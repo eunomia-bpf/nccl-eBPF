@@ -2,15 +2,14 @@
 #include "policy_action.h"
 #include "policy_context.h"
 
-static uint8_t pick_algo(const struct nccl_policy_ctx *ctx)
-{
-  if (ctx->coll_type == 4 && ctx->n_bytes <= (1ULL << 15))
+static uint8_t pick_algo(const struct nccl_policy_ctx *ctx) {
+  if (ctx->coll_type == NCCL_POLICY_COLL_ALLREDUCE &&
+      ctx->n_bytes <= (1ULL << 15))
     return NCCL_POLICY_ALGO_TREE;
   return NCCL_POLICY_ALGO_RING;
 }
 
-static uint8_t pick_proto(const struct nccl_policy_ctx *ctx)
-{
+static uint8_t pick_proto(const struct nccl_policy_ctx *ctx) {
   if (ctx->n_bytes < 4096)
     return NCCL_POLICY_PROTO_SIMPLE;
   if (ctx->n_bytes < (1ULL << 20))
@@ -18,20 +17,18 @@ static uint8_t pick_proto(const struct nccl_policy_ctx *ctx)
   return NCCL_POLICY_PROTO_SIMPLE;
 }
 
-static uint8_t pick_channels(const struct nccl_policy_ctx *ctx)
-{
+static uint8_t pick_channels(const struct nccl_policy_ctx *ctx) {
   if (ctx->n_bytes < 4096)
     return 2;
   if (ctx->n_bytes < (1ULL << 20))
     return 4;
-  if (ctx->coll_type == 4 && ctx->n_ranks >= 8)
+  if (ctx->coll_type == NCCL_POLICY_COLL_ALLREDUCE && ctx->n_ranks >= 8)
     return 10;
   return 8;
 }
 
 SEC("uprobe")
-uint64_t size_aware_v2_policy(struct nccl_policy_ctx *ctx)
-{
+uint64_t size_aware_v2_policy(struct nccl_policy_ctx *ctx) {
   if (!ctx)
     return 0;
 

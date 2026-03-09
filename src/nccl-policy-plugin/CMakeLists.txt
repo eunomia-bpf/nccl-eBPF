@@ -8,8 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(CUDAToolkit REQUIRED)
-find_program(CLANG_EXECUTABLE NAMES clang REQUIRED)
-find_program(LLVM_CONFIG_15_EXECUTABLE NAMES llvm-config-15 REQUIRED)
+find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h REQUIRED)
+find_path(LIBELF_INCLUDE_DIR NAMES gelf.h REQUIRED)
+find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-15 llvm-config REQUIRED)
 
 set(BPFTIME_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../bpftime)
 set(BPFTIME_BUILD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../build-bpftime CACHE PATH
@@ -22,10 +23,19 @@ function(require_file file_path)
 endfunction()
 
 execute_process(
-    COMMAND ${LLVM_CONFIG_15_EXECUTABLE} --libdir
-    OUTPUT_VARIABLE LLVM_15_LIBDIR
+    COMMAND ${LLVM_CONFIG_EXECUTABLE} --version
+    OUTPUT_VARIABLE LLVM_VERSION
     OUTPUT_STRIP_TRAILING_WHITESPACE)
-find_library(LLVM_15_LIBRARY NAMES LLVM-15 PATHS ${LLVM_15_LIBDIR} REQUIRED)
+string(REGEX MATCH "^[0-9]+" LLVM_VERSION_MAJOR "${LLVM_VERSION}")
+
+find_program(CLANG_EXECUTABLE NAMES clang-${LLVM_VERSION_MAJOR} clang REQUIRED)
+
+execute_process(
+    COMMAND ${LLVM_CONFIG_EXECUTABLE} --libdir
+    OUTPUT_VARIABLE LLVM_LIBDIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+find_library(LLVM_LIBRARY NAMES LLVM-${LLVM_VERSION_MAJOR} LLVM
+             PATHS ${LLVM_LIBDIR} REQUIRED)
 
 set(BPFTIME_RUNTIME_LIBRARY ${BPFTIME_BUILD_DIR}/runtime/libruntime.a)
 set(BPFTIME_VERIFIER_LIBRARY
@@ -122,6 +132,8 @@ add_dependencies(nccl-policy ebpf_policies)
 target_include_directories(nccl-policy PRIVATE
     ${NCCL_PUBLIC_INCLUDE_DIRS}
     ${POLICY_SOURCE_DIR}
+    ${LIBBPF_INCLUDE_DIR}
+    ${LIBELF_INCLUDE_DIR}
     ${BPFTIME_SOURCE_DIR}/runtime/include
     ${BPFTIME_SOURCE_DIR}/runtime
     ${BPFTIME_SOURCE_DIR}/vm/compat/include
@@ -134,7 +146,7 @@ target_link_libraries(nccl-policy PRIVATE
     "-Wl,--start-group"
     ${BPFTIME_STATIC_ARCHIVES}
     "-Wl,--end-group"
-    ${LLVM_15_LIBRARY}
+    ${LLVM_LIBRARY}
     dl
     elf
     m

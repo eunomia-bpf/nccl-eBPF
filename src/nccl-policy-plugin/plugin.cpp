@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -65,6 +66,7 @@ struct PluginContext {
   ncclDebugLogger_t log_function = nullptr;
   size_t n_ranks = 0;
   size_t n_nodes = 0;
+  std::mutex state_mu;
   uint64_t call_count = 0;
   uint64_t total_latency_ns = 0;
   uint64_t last_latency_ns = 0;
@@ -74,6 +76,7 @@ struct PluginContext {
   std::string policy_source = "hardcoded-noop";
   std::string section_name = "uprobe";
   std::unordered_map<std::string, int> map_fds;
+  std::map<int, bpftime::verifier::BpftimeMapDescriptor> verifier_maps;
 };
 
 struct ProgramSpec {
@@ -88,11 +91,17 @@ struct MapSymbol {
   uint64_t value = 0;
 };
 
+struct SeededPolicyConfig {
+  uint64_t target_p99_ns = 150;
+  uint32_t min_channels = 1;
+  uint32_t max_channels = 8;
+  uint32_t aggressiveness_step = 1;
+};
+
 std::mutex g_runtime_mu;
 size_t g_runtime_users = 0;
 
-void ensure_bpftime_shm_name()
-{
+void ensure_bpftime_shm_name() {
   const char *existing = getenv("BPFTIME_GLOBAL_SHM_NAME");
   char buffer[128];
 
@@ -104,25 +113,22 @@ void ensure_bpftime_shm_name()
   setenv("BPFTIME_GLOBAL_SHM_NAME", buffer, 0);
 }
 
-uint64_t monotonic_time_ns()
-{
+uint64_t monotonic_time_ns() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
          static_cast<uint64_t>(ts.tv_nsec);
 }
 
-uint64_t update_p99_estimate(uint64_t current_p99, uint64_t sample_ns)
-{
+uint64_t update_p99_estimate(uint64_t current_p99, uint64_t sample_ns) {
   if (current_p99 == 0 || sample_ns > current_p99)
     return sample_ns;
   return (current_p99 * 99 + sample_ns) / 100;
 }
 
 void log_plugin_message(PluginContext *ctx, ncclDebugLogLevel level,
-                        const char *fmt, ...)
-{
-  char buffer[512];
+                        const char *fmt, ...) {
+  char buffer[4096];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buffer, sizeof(buffer), fmt, args);
@@ -133,8 +139,7 @@ void log_plugin_message(PluginContext *ctx, ncclDebugLogLevel level,
     ctx->log_function(level, NCCL_TUNING, __FILE__, __LINE__, "%s", buffer);
 }
 
-void acquire_bpftime_runtime()
-{
+void acquire_bpftime_runtime() {
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime_users++ == 0) {
     ensure_bpftime_shm_name();
@@ -149,8 +154,7 @@ void acquire_bpftime_runtime()
   }
 }
 
-void release_bpftime_runtime()
-{
+void release_bpftime_runtime() {
   std::lock_guard<std::mutex> lock(g_runtime_mu);
   if (g_runtime_users == 0)
     return;
@@ -160,8 +164,7 @@ void release_bpftime_runtime()
   }
 }
 
-VerifyMode get_verify_mode()
-{
+VerifyMode get_verify_mode() {
   const char *mode = getenv("NCCL_POLICY_VERIFY_MODE");
   if (!mode || mode[0] == '\0')
     return VerifyMode::kStrict;
@@ -173,8 +176,7 @@ VerifyMode get_verify_mode()
   return VerifyMode::kStrict;
 }
 
-uint64_t parse_env_u64(const char *name, uint64_t fallback)
-{
+uint64_t parse_env_u64(const char *name, uint64_t fallback) {
   const char *value = getenv(name);
   char *end = nullptr;
 
@@ -188,22 +190,19 @@ uint64_t parse_env_u64(const char *name, uint64_t fallback)
   return static_cast<uint64_t>(parsed);
 }
 
-bool verifier_supports_section(const std::string &section_name)
-{
+bool verifier_supports_section(const std::string &section_name) {
   return section_name.rfind("uprobe", 0) == 0 ||
          section_name.rfind("uretprobe", 0) == 0 ||
          section_name.rfind("tracepoint", 0) == 0;
 }
 
-std::string verifier_section_name(const std::string &section_name)
-{
+std::string verifier_section_name(const std::string &section_name) {
   if (verifier_supports_section(section_name))
     return section_name;
   return "uprobe";
 }
 
-bool collect_map_helpers(std::vector<int32_t> *helper_ids)
-{
+bool collect_map_helpers(std::vector<int32_t> *helper_ids) {
   bpftime::bpftime_helper_group helpers =
       bpftime::bpftime_helper_group::get_kernel_utils_helper_group();
   if (helpers.append(
@@ -217,8 +216,7 @@ bool collect_map_helpers(std::vector<int32_t> *helper_ids)
   return true;
 }
 
-bool register_helpers(bpftime::bpftime_prog *prog)
-{
+bool register_helpers(bpftime::bpftime_prog *prog) {
   bpftime::bpftime_helper_group helpers =
       bpftime::bpftime_helper_group::get_kernel_utils_helper_group();
   if (helpers.append(
@@ -227,8 +225,48 @@ bool register_helpers(bpftime::bpftime_prog *prog)
   return helpers.add_helper_group_to_prog(prog) == 0;
 }
 
-bool create_bpftime_maps(PluginContext *ctx, struct bpf_object *obj)
-{
+uint32_t parse_seeded_channel_setting(PluginContext *ctx, const char *name,
+                                      uint32_t fallback) {
+  const uint64_t parsed = parse_env_u64(name, fallback);
+
+  if (parsed == 0) {
+    log_plugin_message(ctx, NCCL_LOG_WARN,
+                       "%s must be at least 1, using fallback %u", name,
+                       fallback);
+    return fallback;
+  }
+  if (parsed > UINT8_MAX) {
+    log_plugin_message(ctx, NCCL_LOG_WARN,
+                       "%s=%" PRIu64 " exceeds action ABI limit %u, clamping",
+                       name, parsed, UINT8_MAX);
+    return UINT8_MAX;
+  }
+  return static_cast<uint32_t>(parsed);
+}
+
+SeededPolicyConfig load_seeded_policy_config(PluginContext *ctx) {
+  SeededPolicyConfig cfg;
+
+  cfg.target_p99_ns = parse_env_u64("NCCL_POLICY_SLO_TARGET_NS", 150);
+  cfg.min_channels =
+      parse_seeded_channel_setting(ctx, "NCCL_POLICY_MIN_CHANNELS", 1);
+  cfg.max_channels =
+      parse_seeded_channel_setting(ctx, "NCCL_POLICY_MAX_CHANNELS", 8);
+  cfg.aggressiveness_step =
+      parse_seeded_channel_setting(ctx, "NCCL_POLICY_AGGRESSIVENESS_STEP", 1);
+
+  if (cfg.max_channels < cfg.min_channels) {
+    log_plugin_message(ctx, NCCL_LOG_WARN,
+                       "NCCL_POLICY_MAX_CHANNELS=%u is smaller than "
+                       "NCCL_POLICY_MIN_CHANNELS=%u, raising max to match min",
+                       cfg.max_channels, cfg.min_channels);
+    cfg.max_channels = cfg.min_channels;
+  }
+
+  return cfg;
+}
+
+bool create_bpftime_maps(PluginContext *ctx, struct bpf_object *obj) {
   struct bpf_map *map = nullptr;
 
   bpf_object__for_each_map(map, obj) {
@@ -250,20 +288,27 @@ bool create_bpftime_maps(PluginContext *ctx, struct bpf_object *obj)
 
     fd = bpftime_maps_create(-1, bpf_map__name(map), attr);
     if (fd < 0) {
-      log_plugin_message(ctx, NCCL_LOG_WARN,
-                         "failed to create bpftime map %s",
+      log_plugin_message(ctx, NCCL_LOG_WARN, "failed to create bpftime map %s",
                          bpf_map__name(map));
       return false;
     }
     ctx->map_fds.emplace(bpf_map__name(map), fd);
+    ctx->verifier_maps.emplace(
+        fd, bpftime::verifier::BpftimeMapDescriptor{
+                .original_fd = fd,
+                .type = static_cast<uint32_t>(attr.type),
+                .key_size = attr.key_size,
+                .value_size = attr.value_size,
+                .max_entries = attr.max_ents,
+                .inner_map_fd = static_cast<unsigned int>(-1),
+            });
   }
 
   return true;
 }
 
 bool extract_program_spec(PluginContext *ctx, struct bpf_object *obj,
-                          ProgramSpec *spec)
-{
+                          ProgramSpec *spec) {
   struct bpf_program *prog = bpf_object__next_program(obj, nullptr);
   const struct bpf_insn *insns = nullptr;
   size_t insn_cnt = 0;
@@ -288,8 +333,7 @@ bool extract_program_spec(PluginContext *ctx, struct bpf_object *obj,
 }
 
 bool relocate_program_maps(PluginContext *ctx, const char *path,
-                           ProgramSpec *spec)
-{
+                           ProgramSpec *spec) {
   int fd = -1;
   Elf *elf = nullptr;
   Elf_Scn *scn = nullptr;
@@ -323,8 +367,8 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
   }
 
   if (elf_getshdrstrndx(elf, &shstrndx) != 0) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "elf_getshdrstrndx failed for %s", path);
+    log_plugin_message(ctx, NCCL_LOG_WARN, "elf_getshdrstrndx failed for %s",
+                       path);
     elf_end(elf);
     close(fd);
     return false;
@@ -357,7 +401,23 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
 
   {
     Elf_Data *data = elf_getdata(symtab_scn, nullptr);
-    const size_t symbol_count = symtab_shdr.sh_size / symtab_shdr.sh_entsize;
+    size_t symbol_count = 0;
+
+    if (!data) {
+      log_plugin_message(ctx, NCCL_LOG_WARN, "symtab data missing in %s", path);
+      elf_end(elf);
+      close(fd);
+      return false;
+    }
+    if (symtab_shdr.sh_entsize == 0) {
+      log_plugin_message(ctx, NCCL_LOG_WARN, "symtab entry size is zero in %s",
+                         path);
+      elf_end(elf);
+      close(fd);
+      return false;
+    }
+
+    symbol_count = symtab_shdr.sh_size / symtab_shdr.sh_entsize;
     for (size_t i = 0; i < symbol_count; ++i) {
       GElf_Sym sym = {};
       const char *name = nullptr;
@@ -367,10 +427,10 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
 
       name = elf_strptr(elf, symtab_shdr.sh_link, sym.st_name);
       symbols.emplace(i, MapSymbol{
-                            .name = name ? name : "",
-                            .section_index = sym.st_shndx,
-                            .value = sym.st_value,
-                        });
+                             .name = name ? name : "",
+                             .section_index = sym.st_shndx,
+                             .value = sym.st_value,
+                         });
     }
   }
 
@@ -389,6 +449,13 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
     data = elf_getdata(scn, nullptr);
     if (!data)
       continue;
+    if (shdr.sh_entsize == 0) {
+      log_plugin_message(ctx, NCCL_LOG_WARN,
+                         "relocation entry size is zero in %s", path);
+      elf_end(elf);
+      close(fd);
+      return false;
+    }
 
     const size_t reloc_count = shdr.sh_size / shdr.sh_entsize;
     for (size_t i = 0; i < reloc_count; ++i) {
@@ -436,8 +503,7 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
   return true;
 }
 
-bool verify_program(PluginContext *ctx, const ProgramSpec &spec)
-{
+bool verify_program(PluginContext *ctx, const ProgramSpec &spec) {
   std::vector<int32_t> helper_ids;
   const VerifyMode mode = get_verify_mode();
   const std::string verify_section = verifier_section_name(spec.section_name);
@@ -451,6 +517,7 @@ bool verify_program(PluginContext *ctx, const ProgramSpec &spec)
     return mode != VerifyMode::kStrict;
   }
 
+  bpftime::verifier::set_map_descriptors(ctx->verifier_maps);
   bpftime::verifier::set_available_helpers(helper_ids);
   bpftime::verifier::set_non_kernel_helpers({});
 
@@ -467,52 +534,46 @@ bool verify_program(PluginContext *ctx, const ProgramSpec &spec)
     return true;
 
   if (mode == VerifyMode::kStrict) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "verifier rejected %s: %s", ctx->policy_source.c_str(),
-                       result->c_str());
+    fprintf(stderr, "[nccl-policy-plugin] verifier rejected %s:\n%s\n",
+            ctx->policy_source.c_str(), result->c_str());
+    if (ctx && ctx->log_function) {
+      ctx->log_function(NCCL_LOG_WARN, NCCL_TUNING, __FILE__, __LINE__,
+                        "verifier rejected %s", ctx->policy_source.c_str());
+    }
     return false;
   }
 
-  log_plugin_message(ctx, NCCL_LOG_WARN,
-                     "verifier warning for %s: %s", ctx->policy_source.c_str(),
-                     result->c_str());
+  log_plugin_message(ctx, NCCL_LOG_WARN, "verifier warning for %s: %s",
+                     ctx->policy_source.c_str(), result->c_str());
   return true;
 }
 
-void seed_config_map(PluginContext *ctx)
-{
+void seed_config_map(PluginContext *ctx) {
   auto map_it = ctx->map_fds.find("config_map");
+  const SeededPolicyConfig cfg = load_seeded_policy_config(ctx);
+
   if (map_it == ctx->map_fds.end())
     return;
 
-  const uint64_t target_p99 = parse_env_u64("NCCL_POLICY_SLO_TARGET_NS", 150);
-  const uint32_t min_channels =
-      static_cast<uint32_t>(parse_env_u64("NCCL_POLICY_MIN_CHANNELS", 1));
-  const uint32_t max_channels =
-      static_cast<uint32_t>(parse_env_u64("NCCL_POLICY_MAX_CHANNELS", 8));
-  const uint32_t step =
-      static_cast<uint32_t>(parse_env_u64("NCCL_POLICY_AGGRESSIVENESS_STEP",
-                                          1));
-
-  for (uint32_t coll_type = 0; coll_type <= 4; ++coll_type) {
+  for (uint32_t coll_type = 0; coll_type <= NCCL_POLICY_COLL_ALLREDUCE;
+       ++coll_type) {
     const nccl_policy_config_key key = {.coll_type = coll_type};
     const nccl_policy_config_value value = {
-        .target_p99_ns = target_p99,
-        .min_channels = min_channels,
-        .max_channels = max_channels,
-        .aggressiveness_step = step,
+        .target_p99_ns = cfg.target_p99_ns,
+        .min_channels = cfg.min_channels,
+        .max_channels = cfg.max_channels,
+        .aggressiveness_step = cfg.aggressiveness_step,
     };
     (void)bpftime_map_update_elem(map_it->second, &key, &value, BPF_ANY);
   }
 }
 
-bool load_hardcoded_program(PluginContext *ctx)
-{
+bool load_hardcoded_program(PluginContext *ctx) {
   auto config = bpftime::construct_agent_config_from_env();
   config.set_vm_name("llvm");
   ctx->prog = std::make_unique<bpftime::bpftime_prog>(
-      kHardcodedNoopProgram, std::size(kHardcodedNoopProgram),
-      "hardcoded-noop", std::move(config));
+      kHardcodedNoopProgram, std::size(kHardcodedNoopProgram), "hardcoded-noop",
+      std::move(config));
   if (!ctx->prog || !register_helpers(ctx->prog.get()))
     return false;
   if (ctx->prog->bpftime_prog_load(true) < 0) {
@@ -525,16 +586,15 @@ bool load_hardcoded_program(PluginContext *ctx)
   return true;
 }
 
-bool load_program_from_object(PluginContext *ctx, const char *path)
-{
+bool load_program_from_object(PluginContext *ctx, const char *path) {
   std::unique_ptr<struct bpf_object, decltype(&bpf_object__close)> obj(
       bpf_object__open_file(path, nullptr), &bpf_object__close);
   ProgramSpec spec;
   auto config = bpftime::construct_agent_config_from_env();
 
   if (!obj) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "unable to open BPF object %s", path);
+    log_plugin_message(ctx, NCCL_LOG_WARN, "unable to open BPF object %s",
+                       path);
     return false;
   }
 
@@ -567,8 +627,8 @@ bool load_program_from_object(PluginContext *ctx, const char *path)
     return false;
   }
   if (ctx->prog->bpftime_prog_load(true) < 0) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "failed to JIT-load policy %s", path);
+    log_plugin_message(ctx, NCCL_LOG_WARN, "failed to JIT-load policy %s",
+                       path);
     return false;
   }
 
@@ -578,15 +638,20 @@ bool load_program_from_object(PluginContext *ctx, const char *path)
   return true;
 }
 
-bool warmup_program(PluginContext *ctx)
-{
+bool warmup_program(PluginContext *ctx) {
   struct nccl_policy_ctx warmup_ctx = {};
   uint64_t action = 0;
   const uint64_t start_ns = monotonic_time_ns();
   int err = 0;
 
+  if (!ctx->map_fds.empty()) {
+    // Map-backed policies are stateful. Skip synthetic warmup so the first real
+    // getCollInfo() call observes empty policy state.
+    return true;
+  }
+
   warmup_ctx.n_bytes = 1024;
-  warmup_ctx.coll_type = static_cast<uint32_t>(ncclFuncAllReduce);
+  warmup_ctx.coll_type = NCCL_POLICY_COLL_ALLREDUCE;
   warmup_ctx.num_pipe_ops = 1;
   warmup_ctx.n_ranks = static_cast<uint32_t>(ctx->n_ranks);
   warmup_ctx.n_nodes = static_cast<uint32_t>(ctx->n_nodes);
@@ -594,22 +659,20 @@ bool warmup_program(PluginContext *ctx)
 
   err = ctx->prog->bpftime_prog_exec(&warmup_ctx, sizeof(warmup_ctx), &action);
   if (err < 0) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "warmup execution failed for %s",
+    log_plugin_message(ctx, NCCL_LOG_WARN, "warmup execution failed for %s",
                        ctx->policy_source.c_str());
     return false;
   }
 
   fprintf(stderr,
-          "[nccl-policy-plugin] init warmup bytes=%" PRIu64
-          " action=%" PRIu64 " latency_ns=%" PRIu64 "\n",
+          "[nccl-policy-plugin] init warmup bytes=%" PRIu64 " action=%" PRIu64
+          " latency_ns=%" PRIu64 "\n",
           warmup_ctx.n_bytes, action, monotonic_time_ns() - start_ns);
   return true;
 }
 
 void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
-                         int num_proto, int *n_channels)
-{
+                         int num_proto, int *n_channels) {
   const uint8_t flags = nccl_policy_action_flags_get(action);
   const int algo = nccl_policy_action_algo(action);
   const int proto = nccl_policy_action_proto(action);
@@ -622,19 +685,17 @@ void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
     return;
 
   if ((flags & NCCL_POLICY_ACTION_SET_ALGO) &&
-      (flags & NCCL_POLICY_ACTION_SET_PROTO) &&
-      algo >= 0 && proto >= 0 && algo < num_algo && proto < num_proto &&
+      (flags & NCCL_POLICY_ACTION_SET_PROTO) && algo >= 0 && proto >= 0 &&
+      algo < num_algo && proto < num_proto &&
       coll_cost_table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
     coll_cost_table[algo][proto] = 0.0f;
   }
 }
 
 ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
-                            size_t n_nodes,
-                            ncclDebugLogger_t log_function,
+                            size_t n_nodes, ncclDebugLogger_t log_function,
                             ncclNvlDomainInfo_v5_t *nvl_domain_info,
-                            ncclTunerConstants_v5_t *constants)
-{
+                            ncclTunerConstants_v5_t *constants) {
   (void)comm_id;
   (void)nvl_domain_info;
   (void)constants;
@@ -668,9 +729,10 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
     return ncclInternalError;
   }
 
-  log_plugin_message(ctx, NCCL_LOG_INFO,
-                     "initialized for %zu ranks across %zu nodes using policy %s",
-                     n_ranks, n_nodes, ctx->policy_source.c_str());
+  log_plugin_message(
+      ctx, NCCL_LOG_INFO,
+      "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
+      n_nodes, ctx->policy_source.c_str());
   *context = ctx;
   return ncclSuccess;
 }
@@ -679,24 +741,26 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
                                    size_t n_bytes, int num_pipe_ops,
                                    float **coll_cost_table, int num_algo,
                                    int num_proto, int reg_buff,
-                                   int *n_channels)
-{
+                                   int *n_channels) {
   auto *ctx = reinterpret_cast<PluginContext *>(context);
   struct nccl_policy_ctx policy_ctx = {};
   uint64_t action = 0;
-  const uint64_t start_ns = monotonic_time_ns();
   int err = 0;
 
   if (!ctx || !ctx->prog || !n_channels)
     return ncclInternalError;
 
+  std::lock_guard<std::mutex> lock(ctx->state_mu);
+
   *n_channels = ctx->last_channels;
 
   policy_ctx.n_bytes = n_bytes;
-  policy_ctx.last_latency_ns = ctx->last_latency_ns;
-  policy_ctx.avg_latency_ns =
-      ctx->call_count == 0 ? 0 : ctx->total_latency_ns / ctx->call_count;
-  policy_ctx.rolling_p99_ns = ctx->rolling_p99_ns;
+  // TODO: Replace these placeholder zeros with NCCL collective telemetry once
+  // the tuner is wired to the profiler adapter. Feeding plugin dispatch
+  // overhead back into policies breaks map-backed tuning decisions.
+  policy_ctx.last_latency_ns = 0;
+  policy_ctx.avg_latency_ns = 0;
+  policy_ctx.rolling_p99_ns = 0;
   policy_ctx.call_count = ctx->call_count;
   policy_ctx.coll_type = static_cast<uint32_t>(coll_type);
   policy_ctx.num_pipe_ops = static_cast<uint32_t>(num_pipe_ops);
@@ -705,14 +769,17 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_ctx.n_nodes = static_cast<uint32_t>(ctx->n_nodes);
   policy_ctx.current_channels = static_cast<uint32_t>(ctx->last_channels);
 
-  err = ctx->prog->bpftime_prog_exec(&policy_ctx, sizeof(policy_ctx), &action);
-  ctx->last_latency_ns = monotonic_time_ns() - start_ns;
+  {
+    const uint64_t start_ns = monotonic_time_ns();
+    err =
+        ctx->prog->bpftime_prog_exec(&policy_ctx, sizeof(policy_ctx), &action);
+    ctx->last_latency_ns = monotonic_time_ns() - start_ns;
+  }
   ctx->rolling_p99_ns =
       update_p99_estimate(ctx->rolling_p99_ns, ctx->last_latency_ns);
 
   if (err < 0) {
-    log_plugin_message(ctx, NCCL_LOG_WARN,
-                       "bpftime execution failed for %s",
+    log_plugin_message(ctx, NCCL_LOG_WARN, "bpftime execution failed for %s",
                        ctx->policy_source.c_str());
     return ncclInternalError;
   }
@@ -726,43 +793,51 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
     fprintf(stderr,
             "[nccl-policy-plugin] call=%" PRIu64 " bytes=%zu action=%" PRIu64
             " latency_ns=%" PRIu64 " channels=%d aggr=%u\n",
-            ctx->call_count, n_bytes, action, ctx->last_latency_ns,
-            *n_channels, nccl_policy_action_aggressiveness(action));
+            ctx->call_count, n_bytes, action, ctx->last_latency_ns, *n_channels,
+            nccl_policy_action_aggressiveness(action));
   }
 
   return ncclSuccess;
 }
 
-ncclResult_t pluginFinalizeImpl(void *context)
-{
+ncclResult_t pluginFinalizeImpl(void *context) {
   auto *ctx = reinterpret_cast<PluginContext *>(context);
+  uint64_t avg_latency = 0;
+  uint64_t call_count = 0;
+  uint64_t last_latency = 0;
+  uint64_t p99_latency = 0;
+
   if (!ctx)
     return ncclSuccess;
 
-  const uint64_t avg_latency =
-      ctx->call_count == 0 ? 0 : ctx->total_latency_ns / ctx->call_count;
+  {
+    std::lock_guard<std::mutex> lock(ctx->state_mu);
+    call_count = ctx->call_count;
+    avg_latency = call_count == 0 ? 0 : ctx->total_latency_ns / call_count;
+    last_latency = ctx->last_latency_ns;
+    p99_latency = ctx->rolling_p99_ns;
+  }
+
   fprintf(stderr,
           "[nccl-policy-plugin] finalize calls=%" PRIu64
           " avg_latency_ns=%" PRIu64 " last_latency_ns=%" PRIu64
           " p99_estimate_ns=%" PRIu64 " source=%s\n",
-          ctx->call_count, avg_latency, ctx->last_latency_ns,
-          ctx->rolling_p99_ns, ctx->policy_source.c_str());
+          call_count, avg_latency, last_latency, p99_latency,
+          ctx->policy_source.c_str());
 
   delete ctx;
   release_bpftime_runtime();
   return ncclSuccess;
 }
 
-}  // namespace
+} // namespace
 
 extern "C" {
 
 static ncclResult_t pluginInit(void **context, uint64_t comm_id, size_t n_ranks,
-                               size_t n_nodes,
-                               ncclDebugLogger_t log_function,
+                               size_t n_nodes, ncclDebugLogger_t log_function,
                                ncclNvlDomainInfo_v5_t *nvl_domain_info,
-                               ncclTunerConstants_v5_t *constants)
-{
+                               ncclTunerConstants_v5_t *constants) {
   return pluginInitImpl(context, comm_id, n_ranks, n_nodes, log_function,
                         nvl_domain_info, constants);
 }
@@ -771,15 +846,13 @@ static ncclResult_t pluginGetCollInfo(void *context, ncclFunc_t coll_type,
                                       size_t n_bytes, int num_pipe_ops,
                                       float **coll_cost_table, int num_algo,
                                       int num_proto, int reg_buff,
-                                      int *n_channels)
-{
+                                      int *n_channels) {
   return pluginGetCollInfoImpl(context, coll_type, n_bytes, num_pipe_ops,
                                coll_cost_table, num_algo, num_proto, reg_buff,
                                n_channels);
 }
 
-static ncclResult_t pluginFinalize(void *context)
-{
+static ncclResult_t pluginFinalize(void *context) {
   return pluginFinalizeImpl(context);
 }
 
@@ -789,6 +862,20 @@ extern const ncclTuner_v5_t ncclTunerPlugin_v5
         .init = pluginInit,
         .getCollInfo = pluginGetCollInfo,
         .finalize = pluginFinalize,
-    };
+};
 
+extern int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name)
+    __attribute__((visibility("default")));
+
+int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name) {
+  auto *ctx = reinterpret_cast<PluginContext *>(context);
+  std::unordered_map<std::string, int>::const_iterator map_it;
+
+  if (!ctx || !map_name)
+    return -1;
+  map_it = ctx->map_fds.find(map_name);
+  if (map_it == ctx->map_fds.end())
+    return -1;
+  return map_it->second;
+}
 }
