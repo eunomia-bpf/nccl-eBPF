@@ -1,5 +1,16 @@
 # bpftime Migration Results
 
+> Correction (2026-03-09): the strict-verifier status in this file is stale.
+> Revise #1 registered bpftime verifier map descriptors in
+> `src/nccl-policy-plugin/plugin.cpp`, which unblocked strict-mode verification
+> for the map-backed policies. Current status: `adaptive_channels` and
+> `slo_enforcer` both pass `strict` mode. See `docs/tmp/revise1-results.md`,
+> `docs/tmp/phase3-safety-results.md`, and `docs/tmp/benchmark-results.md` for
+> the corrected post-fix results. Also note that this file's original Step 8
+> conclusion predates the later Phase 4 workaround: real 2-rank NCCL
+> `getCollInfo()` traffic was eventually confirmed in
+> `docs/tmp/phase4-results.md`.
+
 ## Summary
 
 The NCCL tuner plugin was migrated from raw `llvmbpf_vm` usage to bpftime runtime primitives. The resulting plugin keeps the NCCL tuner v5 ABI, loads `.bpf.o` objects from `NCCL_POLICY_BPF_PATH`, creates bpftime maps, applies ELF map relocations, verifies programs at load time, and executes policies through `bpftime::bpftime_prog`.
@@ -80,20 +91,22 @@ Practical runtime workaround added:
 
 ### `adaptive_channels.bpf.c`
 
-- strict verifier load: rejected by bpftime userspace verifier
-- warning verifier load: works
+- strict verifier load: works after Revise #1 fixed verifier map descriptor
+  registration in `plugin.cpp`
 - runtime execution with `telemetry_map`: works
 
 ### `slo_enforcer.bpf.c`
 
-- strict verifier load: rejected by bpftime userspace verifier
-- warning verifier load: works
+- strict verifier load: works after Revise #1 fixed verifier map descriptor
+  registration in `plugin.cpp`
 - runtime execution with `config_map` + `telemetry_map`: works
 
-Inference:
+Historical note:
 
-- The map-backed policies appear to hit a current bpftime verifier limitation for these `uprobe` programs with custom context access patterns, rather than a relocation/runtime failure.
-- Reason for that inference: both objects load and execute correctly in `warning` mode, maps are created, map updates persist, and policy outputs change over time as state evolves.
+- The original migration snapshot predates Revise #1 and initially required
+  `warning` mode for the two map-backed policies.
+- That diagnosis is no longer current: strict verification now succeeds once
+  verifier map descriptors are registered before load-time verification.
 
 ## Step 5: Native Baseline
 
@@ -146,6 +159,13 @@ Results:
 | size_aware_v2 | strict | 45 | 54 | 8110 | +31 | +33 |
 | adaptive_channels | warning | 67 | 77 | 10885 | +53 | +56 |
 | slo_enforcer | warning | 80 | 91 | 5083 | +66 | +70 |
+
+Correction:
+
+- The two `warning` rows above are historical migration-run measurements, not
+  the current verifier status.
+- Current post-fix strict-mode results are reported in
+  `docs/tmp/revise1-results.md` and `docs/tmp/benchmark-results.md`.
 
 Observed behavior:
 
@@ -241,6 +261,10 @@ GPU 0: NVIDIA GeForce RTX 5090
 
 ### Final Step 8 status
 
+Historical note: the failed confirmation below reflects the migration-era test
+attempt only. It was later superseded by the successful Phase 4 2-rank run in
+`docs/tmp/phase4-results.md`.
+
 Could not confirm real `getCollInfo()` traffic inside a successful 2-rank NCCL collective on this host.
 
 What was confirmed:
@@ -272,3 +296,8 @@ Partially completed:
 Reason for the remaining gap:
 
 - host has one visible GPU, so NCCL aborts a true 2-rank communicator before `getCollInfo()` can be observed.
+
+Superseded status:
+
+- This remaining gap was closed later in Phase 4 via the
+  `NCCL_TESTS_DEVICE=0` + per-rank `NCCL_HOSTID` socket-only workaround.
