@@ -3,8 +3,10 @@
 #endif
 
 #include <atomic>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <functional>
 #include <inttypes.h>
 #include <limits>
 #include <linux/bpf.h>
@@ -12,9 +14,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <thread>
 #include <time.h>
+#include <unistd.h>
 #include <vector>
 
 #include "native_baseline.h"
@@ -35,6 +39,24 @@ struct policy_case {
   const char *name;
   const char *path;
   const char *verify_mode;
+};
+
+struct verifier_case {
+  const char *name;
+  const char *path;
+  const char *verify_mode;
+  const char *error_type;
+  int expected_accept;
+};
+
+struct verifier_case_result {
+  const char *name;
+  const char *path;
+  const char *error_type;
+  int expected_accept;
+  int accepted;
+  int init_rc;
+  std::string verifier_detail;
 };
 
 struct benchmark_result {
@@ -111,9 +133,17 @@ struct hot_reload_result {
   size_t failed_calls;
   size_t reload_trigger_call;
   size_t first_changed_call;
+  size_t old_policy_calls;
+  size_t new_policy_calls;
+  size_t unexpected_call_count;
+  int good_reload_rc;
+  int bad_reload_rc;
   int post_reload_channels;
   int post_reload_algo;
   int post_reload_proto;
+  int preserved_channels_after_bad_reload;
+  int preserved_algo_after_bad_reload;
+  int preserved_proto_after_bad_reload;
 };
 
 struct adaptive_curve_result {
@@ -162,6 +192,109 @@ static int failf(const char *fmt, ...) {
   va_end(args);
   fputc('\n', stderr);
   return -1;
+}
+
+static int decision_matches(const struct decision_result *decision,
+                            int channels, int algo, int proto) {
+  return decision->channels == channels && decision->algo == algo &&
+         decision->proto == proto;
+}
+
+static int read_fd_to_string(int fd, std::string *output) {
+  char buffer[4096];
+  ssize_t nread;
+
+  output->clear();
+  while ((nread = read(fd, buffer, sizeof(buffer))) > 0)
+    output->append(buffer, (size_t)nread);
+  if (nread < 0)
+    return failf("read failed while capturing stderr: %s", strerror(errno));
+  return 0;
+}
+
+static int capture_stderr(const std::function<void(void)> &fn,
+                          std::string *captured) {
+  int pipe_fds[2] = {-1, -1};
+  int saved_stderr = -1;
+  int rc = 0;
+
+  if (pipe(pipe_fds) != 0)
+    return failf("pipe failed while capturing stderr: %s", strerror(errno));
+
+  saved_stderr = dup(STDERR_FILENO);
+  if (saved_stderr < 0) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    return failf("dup failed while capturing stderr: %s", strerror(errno));
+  }
+
+  fflush(stderr);
+  if (dup2(pipe_fds[1], STDERR_FILENO) < 0) {
+    rc = failf("dup2 failed while capturing stderr: %s", strerror(errno));
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    close(saved_stderr);
+    return rc;
+  }
+  close(pipe_fds[1]);
+  pipe_fds[1] = -1;
+
+  fn();
+
+  fflush(stderr);
+  if (dup2(saved_stderr, STDERR_FILENO) < 0)
+    rc = failf("failed to restore stderr: %s", strerror(errno));
+  close(saved_stderr);
+
+  if (pipe_fds[0] >= 0) {
+    std::string local_capture;
+    if (read_fd_to_string(pipe_fds[0], &local_capture) != 0)
+      rc = -1;
+    close(pipe_fds[0]);
+    if (captured)
+      *captured = std::move(local_capture);
+  } else if (captured) {
+    captured->clear();
+  }
+
+  return rc;
+}
+
+static std::string collapse_whitespace(const std::string &text) {
+  std::string collapsed;
+  int last_was_space = 1;
+
+  for (char ch : text) {
+    if (isspace((unsigned char)ch)) {
+      if (!last_was_space) {
+        collapsed.push_back(' ');
+        last_was_space = 1;
+      }
+      continue;
+    }
+    collapsed.push_back(ch);
+    last_was_space = 0;
+  }
+
+  if (!collapsed.empty() && collapsed.back() == ' ')
+    collapsed.pop_back();
+  return collapsed;
+}
+
+static std::string summarize_verifier_detail(const std::string &captured) {
+  const std::string needle = "verifier rejected";
+  std::string summary;
+  size_t pos = captured.find(needle);
+
+  if (pos == std::string::npos)
+    return "-";
+
+  summary = collapse_whitespace(captured.substr(pos));
+  if (summary.size() > 200) {
+    summary.resize(197);
+    summary += "...";
+  }
+  return summary;
 }
 
 static void no_op_logger(ncclDebugLogLevel level, unsigned long flags,
@@ -470,20 +603,128 @@ static int test_size_aware_policies(const char *plugin_path) {
   return 0;
 }
 
-static int test_verifier_acceptance(const char *plugin_path,
-                                    const struct policy_case *policies,
-                                    size_t policy_count) {
-  size_t i;
+static int probe_policy_verdict(const char *plugin_path,
+                                const struct verifier_case *policy,
+                                struct verifier_case_result *result) {
+  void *handle = NULL;
+  const ncclTuner_v5_t *plugin = NULL;
+  void *plugin_context = NULL;
+  std::string captured;
+  std::string dlopen_error;
+  std::string dlsym_error;
+  int init_rc = ncclInternalError;
+  int dlopen_ok = 0;
+  int dlsym_ok = 0;
+  int init_called = 0;
 
-  for (i = 0; i < policy_count; ++i) {
-    struct plugin_session session;
+  result->name = policy->name;
+  result->path = policy->path;
+  result->error_type = policy->error_type;
+  result->expected_accept = policy->expected_accept;
+  result->accepted = 0;
+  result->init_rc = ncclInternalError;
+  result->verifier_detail = "-";
 
-    if (open_plugin_session(&session, plugin_path, &policies[i], 8, 1) != 0)
-      return -1;
-    close_plugin_session(&session);
+  if (setenv("NCCL_POLICY_BPF_PATH", policy->path, 1) != 0)
+    return failf("setenv failed for NCCL_POLICY_BPF_PATH: %s", strerror(errno));
+  if (setenv("NCCL_POLICY_VERIFY_MODE", policy->verify_mode, 1) != 0)
+    return failf("setenv failed for NCCL_POLICY_VERIFY_MODE: %s",
+                 strerror(errno));
+
+  if (capture_stderr(
+          [&]() {
+            handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
+            if (!handle) {
+              dlopen_error = dlerror() ? dlerror() : "unknown";
+              return;
+            }
+            dlopen_ok = 1;
+
+            plugin = (const ncclTuner_v5_t *)dlsym(handle,
+                                                   NCCL_TUNER_PLUGIN_SYMBOL);
+            if (!plugin) {
+              dlsym_error = dlerror() ? dlerror() : "unknown";
+              return;
+            }
+            dlsym_ok = 1;
+
+            init_rc = plugin->init(&plugin_context, 0, 8, 1, no_op_logger,
+                                   NULL, NULL);
+            init_called = 1;
+            if (init_rc == ncclSuccess && plugin_context) {
+              plugin->finalize(plugin_context);
+              plugin_context = NULL;
+            }
+
+            dlclose(handle);
+            handle = NULL;
+          },
+          &captured) != 0) {
+    if (handle)
+      dlclose(handle);
+    return -1;
   }
 
-  printf("verifier acceptance: PASS (%zu strict policies)\n", policy_count);
+  if (handle)
+    dlclose(handle);
+  if (!dlopen_ok)
+    return failf("dlopen failed for %s: %s", plugin_path, dlopen_error.c_str());
+  if (!dlsym_ok)
+    return failf("dlsym failed for %s: %s", NCCL_TUNER_PLUGIN_SYMBOL,
+                 dlsym_error.c_str());
+  if (!init_called)
+    return failf("plugin init was not attempted for %s", policy->name);
+
+  result->accepted = init_rc == ncclSuccess;
+  result->init_rc = init_rc;
+  result->verifier_detail = summarize_verifier_detail(captured);
+  return 0;
+}
+
+static int test_verifier_matrix(const char *plugin_path,
+                                const struct verifier_case *policies,
+                                size_t policy_count,
+                                std::vector<struct verifier_case_result>
+                                    *results_out) {
+  std::vector<struct verifier_case_result> results;
+  size_t i;
+  int failed = 0;
+
+  results.reserve(policy_count);
+  for (i = 0; i < policy_count; ++i) {
+    struct verifier_case_result result = {};
+
+    if (probe_policy_verdict(plugin_path, &policies[i], &result) != 0)
+      return -1;
+    if (result.accepted != result.expected_accept)
+      failed = 1;
+    results.push_back(std::move(result));
+  }
+
+  printf("verifier matrix:\n");
+  printf("| program | error_type | verifier_verdict | expected | pass/fail |\n");
+  printf("| --- | --- | --- | --- | --- |\n");
+  for (const auto &result : results) {
+    const char *verdict = result.accepted ? "ACCEPTED" : "REJECTED";
+    const char *expected = result.expected_accept ? "ACCEPTED" : "REJECTED";
+    const char *pass_fail =
+        result.accepted == result.expected_accept ? "PASS" : "FAIL";
+
+    printf("| %s | %s | %s | %s | %s |\n", result.name, result.error_type,
+           verdict, expected, pass_fail);
+    if (result.verifier_detail != "-") {
+      printf("verifier detail: %s => %s\n", result.name,
+             result.verifier_detail.c_str());
+    }
+  }
+
+  if (results_out)
+    *results_out = results;
+
+  if (failed)
+    return failf("verifier matrix contained unexpected verdicts");
+
+  printf("verifier matrix: PASS (%zu programs)\n", policy_count);
   return 0;
 }
 
@@ -566,43 +807,6 @@ static int test_adaptive_channels_map_state(const char *plugin_path) {
 
   close_plugin_session(&session);
   printf("adaptive_channels map state: PASS\n");
-  return 0;
-}
-
-static int test_verifier_rejection(const char *plugin_path) {
-  const struct policy_case bad_policy = {
-      "bad_lookup", NCCL_POLICY_TEST_BAD_BPF_PATH, "strict"};
-  void *handle = NULL;
-  const ncclTuner_v5_t *plugin = NULL;
-  void *plugin_context = NULL;
-  int rc = 0;
-
-  if (setenv("NCCL_POLICY_BPF_PATH", bad_policy.path, 1) != 0)
-    return failf("setenv failed for NCCL_POLICY_BPF_PATH: %s", strerror(errno));
-  if (setenv("NCCL_POLICY_VERIFY_MODE", bad_policy.verify_mode, 1) != 0)
-    return failf("setenv failed for NCCL_POLICY_VERIFY_MODE: %s",
-                 strerror(errno));
-
-  handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
-  if (!handle)
-    return failf("dlopen failed for %s: %s", plugin_path, dlerror());
-
-  plugin = (const ncclTuner_v5_t *)dlsym(handle, NCCL_TUNER_PLUGIN_SYMBOL);
-  if (!plugin) {
-    dlclose(handle);
-    return failf("dlsym failed for %s: %s", NCCL_TUNER_PLUGIN_SYMBOL,
-                 dlerror());
-  }
-
-  rc = plugin->init(&plugin_context, 0, 8, 1, no_op_logger, NULL, NULL);
-  if (rc == ncclSuccess) {
-    plugin->finalize(plugin_context);
-    dlclose(handle);
-    return failf("verifier unexpectedly accepted bad_lookup in strict mode");
-  }
-
-  dlclose(handle);
-  printf("verifier rejection: PASS (%s)\n", bad_policy.path);
   return 0;
 }
 
@@ -757,24 +961,32 @@ static int benchmark_policy(const char *plugin_path,
   return 0;
 }
 
-static int test_hot_reload_latency(const char *plugin_path,
-                                   struct hot_reload_result *result) {
+static int test_hot_reload_safety(const char *plugin_path,
+                                  struct hot_reload_result *result) {
   const struct policy_case initial_policy = {
       "noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"};
   const size_t sentinel = std::numeric_limits<size_t>::max();
   struct plugin_session session;
   std::vector<uint64_t> call_latencies(kHotReloadIterations, 0);
+  const struct decision_result unknown_decision = {-777, -777, -777};
+  std::vector<struct decision_result> decisions(kHotReloadIterations,
+                                                unknown_decision);
   std::atomic<size_t> calls_started(0);
   std::atomic<size_t> failed_calls(0);
-  std::atomic<int> reload_rc(-1);
   struct reload_debug_stats reload_stats = {0};
-  std::atomic<size_t> first_changed_call(sentinel);
-  std::atomic<int> post_reload_channels(-1);
-  std::atomic<int> post_reload_algo(-1);
-  std::atomic<int> post_reload_proto(-1);
+  struct decision_result preserved_decision = {-1, -1, -1};
+  std::string bad_reload_capture;
 
-  memset(result, 0, sizeof(*result));
+  *result = hot_reload_result();
   result->first_changed_call = sentinel;
+  result->good_reload_rc = -1;
+  result->bad_reload_rc = -1;
+  result->post_reload_channels = -1;
+  result->post_reload_algo = -1;
+  result->post_reload_proto = -1;
+  result->preserved_channels_after_bad_reload = -1;
+  result->preserved_algo_after_bad_reload = -1;
+  result->preserved_proto_after_bad_reload = -1;
 
   if (open_plugin_session(&session, plugin_path, &initial_policy, 8, 1) != 0)
     return -1;
@@ -812,18 +1024,7 @@ static int test_hot_reload_latency(const char *plugin_path,
       call_latencies[i] = end_ns - start_ns;
       decision.channels = n_channels;
       detect_forced_choice(cost_table, &decision.algo, &decision.proto);
-
-      if (reload_rc.load(std::memory_order_acquire) == 0 &&
-          decision.channels == 10 && decision.algo == NCCL_ALGO_RING &&
-          decision.proto == NCCL_PROTO_SIMPLE) {
-        size_t expected = sentinel;
-        (void)first_changed_call.compare_exchange_strong(
-            expected, i, std::memory_order_acq_rel, std::memory_order_acquire);
-        post_reload_channels.store(decision.channels,
-                                   std::memory_order_release);
-        post_reload_algo.store(decision.algo, std::memory_order_release);
-        post_reload_proto.store(decision.proto, std::memory_order_release);
-      }
+      decisions[i] = decision;
     }
   });
 
@@ -834,18 +1035,22 @@ static int test_hot_reload_latency(const char *plugin_path,
     }
     result->reload_trigger_call = calls_started.load(std::memory_order_acquire);
 
-    reload_rc.store(session.debug_reload_policy(
-                        session.plugin_context,
-                        NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, &reload_stats),
-                    std::memory_order_release);
+    result->good_reload_rc = session.debug_reload_policy(
+        session.plugin_context, NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH,
+        &reload_stats);
   });
 
   caller.join();
   reloader.join();
 
-  if (reload_rc.load(std::memory_order_acquire) != 0) {
+  if (result->good_reload_rc != 0) {
     close_plugin_session(&session);
     return failf("hot reload failed");
+  }
+  if (result->reload_trigger_call == 0 ||
+      result->reload_trigger_call > call_latencies.size()) {
+    close_plugin_session(&session);
+    return failf("hot reload trigger call was out of range");
   }
 
   {
@@ -865,12 +1070,6 @@ static int test_hot_reload_latency(const char *plugin_path,
       std::max<uint64_t>(10000, result->pre_reload_p99_ns * 10);
   result->completed_calls = kHotReloadIterations;
   result->failed_calls = failed_calls.load(std::memory_order_acquire);
-  result->first_changed_call =
-      first_changed_call.load(std::memory_order_acquire);
-  result->post_reload_channels =
-      post_reload_channels.load(std::memory_order_acquire);
-  result->post_reload_algo = post_reload_algo.load(std::memory_order_acquire);
-  result->post_reload_proto = post_reload_proto.load(std::memory_order_acquire);
 
   for (size_t i = 0; i < call_latencies.size(); ++i) {
     if (call_latencies[i] > result->max_call_latency_ns)
@@ -879,30 +1078,105 @@ static int test_hot_reload_latency(const char *plugin_path,
       result->slow_call_count++;
   }
 
+  for (size_t i = 0; i < decisions.size(); ++i) {
+    if (decision_matches(&decisions[i], 1, -1, -1)) {
+      result->old_policy_calls++;
+      continue;
+    }
+    if (decision_matches(&decisions[i], 10, NCCL_ALGO_RING,
+                         NCCL_PROTO_SIMPLE)) {
+      if (result->first_changed_call == sentinel)
+        result->first_changed_call = i;
+      result->new_policy_calls++;
+      continue;
+    }
+    result->unexpected_call_count++;
+  }
+
+  if (result->first_changed_call == sentinel) {
+    close_plugin_session(&session);
+    return failf("hot reload never switched to the replacement policy");
+  }
+
+  for (size_t i = 0; i < result->first_changed_call; ++i) {
+    if (!decision_matches(&decisions[i], 1, -1, -1)) {
+      close_plugin_session(&session);
+      return failf("hot reload was not atomic before the transition point");
+    }
+  }
+  for (size_t i = result->first_changed_call; i < decisions.size(); ++i) {
+    if (!decision_matches(&decisions[i], 10, NCCL_ALGO_RING,
+                          NCCL_PROTO_SIMPLE)) {
+      close_plugin_session(&session);
+      return failf("hot reload was not atomic after the transition point");
+    }
+  }
+
+  result->post_reload_channels = 10;
+  result->post_reload_algo = NCCL_ALGO_RING;
+  result->post_reload_proto = NCCL_PROTO_SIMPLE;
+
+  if (capture_stderr(
+          [&]() {
+            result->bad_reload_rc = session.debug_reload_policy(
+                session.plugin_context, NCCL_POLICY_TEST_BAD_LOOKUP_BPF_PATH,
+                NULL);
+          },
+          &bad_reload_capture) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+  if (result->bad_reload_rc == 0) {
+    close_plugin_session(&session);
+    return failf("bad hot-reload replacement unexpectedly succeeded");
+  }
+  if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 1,
+                      &preserved_decision) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+
+  result->preserved_channels_after_bad_reload = preserved_decision.channels;
+  result->preserved_algo_after_bad_reload = preserved_decision.algo;
+  result->preserved_proto_after_bad_reload = preserved_decision.proto;
+
   close_plugin_session(&session);
-  if (result->failed_calls != 0 ||
-      result->first_changed_call == std::numeric_limits<size_t>::max() ||
+  if (result->failed_calls != 0 || result->unexpected_call_count != 0 ||
       result->post_reload_channels != 10 ||
       result->post_reload_algo != NCCL_ALGO_RING ||
-      result->post_reload_proto != NCCL_PROTO_SIMPLE) {
+      result->post_reload_proto != NCCL_PROTO_SIMPLE ||
+      !decision_matches(&preserved_decision, 10, NCCL_ALGO_RING,
+                        NCCL_PROTO_SIMPLE)) {
     return failf("hot reload correctness check failed");
   }
 
   result->first_changed_call += 1;
   printf(
-      "hot reload us: load=%.3f swap=%.3f total=%.3f"
+      "hot reload safety: load=%.3f swap=%.3f total=%.3f"
       " pre_p50_ns=%" PRIu64 " pre_p99_ns=%" PRIu64 " max_call_ns=%" PRIu64
       " slow_calls=%zu threshold_ns=%" PRIu64
       " completed_calls=%zu failed_calls=%zu zero_call_loss=%s"
-      " trigger_call=%zu first_changed_call=%zu channels=%d algo=%d proto=%d\n",
+      " trigger_call=%zu first_changed_call=%zu old_calls=%zu new_calls=%zu"
+      " unexpected_calls=%zu channels=%d algo=%d proto=%d"
+      " bad_replacement_rc=%d preserved_channels=%d preserved_algo=%d"
+      " preserved_proto=%d\n",
       result->reload_load_ns / 1000.0, result->reload_swap_ns / 1000.0,
       result->reload_total_ns / 1000.0, result->pre_reload_p50_ns,
       result->pre_reload_p99_ns, result->max_call_latency_ns,
       result->slow_call_count, result->slow_call_threshold_ns,
       result->completed_calls, result->failed_calls,
       result->failed_calls == 0 ? "yes" : "no", result->reload_trigger_call,
-      result->first_changed_call, result->post_reload_channels,
-      result->post_reload_algo, result->post_reload_proto);
+      result->first_changed_call, result->old_policy_calls,
+      result->new_policy_calls, result->unexpected_call_count,
+      result->post_reload_channels, result->post_reload_algo,
+      result->post_reload_proto, result->bad_reload_rc,
+      result->preserved_channels_after_bad_reload,
+      result->preserved_algo_after_bad_reload,
+      result->preserved_proto_after_bad_reload);
+  if (!bad_reload_capture.empty()) {
+    printf("hot reload rejected detail: %s\n",
+           summarize_verifier_detail(bad_reload_capture).c_str());
+  }
   return 0;
 }
 
@@ -1017,15 +1291,35 @@ static int test_adaptive_policy_curve(const char *plugin_path,
 
 int main(int argc, char **argv) {
   const char *plugin_path = argc > 1 ? argv[1] : NCCL_POLICY_TEST_PLUGIN_PATH;
-  const struct policy_case strict_policies[] = {
-      {"noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"},
-      {"size_aware", NCCL_POLICY_TEST_SIZE_AWARE_BPF_PATH, "strict"},
-      {"size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict"},
-      {"lookup_only", NCCL_POLICY_TEST_LOOKUP_ONLY_BPF_PATH, "strict"},
-      {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict"},
+  const struct verifier_case verifier_policies[] = {
+      {"noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict", "valid", 1},
+      {"size_aware", NCCL_POLICY_TEST_SIZE_AWARE_BPF_PATH, "strict", "valid",
+       1},
+      {"size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict",
+       "valid", 1},
+      {"lookup_only", NCCL_POLICY_TEST_LOOKUP_ONLY_BPF_PATH, "strict", "valid",
+       1},
+      {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict",
+       "valid", 1},
       {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
-       "strict"},
-      {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict"},
+       "strict", "valid", 1},
+      {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict",
+       "valid", 1},
+      {"bad_lookup", NCCL_POLICY_TEST_BAD_LOOKUP_BPF_PATH, "strict",
+       "null_deref_after_map_lookup", 0},
+      {"bad_oob_access", NCCL_POLICY_TEST_BAD_OOB_ACCESS_BPF_PATH, "strict",
+       "ctx_out_of_bounds_read", 0},
+      {"bad_unregistered_helper",
+       NCCL_POLICY_TEST_BAD_UNREGISTERED_HELPER_BPF_PATH, "strict",
+       "helper_not_registered", 0},
+      {"bad_stack_overflow", NCCL_POLICY_TEST_BAD_STACK_OVERFLOW_BPF_PATH,
+       "strict", "stack_limit_exceeded", 0},
+      {"bad_infinite_loop", NCCL_POLICY_TEST_BAD_INFINITE_LOOP_BPF_PATH,
+       "strict", "unbounded_loop", 0},
+      {"bad_write_ctx", NCCL_POLICY_TEST_BAD_WRITE_CTX_BPF_PATH, "strict",
+       "write_to_read_only_ctx", 0},
+      {"bad_div_zero", NCCL_POLICY_TEST_BAD_DIV_ZERO_BPF_PATH, "strict",
+       "potential_divide_by_zero", 0},
   };
   const struct policy_case benchmark_policies[] = {
       {"noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"},
@@ -1046,9 +1340,10 @@ int main(int argc, char **argv) {
   if (!samples)
     return failf("failed to allocate benchmark samples");
 
-  if (test_verifier_acceptance(plugin_path, strict_policies,
-                               sizeof(strict_policies) /
-                                   sizeof(strict_policies[0])) != 0) {
+  if (test_verifier_matrix(plugin_path, verifier_policies,
+                           sizeof(verifier_policies) /
+                               sizeof(verifier_policies[0]),
+                           NULL) != 0) {
     free(samples);
     return 1;
   }
@@ -1059,11 +1354,6 @@ int main(int argc, char **argv) {
   }
 
   if (test_adaptive_channels_map_state(plugin_path) != 0) {
-    free(samples);
-    return 1;
-  }
-
-  if (test_verifier_rejection(plugin_path) != 0) {
     free(samples);
     return 1;
   }
@@ -1098,7 +1388,7 @@ int main(int argc, char **argv) {
            policy_result.last_proto);
   }
 
-  if (test_hot_reload_latency(plugin_path, &hot_reload_result) != 0) {
+  if (test_hot_reload_safety(plugin_path, &hot_reload_result) != 0) {
     free(samples);
     return 1;
   }

@@ -113,6 +113,15 @@ add_policy_object(adaptive_channels_policy adaptive_channels
                   ADAPTIVE_CHANNELS_BPF_O)
 add_policy_object(slo_enforcer_policy slo_enforcer SLO_ENFORCER_BPF_O)
 add_policy_object(bad_lookup_policy bad_lookup BAD_LOOKUP_BPF_O)
+add_policy_object(bad_oob_access_policy bad_oob_access BAD_OOB_ACCESS_BPF_O)
+add_policy_object(bad_unregistered_helper_policy bad_unregistered_helper
+                  BAD_UNREGISTERED_HELPER_BPF_O)
+add_policy_object(bad_stack_overflow_policy bad_stack_overflow
+                  BAD_STACK_OVERFLOW_BPF_O)
+add_policy_object(bad_infinite_loop_policy bad_infinite_loop
+                  BAD_INFINITE_LOOP_BPF_O)
+add_policy_object(bad_write_ctx_policy bad_write_ctx BAD_WRITE_CTX_BPF_O)
+add_policy_object(bad_div_zero_policy bad_div_zero BAD_DIV_ZERO_BPF_O)
 
 set(POLICY_OBJECTS
     ${NOOP_BPF_O}
@@ -122,7 +131,13 @@ set(POLICY_OBJECTS
     ${LOOKUP_UPDATE_BPF_O}
     ${ADAPTIVE_CHANNELS_BPF_O}
     ${SLO_ENFORCER_BPF_O}
-    ${BAD_LOOKUP_BPF_O})
+    ${BAD_LOOKUP_BPF_O}
+    ${BAD_OOB_ACCESS_BPF_O}
+    ${BAD_UNREGISTERED_HELPER_BPF_O}
+    ${BAD_STACK_OVERFLOW_BPF_O}
+    ${BAD_INFINITE_LOOP_BPF_O}
+    ${BAD_WRITE_CTX_BPF_O}
+    ${BAD_DIV_ZERO_BPF_O})
 
 add_custom_target(ebpf_policies ALL DEPENDS ${POLICY_OBJECTS})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in
@@ -130,6 +145,13 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in
 
 add_library(native_policy_baseline STATIC native_baseline.cpp)
 target_include_directories(native_policy_baseline PRIVATE ${POLICY_SOURCE_DIR})
+
+set_source_files_properties(test/native_crash_plugin.c PROPERTIES LANGUAGE CXX)
+add_library(native_crash_policy SHARED test/native_crash_plugin.c)
+target_include_directories(native_crash_policy PRIVATE ${NCCL_PUBLIC_INCLUDE_DIRS})
+set_target_properties(native_crash_policy PROPERTIES
+    OUTPUT_NAME "native-crash-policy"
+    PREFIX "lib")
 
 add_library(nccl-policy SHARED plugin.cpp)
 add_dependencies(nccl-policy ebpf_policies)
@@ -175,3 +197,16 @@ target_link_libraries(test_ebpf_plugin PRIVATE
     dl
     rt)
 set_target_properties(test_ebpf_plugin PROPERTIES LINKER_LANGUAGE CXX)
+
+add_executable(test_native_crash test/test_native_crash.c)
+add_dependencies(test_native_crash nccl-policy native_crash_policy ebpf_policies)
+set_source_files_properties(test/test_native_crash.c PROPERTIES LANGUAGE CXX)
+target_include_directories(test_native_crash PRIVATE
+    ${NCCL_PUBLIC_INCLUDE_DIRS}
+    ${POLICY_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(test_native_crash PRIVATE
+    dl
+    rt)
+set_target_properties(test_native_crash PROPERTIES LINKER_LANGUAGE CXX)
