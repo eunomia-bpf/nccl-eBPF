@@ -11,6 +11,10 @@
 #define BPF_MAP_TYPE_HASH 1
 #endif
 
+#ifndef BPF_MAP_TYPE_ARRAY
+#define BPF_MAP_TYPE_ARRAY 2
+#endif
+
 #ifndef BPF_ANY
 #define BPF_ANY 0
 #endif

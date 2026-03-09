@@ -2,16 +2,20 @@
 #define _GNU_SOURCE
 #endif
 
+#include <atomic>
 #include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits>
 #include <linux/bpf.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
 #include <time.h>
+#include <vector>
 
 #include "native_baseline.h"
 #include "nccl_tuner.h"
@@ -21,6 +25,11 @@
 #include "policy_test_paths.h"
 
 enum { kIterations = 1000000 };
+enum { kWarmupIterations = 10000 };
+enum { kAdaptivePhaseIterations = 500000 };
+enum { kAdaptiveSampleStride = 10000 };
+enum { kHotReloadIterations = 400000 };
+enum { kHotReloadTriggerIteration = 200000 };
 
 struct policy_case {
   const char *name;
@@ -57,6 +66,23 @@ struct expected_case {
 };
 
 typedef int (*plugin_debug_get_map_fd_fn)(void *context, const char *map_name);
+struct reload_debug_stats {
+  uint64_t load_ns;
+  uint64_t swap_ns;
+  uint64_t total_ns;
+};
+typedef int (*plugin_debug_reload_policy_fn)(void *context,
+                                             const char *policy_path,
+                                             struct reload_debug_stats *stats);
+struct synthetic_telemetry_config {
+  uint64_t last_latency_ns;
+  uint64_t avg_latency_ns;
+  uint64_t rolling_p99_ns;
+  uint32_t enabled;
+  uint32_t reserved;
+};
+typedef int (*plugin_debug_set_synthetic_telemetry_fn)(
+    void *context, const struct synthetic_telemetry_config *config);
 typedef long (*bpftime_map_update_elem_fn)(int fd, const void *key,
                                            const void *value, uint64_t flags);
 typedef const void *(*bpftime_map_lookup_elem_fn)(int fd, const void *key);
@@ -66,8 +92,38 @@ struct plugin_session {
   const ncclTuner_v5_t *plugin;
   void *plugin_context;
   plugin_debug_get_map_fd_fn debug_get_map_fd;
+  plugin_debug_reload_policy_fn debug_reload_policy;
+  plugin_debug_set_synthetic_telemetry_fn debug_set_synthetic_telemetry;
   bpftime_map_update_elem_fn map_update_elem;
   bpftime_map_lookup_elem_fn map_lookup_elem;
+};
+
+struct hot_reload_result {
+  uint64_t reload_load_ns;
+  uint64_t reload_swap_ns;
+  uint64_t reload_total_ns;
+  uint64_t pre_reload_p50_ns;
+  uint64_t pre_reload_p99_ns;
+  uint64_t max_call_latency_ns;
+  uint64_t slow_call_threshold_ns;
+  size_t slow_call_count;
+  size_t completed_calls;
+  size_t failed_calls;
+  size_t reload_trigger_call;
+  size_t first_changed_call;
+  int post_reload_channels;
+  int post_reload_algo;
+  int post_reload_proto;
+};
+
+struct adaptive_curve_result {
+  enum { kMaxSamples = 100 };
+  size_t sample_count;
+  uint64_t calls[kMaxSamples];
+  uint32_t channels[kMaxSamples];
+  uint32_t map_channels[kMaxSamples];
+  uint32_t boundary_before_channels;
+  uint32_t boundary_after_channels;
 };
 
 static uint64_t monotonic_time_ns(void) {
@@ -203,6 +259,11 @@ static int open_plugin_session(struct plugin_session *session,
 
   session->debug_get_map_fd = (plugin_debug_get_map_fd_fn)dlsym(
       session->handle, "ncclPolicyPluginDebugGetMapFd");
+  session->debug_reload_policy = (plugin_debug_reload_policy_fn)dlsym(
+      session->handle, "ncclPolicyPluginDebugReloadPolicy");
+  session->debug_set_synthetic_telemetry =
+      (plugin_debug_set_synthetic_telemetry_fn)dlsym(
+          session->handle, "ncclPolicyPluginDebugSetSyntheticTelemetry");
   session->map_update_elem = (bpftime_map_update_elem_fn)dlsym(
       session->handle, "bpftime_map_update_elem");
   session->map_lookup_elem = (bpftime_map_lookup_elem_fn)dlsym(
@@ -237,6 +298,47 @@ static int run_policy_once(struct plugin_session *session, ncclFunc_t coll_type,
 
   decision->channels = n_channels;
   detect_forced_choice(cost_table, &decision->algo, &decision->proto);
+  return 0;
+}
+
+static int seed_telemetry_map(struct plugin_session *session,
+                              int telemetry_map_fd,
+                              const struct nccl_policy_telemetry_key *key,
+                              const struct nccl_policy_telemetry_value *value) {
+  if (!session->map_update_elem)
+    return failf("bpftime_map_update_elem is unavailable");
+  if (session->map_update_elem(telemetry_map_fd, key, value, BPF_ANY) != 0)
+    return failf("failed to seed telemetry_map");
+  return 0;
+}
+
+static const struct nccl_policy_telemetry_value *
+lookup_telemetry_map(struct plugin_session *session, int telemetry_map_fd,
+                     const struct nccl_policy_telemetry_key *key) {
+  if (!session->map_lookup_elem)
+    return NULL;
+  return (const struct nccl_policy_telemetry_value *)session->map_lookup_elem(
+      telemetry_map_fd, key);
+}
+
+static int set_synthetic_telemetry(struct plugin_session *session,
+                                   uint64_t last_latency_ns,
+                                   uint64_t avg_latency_ns,
+                                   uint64_t rolling_p99_ns, uint32_t enabled) {
+  const struct synthetic_telemetry_config config = {
+      .last_latency_ns = last_latency_ns,
+      .avg_latency_ns = avg_latency_ns,
+      .rolling_p99_ns = rolling_p99_ns,
+      .enabled = enabled,
+      .reserved = 0,
+  };
+
+  if (!session->debug_set_synthetic_telemetry)
+    return failf("synthetic telemetry debug hook is unavailable");
+  if (session->debug_set_synthetic_telemetry(session->plugin_context,
+                                             enabled ? &config : NULL) != 0) {
+    return failf("failed to configure synthetic telemetry");
+  }
   return 0;
 }
 
@@ -504,6 +606,52 @@ static int test_verifier_rejection(const char *plugin_path) {
   return 0;
 }
 
+static void warmup_native_size_aware(size_t count) {
+  const ncclFunc_t coll_types[] = {
+      ncclFuncBroadcast,     ncclFuncReduce,    ncclFuncAllGather,
+      ncclFuncReduceScatter, ncclFuncAllReduce,
+  };
+  volatile uint64_t sink = 0;
+  size_t i;
+
+  for (i = 0; i < count; ++i) {
+    struct nccl_policy_ctx ctx = {0};
+
+    ctx.n_bytes = ((size_t)1 << (10 + (i % 11))) + (i & 255u);
+    ctx.coll_type =
+        (uint32_t)coll_types[i % (sizeof(coll_types) / sizeof(coll_types[0]))];
+    ctx.num_pipe_ops = 1 + (uint32_t)(i % 4);
+    ctx.reg_buff = (uint32_t)(i & 1u);
+    ctx.n_ranks = 8;
+    ctx.n_nodes = 1;
+    ctx.current_channels = 1;
+    sink ^= nccl_native_size_aware_v2(&ctx);
+  }
+
+  (void)sink;
+}
+
+static int warmup_policy_session(struct plugin_session *session, size_t count) {
+  const ncclFunc_t coll_types[] = {
+      ncclFuncBroadcast,     ncclFuncReduce,    ncclFuncAllGather,
+      ncclFuncReduceScatter, ncclFuncAllReduce,
+  };
+  size_t i;
+
+  for (i = 0; i < count; ++i) {
+    struct decision_result decision = {-1, -1, -1};
+    if (run_policy_once(
+            session,
+            coll_types[i % (sizeof(coll_types) / sizeof(coll_types[0]))],
+            ((size_t)1 << (10 + (i % 11))) + (i & 255u), 1 + (int)(i % 4),
+            (int)(i & 1u), 1, &decision) != 0) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
 static int benchmark_native_size_aware(uint64_t *samples, size_t count,
                                        struct benchmark_result *result) {
   const ncclFunc_t coll_types[] = {
@@ -514,6 +662,8 @@ static int benchmark_native_size_aware(uint64_t *samples, size_t count,
   uint64_t last_action = 0;
   struct decision_result last_decision = {-1, -1, -1};
   size_t i;
+
+  warmup_native_size_aware(kWarmupIterations);
 
   for (i = 0; i < count; ++i) {
     struct nccl_policy_ctx ctx = {0};
@@ -539,7 +689,7 @@ static int benchmark_native_size_aware(uint64_t *samples, size_t count,
   (void)sink;
   decode_action(last_action, &last_decision);
   compute_stats(samples, count, &result->p50, &result->p99, &result->max);
-  result->name = "native_size_aware_v2";
+  result->name = "native";
   result->path = "builtin";
   result->verify_mode = "builtin";
   result->last_channels = last_decision.channels;
@@ -563,6 +713,10 @@ static int benchmark_policy(const char *plugin_path,
 
   if (open_plugin_session(&session, plugin_path, policy, 8, 1) != 0)
     return -1;
+  if (warmup_policy_session(&session, kWarmupIterations) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
 
   for (i = 0; i < count; ++i) {
     const size_t n_bytes = ((size_t)1 << (10 + (i % 11))) + (i & 255u);
@@ -603,18 +757,289 @@ static int benchmark_policy(const char *plugin_path,
   return 0;
 }
 
+static int test_hot_reload_latency(const char *plugin_path,
+                                   struct hot_reload_result *result) {
+  const struct policy_case initial_policy = {
+      "noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"};
+  const size_t sentinel = std::numeric_limits<size_t>::max();
+  struct plugin_session session;
+  std::vector<uint64_t> call_latencies(kHotReloadIterations, 0);
+  std::atomic<size_t> calls_started(0);
+  std::atomic<size_t> failed_calls(0);
+  std::atomic<int> reload_rc(-1);
+  struct reload_debug_stats reload_stats = {0};
+  std::atomic<size_t> first_changed_call(sentinel);
+  std::atomic<int> post_reload_channels(-1);
+  std::atomic<int> post_reload_algo(-1);
+  std::atomic<int> post_reload_proto(-1);
+
+  memset(result, 0, sizeof(*result));
+  result->first_changed_call = sentinel;
+
+  if (open_plugin_session(&session, plugin_path, &initial_policy, 8, 1) != 0)
+    return -1;
+  if (!session.debug_reload_policy) {
+    close_plugin_session(&session);
+    return failf("hot reload test requires reload debug hook");
+  }
+  if (warmup_policy_session(&session, kWarmupIterations) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+
+  std::thread caller([&]() {
+    size_t i;
+
+    for (i = 0; i < kHotReloadIterations; ++i) {
+      float cost_table[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
+      float *cost_table_ptr[NCCL_NUM_ALGORITHMS];
+      struct decision_result decision = {-1, -1, -1};
+      int n_channels = 1;
+      uint64_t start_ns;
+      uint64_t end_ns;
+
+      calls_started.store(i + 1, std::memory_order_release);
+      reset_cost_table(cost_table, cost_table_ptr);
+      start_ns = monotonic_time_ns();
+      if (session.plugin->getCollInfo(session.plugin_context, ncclFuncAllReduce,
+                                      1u << 20, 1, cost_table_ptr,
+                                      NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
+                                      0, &n_channels) != ncclSuccess) {
+        failed_calls.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      end_ns = monotonic_time_ns();
+      call_latencies[i] = end_ns - start_ns;
+      decision.channels = n_channels;
+      detect_forced_choice(cost_table, &decision.algo, &decision.proto);
+
+      if (reload_rc.load(std::memory_order_acquire) == 0 &&
+          decision.channels == 10 && decision.algo == NCCL_ALGO_RING &&
+          decision.proto == NCCL_PROTO_SIMPLE) {
+        size_t expected = sentinel;
+        (void)first_changed_call.compare_exchange_strong(
+            expected, i, std::memory_order_acq_rel, std::memory_order_acquire);
+        post_reload_channels.store(decision.channels,
+                                   std::memory_order_release);
+        post_reload_algo.store(decision.algo, std::memory_order_release);
+        post_reload_proto.store(decision.proto, std::memory_order_release);
+      }
+    }
+  });
+
+  std::thread reloader([&]() {
+    while (calls_started.load(std::memory_order_acquire) <
+           kHotReloadTriggerIteration) {
+      std::this_thread::yield();
+    }
+    result->reload_trigger_call = calls_started.load(std::memory_order_acquire);
+
+    reload_rc.store(session.debug_reload_policy(
+                        session.plugin_context,
+                        NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, &reload_stats),
+                    std::memory_order_release);
+  });
+
+  caller.join();
+  reloader.join();
+
+  if (reload_rc.load(std::memory_order_acquire) != 0) {
+    close_plugin_session(&session);
+    return failf("hot reload failed");
+  }
+
+  {
+    std::vector<uint64_t> pre_reload(call_latencies.begin(),
+                                     call_latencies.begin() +
+                                         result->reload_trigger_call);
+    uint64_t max_dummy = 0;
+    compute_stats(pre_reload.data(), pre_reload.size(),
+                  &result->pre_reload_p50_ns, &result->pre_reload_p99_ns,
+                  &max_dummy);
+  }
+
+  result->reload_load_ns = reload_stats.load_ns;
+  result->reload_swap_ns = reload_stats.swap_ns;
+  result->reload_total_ns = reload_stats.total_ns;
+  result->slow_call_threshold_ns =
+      std::max<uint64_t>(10000, result->pre_reload_p99_ns * 10);
+  result->completed_calls = kHotReloadIterations;
+  result->failed_calls = failed_calls.load(std::memory_order_acquire);
+  result->first_changed_call =
+      first_changed_call.load(std::memory_order_acquire);
+  result->post_reload_channels =
+      post_reload_channels.load(std::memory_order_acquire);
+  result->post_reload_algo = post_reload_algo.load(std::memory_order_acquire);
+  result->post_reload_proto = post_reload_proto.load(std::memory_order_acquire);
+
+  for (size_t i = 0; i < call_latencies.size(); ++i) {
+    if (call_latencies[i] > result->max_call_latency_ns)
+      result->max_call_latency_ns = call_latencies[i];
+    if (call_latencies[i] > result->slow_call_threshold_ns)
+      result->slow_call_count++;
+  }
+
+  close_plugin_session(&session);
+  if (result->failed_calls != 0 ||
+      result->first_changed_call == std::numeric_limits<size_t>::max() ||
+      result->post_reload_channels != 10 ||
+      result->post_reload_algo != NCCL_ALGO_RING ||
+      result->post_reload_proto != NCCL_PROTO_SIMPLE) {
+    return failf("hot reload correctness check failed");
+  }
+
+  result->first_changed_call += 1;
+  printf(
+      "hot reload us: load=%.3f swap=%.3f total=%.3f"
+      " pre_p50_ns=%" PRIu64 " pre_p99_ns=%" PRIu64 " max_call_ns=%" PRIu64
+      " slow_calls=%zu threshold_ns=%" PRIu64
+      " completed_calls=%zu failed_calls=%zu zero_call_loss=%s"
+      " trigger_call=%zu first_changed_call=%zu channels=%d algo=%d proto=%d\n",
+      result->reload_load_ns / 1000.0, result->reload_swap_ns / 1000.0,
+      result->reload_total_ns / 1000.0, result->pre_reload_p50_ns,
+      result->pre_reload_p99_ns, result->max_call_latency_ns,
+      result->slow_call_count, result->slow_call_threshold_ns,
+      result->completed_calls, result->failed_calls,
+      result->failed_calls == 0 ? "yes" : "no", result->reload_trigger_call,
+      result->first_changed_call, result->post_reload_channels,
+      result->post_reload_algo, result->post_reload_proto);
+  return 0;
+}
+
+static int test_adaptive_policy_curve(const char *plugin_path,
+                                      struct adaptive_curve_result *result) {
+  const struct policy_case policy = {
+      "adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
+      "strict"};
+  const uint64_t total_iterations = 2ull * (uint64_t)kAdaptivePhaseIterations;
+  const size_t expected_samples = total_iterations / kAdaptiveSampleStride;
+  const size_t boundary_index =
+      (size_t)(kAdaptivePhaseIterations / kAdaptiveSampleStride) - 1;
+  struct plugin_session session;
+  struct nccl_policy_telemetry_key key = {
+      .coll_type = NCCL_POLICY_COLL_ALLREDUCE,
+      .n_nodes = 1,
+  };
+  int telemetry_map_fd = -1;
+
+  memset(result, 0, sizeof(*result));
+
+  if (expected_samples > adaptive_curve_result::kMaxSamples)
+    return failf("adaptive curve sample budget exceeded");
+  if (open_plugin_session(&session, plugin_path, &policy, 8, 1) != 0)
+    return -1;
+  if (!session.debug_get_map_fd || !session.map_update_elem ||
+      !session.map_lookup_elem || !session.debug_set_synthetic_telemetry) {
+    close_plugin_session(&session);
+    return failf("adaptive curve test requires debug map + telemetry hooks");
+  }
+
+  telemetry_map_fd =
+      session.debug_get_map_fd(session.plugin_context, "telemetry_map");
+  if (telemetry_map_fd < 0) {
+    close_plugin_session(&session);
+    return failf("adaptive curve test could not find telemetry_map");
+  }
+
+  for (size_t sample_idx = 0; sample_idx < expected_samples; ++sample_idx) {
+    const uint32_t phase_high = sample_idx >= expected_samples / 2 ? 1u : 0u;
+    const uint64_t seeded_latency_ns = phase_high ? 100 : 200;
+    const uint64_t current_latency_ns = phase_high ? 10000 : 100;
+    const struct nccl_policy_telemetry_value *current =
+        lookup_telemetry_map(&session, telemetry_map_fd, &key);
+    struct nccl_policy_telemetry_value seeded = {
+        .last_latency_ns = seeded_latency_ns,
+        .avg_latency_ns = seeded_latency_ns,
+        .p99_latency_ns = seeded_latency_ns,
+        .last_n_bytes = 1u << 20,
+        .samples = current ? current->samples : 1,
+        .recommended_channels = current ? current->recommended_channels : 4,
+    };
+
+    if (seed_telemetry_map(&session, telemetry_map_fd, &key, &seeded) != 0) {
+      close_plugin_session(&session);
+      return -1;
+    }
+    if (set_synthetic_telemetry(&session, current_latency_ns,
+                                current_latency_ns, current_latency_ns,
+                                1) != 0) {
+      close_plugin_session(&session);
+      return -1;
+    }
+
+    for (size_t iter = 0; iter < kAdaptiveSampleStride; ++iter) {
+      struct decision_result decision = {-1, -1, -1};
+      if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 1,
+                          &decision) != 0) {
+        close_plugin_session(&session);
+        return -1;
+      }
+    }
+
+    current = lookup_telemetry_map(&session, telemetry_map_fd, &key);
+    if (!current) {
+      close_plugin_session(&session);
+      return failf("adaptive curve test lost telemetry state");
+    }
+
+    result->calls[sample_idx] = (sample_idx + 1) * kAdaptiveSampleStride;
+    result->channels[sample_idx] = current->recommended_channels;
+    result->map_channels[sample_idx] = current->recommended_channels;
+    result->sample_count++;
+  }
+
+  if (set_synthetic_telemetry(&session, 0, 0, 0, 0) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+
+  close_plugin_session(&session);
+
+  result->boundary_before_channels = result->channels[boundary_index];
+  result->boundary_after_channels = result->channels[boundary_index + 1];
+  if (result->boundary_before_channels <= 4 ||
+      result->boundary_after_channels >= result->boundary_before_channels) {
+    return failf("adaptive curve did not show increase then decrease");
+  }
+
+  printf("adaptive curve boundary: before=%u after=%u samples=%zu\n",
+         result->boundary_before_channels, result->boundary_after_channels,
+         result->sample_count);
+  for (size_t i = 0; i < result->sample_count; ++i) {
+    printf("adaptive sample: call=%" PRIu64 " phase=%s channels=%u"
+           " map_channels=%u\n",
+           result->calls[i],
+           result->calls[i] <= kAdaptivePhaseIterations ? "low" : "high",
+           result->channels[i], result->map_channels[i]);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const char *plugin_path = argc > 1 ? argv[1] : NCCL_POLICY_TEST_PLUGIN_PATH;
   const struct policy_case strict_policies[] = {
       {"noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"},
       {"size_aware", NCCL_POLICY_TEST_SIZE_AWARE_BPF_PATH, "strict"},
       {"size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict"},
+      {"lookup_only", NCCL_POLICY_TEST_LOOKUP_ONLY_BPF_PATH, "strict"},
+      {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict"},
+      {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
+       "strict"},
+      {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict"},
+  };
+  const struct policy_case benchmark_policies[] = {
+      {"noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"},
+      {"size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict"},
+      {"lookup_only", NCCL_POLICY_TEST_LOOKUP_ONLY_BPF_PATH, "strict"},
+      {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict"},
       {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
        "strict"},
       {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict"},
   };
   struct benchmark_result native_result = {0};
   struct benchmark_result policy_result = {0};
+  struct hot_reload_result hot_reload_result = {0};
+  struct adaptive_curve_result adaptive_curve_result = {0};
   uint64_t *samples = (uint64_t *)calloc(kIterations, sizeof(*samples));
   size_t i;
 
@@ -654,9 +1079,10 @@ int main(int argc, char **argv) {
          native_result.last_channels, native_result.last_algo,
          native_result.last_proto);
 
-  for (i = 0; i < sizeof(strict_policies) / sizeof(strict_policies[0]); ++i) {
-    if (benchmark_policy(plugin_path, &strict_policies[i], samples, kIterations,
-                         &policy_result) != 0) {
+  for (i = 0; i < sizeof(benchmark_policies) / sizeof(benchmark_policies[0]);
+       ++i) {
+    if (benchmark_policy(plugin_path, &benchmark_policies[i], samples,
+                         kIterations, &policy_result) != 0) {
       free(samples);
       return 1;
     }
@@ -670,6 +1096,16 @@ int main(int argc, char **argv) {
            delta_u64(policy_result.p99, native_result.p99),
            policy_result.last_channels, policy_result.last_algo,
            policy_result.last_proto);
+  }
+
+  if (test_hot_reload_latency(plugin_path, &hot_reload_result) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_adaptive_policy_curve(plugin_path, &adaptive_curve_result) != 0) {
+    free(samples);
+    return 1;
   }
 
   free(samples);

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <bpf/libbpf.h>
 #include <fcntl.h>
 #include <gelf.h>
@@ -62,21 +63,39 @@ enum class VerifyMode {
 };
 
 struct PluginContext {
-  std::unique_ptr<bpftime::bpftime_prog> prog;
   ncclDebugLogger_t log_function = nullptr;
   size_t n_ranks = 0;
   size_t n_nodes = 0;
-  std::mutex state_mu;
+  std::mutex stats_mu;
+  std::mutex reload_mu;
   uint64_t call_count = 0;
   uint64_t total_latency_ns = 0;
   uint64_t last_latency_ns = 0;
   uint64_t rolling_p99_ns = 0;
   int last_channels = 1;
-  bool loaded_from_file = false;
-  std::string policy_source = "hardcoded-noop";
-  std::string section_name = "uprobe";
-  std::unordered_map<std::string, int> map_fds;
-  std::map<int, bpftime::verifier::BpftimeMapDescriptor> verifier_maps;
+  struct SyntheticTelemetryState {
+    bool enabled = false;
+    uint64_t last_latency_ns = 0;
+    uint64_t avg_latency_ns = 0;
+    uint64_t rolling_p99_ns = 0;
+  } synthetic_telemetry;
+  struct LoadedPolicyState {
+    ~LoadedPolicyState() {
+      for (const auto &entry : map_fds) {
+        if (entry.second >= 0)
+          bpftime_close(entry.second);
+      }
+    }
+
+    std::unique_ptr<bpftime::bpftime_prog> prog;
+    bool loaded_from_file = false;
+    std::string policy_source = "hardcoded-noop";
+    std::string section_name = "uprobe";
+    std::unordered_map<std::string, int> map_fds;
+    std::map<int, bpftime::verifier::BpftimeMapDescriptor> verifier_maps;
+    mutable std::mutex exec_mu;
+  };
+  std::shared_ptr<LoadedPolicyState> active_policy;
 };
 
 struct ProgramSpec {
@@ -96,6 +115,20 @@ struct SeededPolicyConfig {
   uint32_t min_channels = 1;
   uint32_t max_channels = 8;
   uint32_t aggressiveness_step = 1;
+};
+
+struct SyntheticTelemetryConfig {
+  uint64_t last_latency_ns = 0;
+  uint64_t avg_latency_ns = 0;
+  uint64_t rolling_p99_ns = 0;
+  uint32_t enabled = 0;
+  uint32_t reserved = 0;
+};
+
+struct ReloadDebugStats {
+  uint64_t load_ns = 0;
+  uint64_t swap_ns = 0;
+  uint64_t total_ns = 0;
 };
 
 std::mutex g_runtime_mu;
@@ -266,7 +299,29 @@ SeededPolicyConfig load_seeded_policy_config(PluginContext *ctx) {
   return cfg;
 }
 
-bool create_bpftime_maps(PluginContext *ctx, struct bpf_object *obj) {
+std::shared_ptr<PluginContext::LoadedPolicyState>
+load_active_policy(PluginContext *ctx) {
+  return std::atomic_load_explicit(&ctx->active_policy,
+                                   std::memory_order_acquire);
+}
+
+void store_active_policy(
+    PluginContext *ctx,
+    std::shared_ptr<PluginContext::LoadedPolicyState> policy_state) {
+  std::atomic_store_explicit(&ctx->active_policy, std::move(policy_state),
+                             std::memory_order_release);
+}
+
+std::shared_ptr<PluginContext::LoadedPolicyState> exchange_active_policy(
+    PluginContext *ctx,
+    std::shared_ptr<PluginContext::LoadedPolicyState> policy_state) {
+  return std::atomic_exchange_explicit(
+      &ctx->active_policy, std::move(policy_state), std::memory_order_acq_rel);
+}
+
+bool create_bpftime_maps(PluginContext *ctx,
+                         PluginContext::LoadedPolicyState *policy_state,
+                         struct bpf_object *obj) {
   struct bpf_map *map = nullptr;
 
   bpf_object__for_each_map(map, obj) {
@@ -292,8 +347,8 @@ bool create_bpftime_maps(PluginContext *ctx, struct bpf_object *obj) {
                          bpf_map__name(map));
       return false;
     }
-    ctx->map_fds.emplace(bpf_map__name(map), fd);
-    ctx->verifier_maps.emplace(
+    policy_state->map_fds.emplace(bpf_map__name(map), fd);
+    policy_state->verifier_maps.emplace(
         fd, bpftime::verifier::BpftimeMapDescriptor{
                 .original_fd = fd,
                 .type = static_cast<uint32_t>(attr.type),
@@ -333,6 +388,7 @@ bool extract_program_spec(PluginContext *ctx, struct bpf_object *obj,
 }
 
 bool relocate_program_maps(PluginContext *ctx, const char *path,
+                           PluginContext::LoadedPolicyState *policy_state,
                            ProgramSpec *spec) {
   int fd = -1;
   Elf *elf = nullptr;
@@ -344,7 +400,7 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
   std::unordered_map<size_t, MapSymbol> symbols;
   std::vector<ebpf_inst> relocated = spec->insns;
 
-  if (ctx->map_fds.empty())
+  if (policy_state->map_fds.empty())
     return true;
 
   if (elf_version(EV_CURRENT) == EV_NONE) {
@@ -462,7 +518,7 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
       uint64_t offset = 0;
       size_t symbol_index = 0;
       auto symbol_it = symbols.end();
-      auto map_it = ctx->map_fds.end();
+      auto map_it = policy_state->map_fds.end();
 
       if (shdr.sh_type == SHT_REL) {
         GElf_Rel rel = {};
@@ -487,8 +543,8 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
       if (symbol_it == symbols.end())
         continue;
 
-      map_it = ctx->map_fds.find(symbol_it->second.name);
-      if (map_it == ctx->map_fds.end())
+      map_it = policy_state->map_fds.find(symbol_it->second.name);
+      if (map_it == policy_state->map_fds.end())
         continue;
 
       relocated[offset / sizeof(ebpf_inst)].src_reg = BPF_PSEUDO_MAP_FD;
@@ -503,7 +559,9 @@ bool relocate_program_maps(PluginContext *ctx, const char *path,
   return true;
 }
 
-bool verify_program(PluginContext *ctx, const ProgramSpec &spec) {
+bool verify_program(PluginContext *ctx,
+                    const PluginContext::LoadedPolicyState *policy_state,
+                    const ProgramSpec &spec) {
   std::vector<int32_t> helper_ids;
   const VerifyMode mode = get_verify_mode();
   const std::string verify_section = verifier_section_name(spec.section_name);
@@ -517,7 +575,7 @@ bool verify_program(PluginContext *ctx, const ProgramSpec &spec) {
     return mode != VerifyMode::kStrict;
   }
 
-  bpftime::verifier::set_map_descriptors(ctx->verifier_maps);
+  bpftime::verifier::set_map_descriptors(policy_state->verifier_maps);
   bpftime::verifier::set_available_helpers(helper_ids);
   bpftime::verifier::set_non_kernel_helpers({});
 
@@ -535,24 +593,26 @@ bool verify_program(PluginContext *ctx, const ProgramSpec &spec) {
 
   if (mode == VerifyMode::kStrict) {
     fprintf(stderr, "[nccl-policy-plugin] verifier rejected %s:\n%s\n",
-            ctx->policy_source.c_str(), result->c_str());
+            policy_state->policy_source.c_str(), result->c_str());
     if (ctx && ctx->log_function) {
       ctx->log_function(NCCL_LOG_WARN, NCCL_TUNING, __FILE__, __LINE__,
-                        "verifier rejected %s", ctx->policy_source.c_str());
+                        "verifier rejected %s",
+                        policy_state->policy_source.c_str());
     }
     return false;
   }
 
   log_plugin_message(ctx, NCCL_LOG_WARN, "verifier warning for %s: %s",
-                     ctx->policy_source.c_str(), result->c_str());
+                     policy_state->policy_source.c_str(), result->c_str());
   return true;
 }
 
-void seed_config_map(PluginContext *ctx) {
-  auto map_it = ctx->map_fds.find("config_map");
+void seed_config_map(PluginContext *ctx,
+                     PluginContext::LoadedPolicyState *policy_state) {
+  auto map_it = policy_state->map_fds.find("config_map");
   const SeededPolicyConfig cfg = load_seeded_policy_config(ctx);
 
-  if (map_it == ctx->map_fds.end())
+  if (map_it == policy_state->map_fds.end())
     return;
 
   for (uint32_t coll_type = 0; coll_type <= NCCL_POLICY_COLL_ALLREDUCE;
@@ -568,25 +628,28 @@ void seed_config_map(PluginContext *ctx) {
   }
 }
 
-bool load_hardcoded_program(PluginContext *ctx) {
+bool load_hardcoded_program(PluginContext *ctx,
+                            PluginContext::LoadedPolicyState *policy_state) {
   auto config = bpftime::construct_agent_config_from_env();
   config.set_vm_name("llvm");
-  ctx->prog = std::make_unique<bpftime::bpftime_prog>(
+  policy_state->prog = std::make_unique<bpftime::bpftime_prog>(
       kHardcodedNoopProgram, std::size(kHardcodedNoopProgram), "hardcoded-noop",
       std::move(config));
-  if (!ctx->prog || !register_helpers(ctx->prog.get()))
+  if (!policy_state->prog || !register_helpers(policy_state->prog.get()))
     return false;
-  if (ctx->prog->bpftime_prog_load(true) < 0) {
+  if (policy_state->prog->bpftime_prog_load(true) < 0) {
     log_plugin_message(ctx, NCCL_LOG_WARN,
                        "failed to load hardcoded noop policy");
     return false;
   }
-  ctx->policy_source = "hardcoded-noop";
-  ctx->section_name = "uprobe";
+  policy_state->policy_source = "hardcoded-noop";
+  policy_state->section_name = "uprobe";
   return true;
 }
 
-bool load_program_from_object(PluginContext *ctx, const char *path) {
+bool load_program_from_object(PluginContext *ctx,
+                              PluginContext::LoadedPolicyState *policy_state,
+                              const char *path) {
   std::unique_ptr<struct bpf_object, decltype(&bpf_object__close)> obj(
       bpf_object__open_file(path, nullptr), &bpf_object__close);
   ProgramSpec spec;
@@ -598,53 +661,54 @@ bool load_program_from_object(PluginContext *ctx, const char *path) {
     return false;
   }
 
-  ctx->policy_source = path;
+  policy_state->policy_source = path;
 
   if (!extract_program_spec(ctx, obj.get(), &spec)) {
     log_plugin_message(ctx, NCCL_LOG_WARN,
                        "unable to extract a program from %s", path);
     return false;
   }
-  if (!create_bpftime_maps(ctx, obj.get()))
+  if (!create_bpftime_maps(ctx, policy_state, obj.get()))
     return false;
-  if (!relocate_program_maps(ctx, path, &spec))
+  if (!relocate_program_maps(ctx, path, policy_state, &spec))
     return false;
-  if (!verify_program(ctx, spec))
+  if (!verify_program(ctx, policy_state, spec))
     return false;
 
   config.set_vm_name("llvm");
-  ctx->prog = std::make_unique<bpftime::bpftime_prog>(
+  policy_state->prog = std::make_unique<bpftime::bpftime_prog>(
       spec.insns.data(), spec.insns.size(), spec.name.c_str(),
       std::move(config));
-  if (!ctx->prog) {
+  if (!policy_state->prog) {
     log_plugin_message(ctx, NCCL_LOG_WARN,
                        "failed to allocate bpftime_prog for %s", path);
     return false;
   }
-  if (!register_helpers(ctx->prog.get())) {
+  if (!register_helpers(policy_state->prog.get())) {
     log_plugin_message(ctx, NCCL_LOG_WARN,
                        "failed to register helper groups for %s", path);
     return false;
   }
-  if (ctx->prog->bpftime_prog_load(true) < 0) {
+  if (policy_state->prog->bpftime_prog_load(true) < 0) {
     log_plugin_message(ctx, NCCL_LOG_WARN, "failed to JIT-load policy %s",
                        path);
     return false;
   }
 
-  ctx->loaded_from_file = true;
-  ctx->section_name = spec.section_name;
-  seed_config_map(ctx);
+  policy_state->loaded_from_file = true;
+  policy_state->section_name = spec.section_name;
+  seed_config_map(ctx, policy_state);
   return true;
 }
 
-bool warmup_program(PluginContext *ctx) {
+bool warmup_program(PluginContext *ctx,
+                    PluginContext::LoadedPolicyState *policy_state) {
   struct nccl_policy_ctx warmup_ctx = {};
   uint64_t action = 0;
   const uint64_t start_ns = monotonic_time_ns();
   int err = 0;
 
-  if (!ctx->map_fds.empty()) {
+  if (!policy_state->map_fds.empty()) {
     // Map-backed policies are stateful. Skip synthetic warmup so the first real
     // getCollInfo() call observes empty policy state.
     return true;
@@ -657,10 +721,11 @@ bool warmup_program(PluginContext *ctx) {
   warmup_ctx.n_nodes = static_cast<uint32_t>(ctx->n_nodes);
   warmup_ctx.current_channels = static_cast<uint32_t>(ctx->last_channels);
 
-  err = ctx->prog->bpftime_prog_exec(&warmup_ctx, sizeof(warmup_ctx), &action);
+  err = policy_state->prog->bpftime_prog_exec(&warmup_ctx, sizeof(warmup_ctx),
+                                              &action);
   if (err < 0) {
     log_plugin_message(ctx, NCCL_LOG_WARN, "warmup execution failed for %s",
-                       ctx->policy_source.c_str());
+                       policy_state->policy_source.c_str());
     return false;
   }
 
@@ -669,6 +734,23 @@ bool warmup_program(PluginContext *ctx) {
           " latency_ns=%" PRIu64 "\n",
           warmup_ctx.n_bytes, action, monotonic_time_ns() - start_ns);
   return true;
+}
+
+std::shared_ptr<PluginContext::LoadedPolicyState>
+load_policy_state(PluginContext *ctx, const char *policy_path) {
+  auto policy_state = std::make_shared<PluginContext::LoadedPolicyState>();
+  bool loaded = false;
+
+  if (policy_path && policy_path[0] != '\0') {
+    loaded = load_program_from_object(ctx, policy_state.get(), policy_path);
+  } else {
+    loaded = load_hardcoded_program(ctx, policy_state.get());
+  }
+  if (!loaded || !policy_state->prog ||
+      !warmup_program(ctx, policy_state.get())) {
+    return nullptr;
+  }
+  return policy_state;
 }
 
 void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
@@ -711,28 +793,18 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
   ctx->n_nodes = n_nodes;
 
   const char *policy_path = getenv("NCCL_POLICY_BPF_PATH");
-  bool loaded = false;
-
-  if (policy_path && policy_path[0] != '\0') {
-    loaded = load_program_from_object(ctx, policy_path);
-    if (!loaded) {
-      delete ctx;
-      release_bpftime_runtime();
-      return ncclInternalError;
-    }
-  } else {
-    loaded = load_hardcoded_program(ctx);
-  }
-  if (!loaded || !ctx->prog || !warmup_program(ctx)) {
+  auto policy_state = load_policy_state(ctx, policy_path);
+  if (!policy_state) {
     delete ctx;
     release_bpftime_runtime();
     return ncclInternalError;
   }
+  store_active_policy(ctx, std::move(policy_state));
 
   log_plugin_message(
       ctx, NCCL_LOG_INFO,
       "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
-      n_nodes, ctx->policy_source.c_str());
+      n_nodes, load_active_policy(ctx)->policy_source.c_str());
   *context = ctx;
   return ncclSuccess;
 }
@@ -745,55 +817,72 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   auto *ctx = reinterpret_cast<PluginContext *>(context);
   struct nccl_policy_ctx policy_ctx = {};
   uint64_t action = 0;
+  uint64_t exec_latency_ns = 0;
+  uint64_t call_count_snapshot = 0;
+  int current_channels = 1;
+  PluginContext::SyntheticTelemetryState synthetic = {};
   int err = 0;
+  std::shared_ptr<PluginContext::LoadedPolicyState> policy_state;
 
-  if (!ctx || !ctx->prog || !n_channels)
+  if (!ctx || !n_channels)
+    return ncclInternalError;
+  policy_state = load_active_policy(ctx);
+  if (!policy_state || !policy_state->prog)
     return ncclInternalError;
 
-  std::lock_guard<std::mutex> lock(ctx->state_mu);
+  {
+    std::lock_guard<std::mutex> lock(ctx->stats_mu);
+    call_count_snapshot = ctx->call_count;
+    current_channels = ctx->last_channels;
+    synthetic = ctx->synthetic_telemetry;
+  }
 
-  *n_channels = ctx->last_channels;
+  *n_channels = current_channels;
 
   policy_ctx.n_bytes = n_bytes;
-  // TODO: Replace these placeholder zeros with NCCL collective telemetry once
-  // the tuner is wired to the profiler adapter. Feeding plugin dispatch
-  // overhead back into policies breaks map-backed tuning decisions.
-  policy_ctx.last_latency_ns = 0;
-  policy_ctx.avg_latency_ns = 0;
-  policy_ctx.rolling_p99_ns = 0;
-  policy_ctx.call_count = ctx->call_count;
+  policy_ctx.last_latency_ns =
+      synthetic.enabled ? synthetic.last_latency_ns : 0;
+  policy_ctx.avg_latency_ns = synthetic.enabled ? synthetic.avg_latency_ns : 0;
+  policy_ctx.rolling_p99_ns = synthetic.enabled ? synthetic.rolling_p99_ns : 0;
+  policy_ctx.call_count = call_count_snapshot;
   policy_ctx.coll_type = static_cast<uint32_t>(coll_type);
   policy_ctx.num_pipe_ops = static_cast<uint32_t>(num_pipe_ops);
   policy_ctx.reg_buff = static_cast<uint32_t>(reg_buff);
   policy_ctx.n_ranks = static_cast<uint32_t>(ctx->n_ranks);
   policy_ctx.n_nodes = static_cast<uint32_t>(ctx->n_nodes);
-  policy_ctx.current_channels = static_cast<uint32_t>(ctx->last_channels);
+  policy_ctx.current_channels = static_cast<uint32_t>(current_channels);
 
   {
     const uint64_t start_ns = monotonic_time_ns();
-    err =
-        ctx->prog->bpftime_prog_exec(&policy_ctx, sizeof(policy_ctx), &action);
-    ctx->last_latency_ns = monotonic_time_ns() - start_ns;
+    std::lock_guard<std::mutex> exec_lock(policy_state->exec_mu);
+    err = policy_state->prog->bpftime_prog_exec(&policy_ctx, sizeof(policy_ctx),
+                                                &action);
+    exec_latency_ns = monotonic_time_ns() - start_ns;
   }
-  ctx->rolling_p99_ns =
-      update_p99_estimate(ctx->rolling_p99_ns, ctx->last_latency_ns);
 
   if (err < 0) {
     log_plugin_message(ctx, NCCL_LOG_WARN, "bpftime execution failed for %s",
-                       ctx->policy_source.c_str());
+                       policy_state->policy_source.c_str());
     return ncclInternalError;
   }
 
   apply_policy_action(action, coll_cost_table, num_algo, num_proto, n_channels);
-  ctx->last_channels = *n_channels;
-  ctx->total_latency_ns += ctx->last_latency_ns;
-  ctx->call_count++;
+  {
+    std::lock_guard<std::mutex> lock(ctx->stats_mu);
+    ctx->last_channels = *n_channels;
+    ctx->last_latency_ns = exec_latency_ns;
+    ctx->rolling_p99_ns =
+        update_p99_estimate(ctx->rolling_p99_ns, ctx->last_latency_ns);
+    ctx->total_latency_ns += ctx->last_latency_ns;
+    ctx->call_count++;
+    call_count_snapshot = ctx->call_count;
+  }
 
-  if (ctx->call_count <= 5 || ctx->call_count % 100000 == 0) {
+  if (call_count_snapshot <= 5 || call_count_snapshot % 100000 == 0) {
     fprintf(stderr,
             "[nccl-policy-plugin] call=%" PRIu64 " bytes=%zu action=%" PRIu64
             " latency_ns=%" PRIu64 " channels=%d aggr=%u\n",
-            ctx->call_count, n_bytes, action, ctx->last_latency_ns, *n_channels,
+            call_count_snapshot, n_bytes, action, exec_latency_ns, *n_channels,
             nccl_policy_action_aggressiveness(action));
   }
 
@@ -811,23 +900,88 @@ ncclResult_t pluginFinalizeImpl(void *context) {
     return ncclSuccess;
 
   {
-    std::lock_guard<std::mutex> lock(ctx->state_mu);
+    std::lock_guard<std::mutex> lock(ctx->stats_mu);
     call_count = ctx->call_count;
     avg_latency = call_count == 0 ? 0 : ctx->total_latency_ns / call_count;
     last_latency = ctx->last_latency_ns;
     p99_latency = ctx->rolling_p99_ns;
   }
 
+  auto policy_state = load_active_policy(ctx);
+
   fprintf(stderr,
           "[nccl-policy-plugin] finalize calls=%" PRIu64
           " avg_latency_ns=%" PRIu64 " last_latency_ns=%" PRIu64
           " p99_estimate_ns=%" PRIu64 " source=%s\n",
           call_count, avg_latency, last_latency, p99_latency,
-          ctx->policy_source.c_str());
+          policy_state ? policy_state->policy_source.c_str() : "none");
 
+  store_active_policy(ctx, nullptr);
+  policy_state.reset();
   delete ctx;
   release_bpftime_runtime();
   return ncclSuccess;
+}
+
+int pluginReloadPolicyImpl(void *context, const char *policy_path,
+                           ReloadDebugStats *reload_stats) {
+  auto *ctx = reinterpret_cast<PluginContext *>(context);
+  const char *effective_path = policy_path;
+  uint64_t load_start_ns = 0;
+  uint64_t load_end_ns = 0;
+  uint64_t swap_start_ns = 0;
+  uint64_t swap_end_ns = 0;
+
+  if (!ctx)
+    return -1;
+  if (!effective_path || effective_path[0] == '\0')
+    effective_path = getenv("NCCL_POLICY_BPF_PATH");
+
+  std::lock_guard<std::mutex> lock(ctx->reload_mu);
+  load_start_ns = monotonic_time_ns();
+  auto next_policy = load_policy_state(ctx, effective_path);
+  load_end_ns = monotonic_time_ns();
+  if (!next_policy)
+    return -1;
+
+  swap_start_ns = monotonic_time_ns();
+  auto previous_policy = exchange_active_policy(ctx, std::move(next_policy));
+  swap_end_ns = monotonic_time_ns();
+
+  if (reload_stats) {
+    reload_stats->load_ns = load_end_ns - load_start_ns;
+    reload_stats->swap_ns = swap_end_ns - swap_start_ns;
+    reload_stats->total_ns = swap_end_ns - load_start_ns;
+  }
+  log_plugin_message(ctx, NCCL_LOG_INFO,
+                     "reloaded policy %s -> %s (load=%" PRIu64
+                     "ns swap=%" PRIu64 "ns total=%" PRIu64 "ns)",
+                     previous_policy ? previous_policy->policy_source.c_str()
+                                     : "none",
+                     load_active_policy(ctx)->policy_source.c_str(),
+                     load_end_ns - load_start_ns, swap_end_ns - swap_start_ns,
+                     swap_end_ns - load_start_ns);
+  return 0;
+}
+
+int pluginSetSyntheticTelemetryImpl(void *context,
+                                    const SyntheticTelemetryConfig *config) {
+  auto *ctx = reinterpret_cast<PluginContext *>(context);
+
+  if (!ctx)
+    return -1;
+
+  std::lock_guard<std::mutex> lock(ctx->stats_mu);
+  if (!config) {
+    ctx->synthetic_telemetry = {};
+    return 0;
+  }
+
+  ctx->synthetic_telemetry.enabled = config->enabled != 0;
+  ctx->synthetic_telemetry.last_latency_ns = config->last_latency_ns;
+  ctx->synthetic_telemetry.avg_latency_ns = config->avg_latency_ns;
+  ctx->synthetic_telemetry.rolling_p99_ns = config->rolling_p99_ns;
+  return 0;
 }
 
 } // namespace
@@ -866,16 +1020,34 @@ extern const ncclTuner_v5_t ncclTunerPlugin_v5
 
 extern int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name)
     __attribute__((visibility("default")));
+extern int ncclPolicyPluginDebugReloadPolicy(void *context,
+                                             const char *policy_path,
+                                             ReloadDebugStats *reload_stats)
+    __attribute__((visibility("default")));
+extern int ncclPolicyPluginDebugSetSyntheticTelemetry(
+    void *context, const SyntheticTelemetryConfig *config)
+    __attribute__((visibility("default")));
 
 int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name) {
   auto *ctx = reinterpret_cast<PluginContext *>(context);
+  auto policy_state = ctx ? load_active_policy(ctx) : nullptr;
   std::unordered_map<std::string, int>::const_iterator map_it;
 
-  if (!ctx || !map_name)
+  if (!ctx || !policy_state || !map_name)
     return -1;
-  map_it = ctx->map_fds.find(map_name);
-  if (map_it == ctx->map_fds.end())
+  map_it = policy_state->map_fds.find(map_name);
+  if (map_it == policy_state->map_fds.end())
     return -1;
   return map_it->second;
+}
+
+int ncclPolicyPluginDebugReloadPolicy(void *context, const char *policy_path,
+                                      ReloadDebugStats *reload_stats) {
+  return pluginReloadPolicyImpl(context, policy_path, reload_stats);
+}
+
+int ncclPolicyPluginDebugSetSyntheticTelemetry(
+    void *context, const SyntheticTelemetryConfig *config) {
+  return pluginSetSyntheticTelemetryImpl(context, config);
 }
 }

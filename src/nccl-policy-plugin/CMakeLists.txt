@@ -107,6 +107,8 @@ endfunction()
 add_policy_object(noop_policy noop NOOP_BPF_O)
 add_policy_object(size_aware_policy size_aware SIZE_AWARE_BPF_O)
 add_policy_object(size_aware_v2_policy size_aware_v2 SIZE_AWARE_V2_BPF_O)
+add_policy_object(lookup_only_policy lookup_only LOOKUP_ONLY_BPF_O)
+add_policy_object(lookup_update_policy lookup_update LOOKUP_UPDATE_BPF_O)
 add_policy_object(adaptive_channels_policy adaptive_channels
                   ADAPTIVE_CHANNELS_BPF_O)
 add_policy_object(slo_enforcer_policy slo_enforcer SLO_ENFORCER_BPF_O)
@@ -116,6 +118,8 @@ set(POLICY_OBJECTS
     ${NOOP_BPF_O}
     ${SIZE_AWARE_BPF_O}
     ${SIZE_AWARE_V2_BPF_O}
+    ${LOOKUP_ONLY_BPF_O}
+    ${LOOKUP_UPDATE_BPF_O}
     ${ADAPTIVE_CHANNELS_BPF_O}
     ${SLO_ENFORCER_BPF_O}
     ${BAD_LOOKUP_BPF_O})

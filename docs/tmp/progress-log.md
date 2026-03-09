@@ -8,3 +8,4 @@
 | 2026-03-09 | Review #1: 代码质量审查 | codex exec (background b2c2e1iy4) | `docs/tmp/review1-results.md` | 完成 ✓ (6 个高优 + 8 个中优问题) |
 | 2026-03-09 | Revise #1: 修复所有 Review 问题 | codex exec (background bezhh3wgt) | `docs/tmp/revise1-results.md` | 完成 ✓ (all strict verifier pass, P50=42-78ns) |
 | 2026-03-09 | 性能测试: CPU + GPU 基准 | codex exec (background bz2adthf2) | `docs/tmp/benchmark-results.md`, `docs/tmp/benchmark-latency.csv` | 完成 ✓ (GPU 开销 <0.05us, 可忽略) |
+| 2026-03-09 | Review #2: 性能数据分析 | codex exec (background bkku81lom) | `docs/tmp/review2-results.md` | 完成 ✓ (getCollInfo 未被调用是关键gap) |

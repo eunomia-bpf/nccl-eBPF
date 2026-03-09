@@ -4,8 +4,8 @@
 #include "policy_maps.h"
 
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 16);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, NCCL_POLICY_COLL_ALLREDUCE + 1);
   __type(key, struct nccl_policy_config_key);
   __type(value, struct nccl_policy_config_value);
 } config_map SEC(".maps");
