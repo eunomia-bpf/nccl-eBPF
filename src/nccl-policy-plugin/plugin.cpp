@@ -196,6 +196,7 @@ std::mutex g_runtime_mu;
 size_t g_runtime_users = 0;
 std::mutex g_comm_registry_mu;
 std::unordered_map<uint64_t, std::weak_ptr<SharedCommState>> g_comm_registry;
+std::atomic<uint64_t> g_policy_instance_ids{1};
 
 void ensure_bpftime_shm_name() {
   const char *existing = getenv("BPFTIME_GLOBAL_SHM_NAME");
@@ -445,9 +446,17 @@ bool create_bpftime_maps(SharedCommState *shared,
                          SharedCommState::LoadedPolicyState *policy_state,
                          struct bpf_object *obj) {
   struct bpf_map *map = nullptr;
+  const uint64_t policy_instance_id =
+      g_policy_instance_ids.fetch_add(1, std::memory_order_relaxed);
+  const std::string map_namespace =
+      "comm_" + std::to_string(shared ? shared->comm_id : 0) + "_policy_" +
+      std::to_string(policy_instance_id) + "_";
 
   bpf_object__for_each_map(map, obj) {
     bpftime::bpf_map_attr attr = {};
+    const char *logical_name = bpf_map__name(map);
+    const std::string runtime_name =
+        map_namespace + (logical_name ? logical_name : "unnamed_map");
     int fd = -1;
 
     if (bpf_map__is_internal(map))
@@ -463,14 +472,16 @@ bool create_bpftime_maps(SharedCommState *shared,
     attr.btf_value_type_id = bpf_map__btf_value_type_id(map);
     attr.map_extra = bpf_map__map_extra(map);
 
-    fd = bpftime_maps_create(-1, bpf_map__name(map), attr);
+    fd = bpftime_maps_create(-1, runtime_name.c_str(), attr);
     if (fd < 0) {
       log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
-                         NCCL_LOG_WARN, "failed to create bpftime map %s",
-                         bpf_map__name(map));
+                         NCCL_LOG_WARN,
+                         "failed to create bpftime map %s (runtime=%s)",
+                         logical_name ? logical_name : "unnamed_map",
+                         runtime_name.c_str());
       return false;
     }
-    policy_state->map_fds.emplace(bpf_map__name(map), fd);
+    policy_state->map_fds.emplace(logical_name ? logical_name : "", fd);
     policy_state->verifier_maps.emplace(
         fd, bpftime::verifier::BpftimeMapDescriptor{
                 .original_fd = fd,

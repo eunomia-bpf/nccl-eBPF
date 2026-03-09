@@ -31,7 +31,8 @@
 
 enum { kIterations = 1000000 };
 enum { kWarmupIterations = 10000 };
-enum { kAdaptivePhaseIterations = 500000 };
+enum { kDifferentiatedIterations = 100000 };
+enum { kAdaptivePhaseIterations = 100000 };
 enum { kAdaptiveSampleStride = 10000 };
 enum { kHotReloadIterations = 400000 };
 enum { kHotReloadTriggerIteration = 200000 };
@@ -154,10 +155,11 @@ struct adaptive_curve_result {
   enum { kMaxSamples = 100 };
   size_t sample_count;
   uint64_t calls[kMaxSamples];
+  uint64_t injected_latency_ns[kMaxSamples];
   uint32_t channels[kMaxSamples];
   uint32_t map_channels[kMaxSamples];
-  uint32_t boundary_before_channels;
-  uint32_t boundary_after_channels;
+  uint32_t phase_ids[kMaxSamples];
+  uint32_t phase_end_channels[3];
 };
 
 static void close_plugin_session(struct plugin_session *session);
@@ -204,6 +206,90 @@ static int decision_matches(const struct decision_result *decision,
                             int channels, int algo, int proto) {
   return decision->channels == channels && decision->algo == algo &&
          decision->proto == proto;
+}
+
+static const char *collective_name(ncclFunc_t coll_type) {
+  switch (coll_type) {
+  case ncclFuncBroadcast:
+    return "Broadcast";
+  case ncclFuncReduce:
+    return "Reduce";
+  case ncclFuncAllGather:
+    return "AllGather";
+  case ncclFuncReduceScatter:
+    return "ReduceScatter";
+  case ncclFuncAllReduce:
+    return "AllReduce";
+  default:
+    return "Unknown";
+  }
+}
+
+static int policy_coll_type_from_nccl_func_test(ncclFunc_t coll_type,
+                                                uint32_t *policy_coll_type) {
+  if (!policy_coll_type)
+    return 0;
+
+  switch (coll_type) {
+  case ncclFuncBroadcast:
+    *policy_coll_type = NCCL_POLICY_COLL_BROADCAST;
+    return 1;
+  case ncclFuncReduce:
+    *policy_coll_type = NCCL_POLICY_COLL_REDUCE;
+    return 1;
+  case ncclFuncAllGather:
+    *policy_coll_type = NCCL_POLICY_COLL_ALLGATHER;
+    return 1;
+  case ncclFuncReduceScatter:
+    *policy_coll_type = NCCL_POLICY_COLL_REDUCESCATTER;
+    return 1;
+  case ncclFuncAllReduce:
+    *policy_coll_type = NCCL_POLICY_COLL_ALLREDUCE;
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static const char *algo_name(int algo) {
+  switch (algo) {
+  case NCCL_ALGO_TREE:
+    return "TREE";
+  case NCCL_ALGO_RING:
+    return "RING";
+  case -1:
+    return "-";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static const char *proto_name(int proto) {
+  switch (proto) {
+  case NCCL_PROTO_LL:
+    return "LL";
+  case NCCL_PROTO_LL128:
+    return "LL128";
+  case NCCL_PROTO_SIMPLE:
+    return "SIMPLE";
+  case -1:
+    return "-";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static const char *phase_name(uint32_t phase_id) {
+  switch (phase_id) {
+  case 0:
+    return "baseline";
+  case 1:
+    return "contention";
+  case 2:
+    return "recovery";
+  default:
+    return "unknown";
+  }
 }
 
 static int read_fd_to_string(int fd, std::string *output) {
@@ -363,10 +449,11 @@ static void decode_action(uint64_t action, struct decision_result *decision) {
   decision->proto = (int)nccl_policy_action_proto(action);
 }
 
-static int open_plugin_session(struct plugin_session *session,
-                               const char *plugin_path,
-                               const struct policy_case *policy, size_t n_ranks,
-                               size_t n_nodes) {
+static int open_plugin_session_for_comm(struct plugin_session *session,
+                                        const char *plugin_path,
+                                        const struct policy_case *policy,
+                                        uint64_t comm_id, size_t n_ranks,
+                                        size_t n_nodes) {
   memset(session, 0, sizeof(*session));
 
   if (setenv("NCCL_POLICY_BPF_PATH", policy->path, 1) != 0)
@@ -388,7 +475,8 @@ static int open_plugin_session(struct plugin_session *session,
                  dlerror());
   }
 
-  if (session->plugin->init(&session->plugin_context, 0, n_ranks, n_nodes,
+  if (session->plugin->init(&session->plugin_context, comm_id, n_ranks,
+                            n_nodes,
                             no_op_logger, NULL, NULL) != ncclSuccess) {
     dlclose(session->handle);
     memset(session, 0, sizeof(*session));
@@ -412,17 +500,28 @@ static int open_plugin_session(struct plugin_session *session,
   return 0;
 }
 
-static int open_mixed_plugin_session(struct plugin_session *session,
-                                     const char *plugin_path,
-                                     const struct policy_case *policy,
-                                     size_t n_ranks, size_t n_nodes, int rank) {
-  if (open_plugin_session(session, plugin_path, policy, n_ranks, n_nodes) != 0)
+static int open_plugin_session(struct plugin_session *session,
+                               const char *plugin_path,
+                               const struct policy_case *policy, size_t n_ranks,
+                               size_t n_nodes) {
+  return open_plugin_session_for_comm(session, plugin_path, policy, 0, n_ranks,
+                                      n_nodes);
+}
+
+static int open_mixed_plugin_session_for_comm(struct plugin_session *session,
+                                              const char *plugin_path,
+                                              const struct policy_case *policy,
+                                              uint64_t comm_id,
+                                              size_t n_ranks, size_t n_nodes,
+                                              int rank) {
+  if (open_plugin_session_for_comm(session, plugin_path, policy, comm_id,
+                                   n_ranks, n_nodes) != 0)
     return -1;
   if (!session->profiler) {
     close_plugin_session(session);
     return failf("dlsym failed for ncclProfiler_v6: %s", dlerror());
   }
-  if (session->profiler->init(&session->profiler_context, 0,
+  if (session->profiler->init(&session->profiler_context, comm_id,
                               &session->profiler_activation_mask, "test-comm",
                               (int)n_nodes, (int)n_ranks, rank,
                               no_op_logger) != ncclSuccess) {
@@ -430,6 +529,14 @@ static int open_mixed_plugin_session(struct plugin_session *session,
     return failf("profiler init failed for %s", policy->name);
   }
   return 0;
+}
+
+static int open_mixed_plugin_session(struct plugin_session *session,
+                                     const char *plugin_path,
+                                     const struct policy_case *policy,
+                                     size_t n_ranks, size_t n_nodes, int rank) {
+  return open_mixed_plugin_session_for_comm(session, plugin_path, policy, 0,
+                                            n_ranks, n_nodes, rank);
 }
 
 static void close_plugin_session(struct plugin_session *session) {
@@ -482,6 +589,81 @@ lookup_telemetry_map(struct plugin_session *session, int telemetry_map_fd,
     return NULL;
   return (const struct nccl_policy_telemetry_value *)session->map_lookup_elem(
       telemetry_map_fd, key);
+}
+
+static int seed_config_map(struct plugin_session *session, int config_map_fd,
+                           const struct nccl_policy_config_key *key,
+                           const struct nccl_policy_config_value *value) {
+  if (!session->map_update_elem)
+    return failf("bpftime_map_update_elem is unavailable");
+  if (session->map_update_elem(config_map_fd, key, value, BPF_ANY) != 0)
+    return failf("failed to seed config_map");
+  return 0;
+}
+
+static const struct nccl_policy_config_value *
+lookup_config_map(struct plugin_session *session, int config_map_fd,
+                  const struct nccl_policy_config_key *key) {
+  if (!session->map_lookup_elem)
+    return NULL;
+  return (const struct nccl_policy_config_value *)session->map_lookup_elem(
+      config_map_fd, key);
+}
+
+static int seed_uniform_config_map(struct plugin_session *session,
+                                   uint64_t target_p99_ns,
+                                   uint32_t min_channels,
+                                   uint32_t max_channels,
+                                   uint32_t aggressiveness_step) {
+  int config_map_fd = -1;
+
+  if (!session->debug_get_map_fd || !session->map_update_elem ||
+      !session->map_lookup_elem) {
+    return failf("config_map test requires debug map helpers");
+  }
+
+  config_map_fd = session->debug_get_map_fd(session->plugin_context,
+                                            "config_map");
+  if (config_map_fd < 0)
+    return failf("unable to find config_map");
+
+  for (uint32_t coll_type = 0; coll_type <= NCCL_POLICY_COLL_ALLREDUCE;
+       ++coll_type) {
+    const struct nccl_policy_config_key key = {.coll_type = coll_type};
+    const struct nccl_policy_config_value value = {
+        .target_p99_ns = target_p99_ns,
+        .min_channels = min_channels,
+        .max_channels = max_channels,
+        .aggressiveness_step = aggressiveness_step,
+    };
+
+    if (seed_config_map(session, config_map_fd, &key, &value) != 0)
+      return -1;
+  }
+
+  return 0;
+}
+
+static void compute_native_size_aware_v2_decision(ncclFunc_t coll_type,
+                                                  size_t n_bytes,
+                                                  int initial_channels,
+                                                  struct decision_result
+                                                      *decision) {
+  struct nccl_policy_ctx ctx = {};
+
+  if (!decision)
+    return;
+
+  ctx.n_bytes = n_bytes;
+  if (!policy_coll_type_from_nccl_func_test(coll_type, &ctx.coll_type)) {
+    *decision = {-1, -1, -1};
+    return;
+  }
+  ctx.num_pipe_ops = 1;
+  ctx.n_ranks = 8;
+  ctx.n_nodes = 1;
+  ctx.current_channels = (uint32_t)initial_channels;
+  decode_action(nccl_native_size_aware_v2(&ctx), decision);
 }
 
 static int set_synthetic_telemetry(struct plugin_session *session,
@@ -1025,6 +1207,165 @@ static int test_profiler_telemetry_bridge(const char *plugin_path) {
   return 0;
 }
 
+static int test_multi_communicator_differentiation(const char *plugin_path) {
+  const struct policy_case policy = {
+      "slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict"};
+  const size_t sizes[] = {1024, 32768, 262144};
+  struct plugin_session latency_sensitive = {};
+  struct plugin_session throughput = {};
+  struct decision_result latency_results[sizeof(sizes) / sizeof(sizes[0])];
+  struct decision_result throughput_results[sizeof(sizes) / sizeof(sizes[0])];
+  int rc = -1;
+
+  memset(latency_results, 0, sizeof(latency_results));
+  memset(throughput_results, 0, sizeof(throughput_results));
+
+  if (open_plugin_session_for_comm(&latency_sensitive, plugin_path, &policy, 1,
+                                   8, 1) != 0)
+    goto done;
+  if (open_plugin_session_for_comm(&throughput, plugin_path, &policy, 2, 8, 1) !=
+      0)
+    goto done;
+
+  if (seed_uniform_config_map(&latency_sensitive, 1000000ull, 1, 8, 1) != 0)
+    goto done;
+  if (seed_uniform_config_map(&throughput, 10000000ull, 1, 8, 1) != 0)
+    goto done;
+
+  if (set_synthetic_telemetry(&latency_sensitive, 5000000ull, 5000000ull,
+                              5000000ull, 1) != 0)
+    goto done;
+  if (set_synthetic_telemetry(&throughput, 5000000ull, 5000000ull, 5000000ull,
+                              1) != 0)
+    goto done;
+
+  for (size_t i = 0; i < kDifferentiatedIterations; ++i) {
+    const size_t n_bytes = sizes[i % (sizeof(sizes) / sizeof(sizes[0]))];
+    struct decision_result ignored = {-1, -1, -1};
+
+    if (run_policy_once(&latency_sensitive, ncclFuncAllReduce, n_bytes, 1, 0, 1,
+                        &ignored) != 0)
+      goto done;
+    if (run_policy_once(&throughput, ncclFuncAllReduce, n_bytes, 1, 0, 1,
+                        &ignored) != 0)
+      goto done;
+  }
+
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+    if (run_policy_once(&latency_sensitive, ncclFuncAllReduce, sizes[i], 1, 0,
+                        1, &latency_results[i]) != 0)
+      goto done;
+    if (run_policy_once(&throughput, ncclFuncAllReduce, sizes[i], 1, 0, 1,
+                        &throughput_results[i]) != 0)
+      goto done;
+    if (latency_results[i].algo == throughput_results[i].algo &&
+        latency_results[i].proto == throughput_results[i].proto &&
+        latency_results[i].channels == throughput_results[i].channels) {
+      failf("multi-communicator differentiation failed for bytes=%zu", sizes[i]);
+      goto done;
+    }
+  }
+
+  {
+    int latency_cfg_fd =
+        latency_sensitive.debug_get_map_fd(latency_sensitive.plugin_context,
+                                           "config_map");
+    int throughput_cfg_fd =
+        throughput.debug_get_map_fd(throughput.plugin_context, "config_map");
+    const struct nccl_policy_config_key allreduce_key = {
+        .coll_type = NCCL_POLICY_COLL_ALLREDUCE,
+    };
+    const struct nccl_policy_config_value *latency_cfg =
+        lookup_config_map(&latency_sensitive, latency_cfg_fd, &allreduce_key);
+    const struct nccl_policy_config_value *throughput_cfg =
+        lookup_config_map(&throughput, throughput_cfg_fd, &allreduce_key);
+
+    if (!latency_cfg || !throughput_cfg) {
+      failf("multi-communicator test could not read communicator configs back");
+      goto done;
+    }
+
+    printf("multi-communicator differentiated policy:\n");
+    printf("same_process=yes policy=%s calls_per_comm=%d injected_p99_ns=%d\n",
+           policy.name, kDifferentiatedIterations, 5000000);
+    printf("| message_bytes | comm=1 latency-sensitive target_p99=1ms | "
+           "comm=2 throughput target_p99=10ms |\n");
+    printf("| --- | --- | --- |\n");
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+      printf("| %zu | algo=%s proto=%s channels=%d | algo=%s proto=%s "
+             "channels=%d |\n",
+             sizes[i], algo_name(latency_results[i].algo),
+             proto_name(latency_results[i].proto),
+             latency_results[i].channels, algo_name(throughput_results[i].algo),
+             proto_name(throughput_results[i].proto),
+             throughput_results[i].channels);
+    }
+    printf("config isolation: comm=1 target_p99_ns=%" PRIu64
+           " comm=2 target_p99_ns=%" PRIu64 "\n",
+           latency_cfg->target_p99_ns, throughput_cfg->target_p99_ns);
+  }
+
+  rc = 0;
+done:
+  close_plugin_session(&throughput);
+  close_plugin_session(&latency_sensitive);
+  if (rc == 0)
+    printf("multi-communicator differentiation: PASS\n");
+  return rc;
+}
+
+static int test_collective_type_coverage(const char *plugin_path) {
+  const struct policy_case policy = {
+      "size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict"};
+  const ncclFunc_t coll_types[] = {
+      ncclFuncAllReduce,
+      ncclFuncAllGather,
+      ncclFuncReduceScatter,
+      ncclFuncBroadcast,
+  };
+  const size_t sizes[] = {1024, 32768, 1u << 20};
+  struct plugin_session session = {};
+  int rc = -1;
+
+  if (open_plugin_session(&session, plugin_path, &policy, 8, 1) != 0)
+    return -1;
+
+  printf("multi-collective coverage:\n");
+  printf("| collective | message_bytes | algo | proto | channels |\n");
+  printf("| --- | --- | --- | --- | --- |\n");
+  for (size_t i = 0; i < sizeof(coll_types) / sizeof(coll_types[0]); ++i) {
+    for (size_t j = 0; j < sizeof(sizes) / sizeof(sizes[0]); ++j) {
+      struct decision_result plugin_decision = {-1, -1, -1};
+      struct decision_result native_decision = {-1, -1, -1};
+
+      if (run_policy_once(&session, coll_types[i], sizes[j], 1, 0, 1,
+                          &plugin_decision) != 0)
+        goto done;
+
+      compute_native_size_aware_v2_decision(coll_types[i], sizes[j], 1,
+                                            &native_decision);
+      if (plugin_decision.algo != native_decision.algo ||
+          plugin_decision.proto != native_decision.proto ||
+          plugin_decision.channels != native_decision.channels) {
+        failf("multi-collective coverage mismatch for %s bytes=%zu",
+              collective_name(coll_types[i]), sizes[j]);
+        goto done;
+      }
+
+      printf("| %s | %zu | %s | %s | %d |\n", collective_name(coll_types[i]),
+             sizes[j], algo_name(plugin_decision.algo),
+             proto_name(plugin_decision.proto), plugin_decision.channels);
+    }
+  }
+
+  rc = 0;
+done:
+  close_plugin_session(&session);
+  if (rc == 0)
+    printf("multi-collective coverage: PASS\n");
+  return rc;
+}
+
 static void warmup_native_size_aware(size_t count) {
   const ncclFunc_t coll_types[] = {
       ncclFuncBroadcast,     ncclFuncReduce,    ncclFuncAllGather,
@@ -1400,10 +1741,10 @@ static int test_adaptive_policy_curve(const char *plugin_path,
   const struct policy_case policy = {
       "adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
       "strict"};
-  const uint64_t total_iterations = 2ull * (uint64_t)kAdaptivePhaseIterations;
-  const size_t expected_samples = total_iterations / kAdaptiveSampleStride;
-  const size_t boundary_index =
-      (size_t)(kAdaptivePhaseIterations / kAdaptiveSampleStride) - 1;
+  const uint64_t phase_latencies_ns[] = {100, 10000, 100};
+  const size_t samples_per_phase = kAdaptivePhaseIterations / kAdaptiveSampleStride;
+  const size_t expected_samples =
+      samples_per_phase * (sizeof(phase_latencies_ns) / sizeof(phase_latencies_ns[0]));
   struct plugin_session session;
   struct nccl_policy_telemetry_key key = {
       .coll_type = NCCL_POLICY_COLL_ALLREDUCE,
@@ -1431,18 +1772,19 @@ static int test_adaptive_policy_curve(const char *plugin_path,
   }
 
   for (size_t sample_idx = 0; sample_idx < expected_samples; ++sample_idx) {
-    const uint32_t phase_high = sample_idx >= expected_samples / 2 ? 1u : 0u;
-    const uint64_t seeded_latency_ns = phase_high ? 10000 : 100;
+    const uint32_t phase_id = (uint32_t)(sample_idx / samples_per_phase);
+    const uint64_t seeded_latency_ns = phase_latencies_ns[phase_id];
     const struct nccl_policy_telemetry_value *current =
         lookup_telemetry_map(&session, telemetry_map_fd, &key);
     struct nccl_policy_telemetry_value seeded = {
         .last_latency_ns = seeded_latency_ns,
-        .avg_latency_ns = 100,
+        .avg_latency_ns = phase_id == 1 ? 100 : seeded_latency_ns,
         .p99_latency_ns = seeded_latency_ns,
         .last_n_bytes = 1u << 20,
         .samples = current ? current->samples : 1,
-        .recommended_channels = current ? current->recommended_channels : 4,
+        .recommended_channels = current ? current->recommended_channels : 8,
     };
+    struct decision_result decision = {-1, -1, -1};
 
     if (seed_telemetry_map(&session, telemetry_map_fd, &key, &seeded) != 0) {
       close_plugin_session(&session);
@@ -1450,7 +1792,6 @@ static int test_adaptive_policy_curve(const char *plugin_path,
     }
 
     for (size_t iter = 0; iter < kAdaptiveSampleStride; ++iter) {
-      struct decision_result decision = {-1, -1, -1};
       if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 1,
                           &decision) != 0) {
         close_plugin_session(&session);
@@ -1465,30 +1806,35 @@ static int test_adaptive_policy_curve(const char *plugin_path,
     }
 
     result->calls[sample_idx] = (sample_idx + 1) * kAdaptiveSampleStride;
+    result->injected_latency_ns[sample_idx] = seeded_latency_ns;
     result->channels[sample_idx] = current->recommended_channels;
     result->map_channels[sample_idx] = current->recommended_channels;
+    result->phase_ids[sample_idx] = phase_id;
+    result->phase_end_channels[phase_id] = current->recommended_channels;
     result->sample_count++;
   }
 
   close_plugin_session(&session);
 
-  result->boundary_before_channels = result->channels[boundary_index];
-  result->boundary_after_channels = result->channels[boundary_index + 1];
-  if (result->boundary_before_channels <= 4 ||
-      result->boundary_after_channels >= result->boundary_before_channels) {
-    return failf("adaptive curve did not show increase then decrease");
+  if (result->phase_end_channels[0] < 10 ||
+      result->phase_end_channels[1] >= result->phase_end_channels[0] ||
+      result->phase_end_channels[2] <= result->phase_end_channels[1]) {
+    return failf("adaptive curve did not show high channels, contention drop, "
+                 "and recovery");
   }
 
-  printf("adaptive curve boundary: before=%u after=%u samples=%zu\n",
-         result->boundary_before_channels, result->boundary_after_channels,
-         result->sample_count);
+  printf("adaptive contention response:\n");
+  printf("phase_end_channels: baseline=%u contention=%u recovery=%u samples=%zu\n",
+         result->phase_end_channels[0], result->phase_end_channels[1],
+         result->phase_end_channels[2], result->sample_count);
+  printf("| sample | call_count | phase | injected_latency_ns | channels |\n");
+  printf("| --- | --- | --- | --- | --- |\n");
   for (size_t i = 0; i < result->sample_count; ++i) {
-    printf("adaptive sample: call=%" PRIu64 " phase=%s channels=%u"
-           " map_channels=%u\n",
-           result->calls[i],
-           result->calls[i] <= kAdaptivePhaseIterations ? "low" : "high",
-           result->channels[i], result->map_channels[i]);
+    printf("| %zu | %" PRIu64 " | %s | %" PRIu64 " | %u |\n", i + 1,
+           result->calls[i], phase_name(result->phase_ids[i]),
+           result->injected_latency_ns[i], result->channels[i]);
   }
+  printf("adaptive contention response: PASS\n");
   return 0;
 }
 
@@ -1562,6 +1908,16 @@ int main(int argc, char **argv) {
   }
 
   if (test_profiler_telemetry_bridge(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_multi_communicator_differentiation(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_collective_type_coverage(plugin_path) != 0) {
     free(samples);
     return 1;
   }

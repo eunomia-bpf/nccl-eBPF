@@ -1,0 +1,181 @@
+[2026-03-09 15:37:26.002] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.002] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.008] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.020] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.020] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.026] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.034] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.034] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.042] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.049] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.049] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.055] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.063] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.063] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.084] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.091] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.091] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.123] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.130] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.130] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.175] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.182] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.182] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.186] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.193] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.193] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.195] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.202] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.202] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.204] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.210] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.210] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.212] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.219] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.219] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.223] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.230] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.230] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.232] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.239] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.239] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.241] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+verifier matrix:
+| program | error_type | verifier_verdict | expected | pass/fail |
+| --- | --- | --- | --- | --- |
+| noop | valid | ACCEPTED | ACCEPTED | PASS |
+| size_aware | valid | ACCEPTED | ACCEPTED | PASS |
+| size_aware_v2 | valid | ACCEPTED | ACCEPTED | PASS |
+| lookup_only | valid | ACCEPTED | ACCEPTED | PASS |
+| lookup_update | valid | ACCEPTED | ACCEPTED | PASS |
+| adaptive_channels | valid | ACCEPTED | ACCEPTED | PASS |
+| slo_enforcer | valid | ACCEPTED | ACCEPTED | PASS |
+| bad_lookup | null_deref_after_map_lookup | REJECTED | REJECTED | PASS |
+verifier detail: bad_lookup => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_lookup.bpf.o: Pre-invariant : [ instruction_count=0, meta_offset=[-409...
+| bad_oob_access | ctx_out_of_bounds_read | REJECTED | REJECTED | PASS |
+verifier detail: bad_oob_access => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_oob_access.bpf.o: Pre-invariant : [ instruction_count=0, meta_offset=[...
+| bad_unregistered_helper | helper_not_registered | REJECTED | REJECTED | PASS |
+verifier detail: bad_unregistered_helper => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_unregistered_helper.bpf.o: 2: invalid helper function id
+| bad_stack_overflow | stack_limit_exceeded | REJECTED | REJECTED | PASS |
+verifier detail: bad_stack_overflow => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_stack_overflow.bpf.o: exit: bitset index out of range
+| bad_infinite_loop | unbounded_loop | REJECTED | REJECTED | PASS |
+verifier detail: bad_infinite_loop => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_infinite_loop.bpf.o: Pre-invariant : [ instruction_count=0, meta_offse...
+| bad_write_ctx | write_to_read_only_ctx | REJECTED | REJECTED | PASS |
+verifier detail: bad_write_ctx => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_write_ctx.bpf.o: Pre-invariant : [ instruction_count=0, meta_offset=[-...
+| bad_div_zero | potential_divide_by_zero | REJECTED | REJECTED | PASS |
+verifier detail: bad_div_zero => verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_div_zero.bpf.o: Pre-invariant : [ instruction_count=0, meta_offset=[-4...
+verifier matrix: PASS (14 programs)
+[2026-03-09 15:37:26.248] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.248] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.253] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+[2026-03-09 15:37:26.260] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.260] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.269] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+size_aware correctness: PASS
+[2026-03-09 15:37:26.276] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.276] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.307] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+adaptive_channels map state: PASS
+[2026-03-09 15:37:26.314] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.314] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.345] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+profiler telemetry bridge: PASS
+[2026-03-09 15:37:26.352] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.352] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+multi-communicator differentiated policy:
+same_process=yes policy=slo_enforcer calls_per_comm=100000 injected_p99_ns=5000000
+| message_bytes | comm=1 latency-sensitive target_p99=1ms | comm=2 throughput target_p99=10ms |
+| --- | --- | --- |
+| 1024 | algo=TREE proto=LL channels=8 | algo=TREE proto=SIMPLE channels=1 |
+| 32768 | algo=TREE proto=LL channels=8 | algo=RING proto=SIMPLE channels=1 |
+| 262144 | algo=RING proto=LL channels=8 | algo=RING proto=SIMPLE channels=1 |
+config isolation: comm=1 target_p99_ns=1000000 comm=2 target_p99_ns=10000000
+[2026-03-09 15:37:26.453] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+multi-communicator differentiation: PASS
+[2026-03-09 15:37:26.461] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.461] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+multi-collective coverage:
+| collective | message_bytes | algo | proto | channels |
+| --- | --- | --- | --- | --- |
+| AllReduce | 1024 | TREE | SIMPLE | 2 |
+| AllReduce | 32768 | TREE | LL | 4 |
+| AllReduce | 1048576 | RING | SIMPLE | 10 |
+| AllGather | 1024 | RING | SIMPLE | 2 |
+| AllGather | 32768 | RING | LL | 4 |
+| AllGather | 1048576 | RING | SIMPLE | 8 |
+| ReduceScatter | 1024 | RING | SIMPLE | 2 |
+| ReduceScatter | 32768 | RING | LL | 4 |
+| ReduceScatter | 1048576 | RING | SIMPLE | 8 |
+| Broadcast | 1024 | RING | SIMPLE | 2 |
+| Broadcast | 32768 | RING | LL | 4 |
+| Broadcast | 1048576 | RING | SIMPLE | 8 |
+[2026-03-09 15:37:26.469] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+multi-collective coverage: PASS
+native baseline ns: p50=10 p99=16 max=27060 channels=2 algo=0 proto=2
+[2026-03-09 15:37:26.543] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.543] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.667] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+noop (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/noop.bpf.o, verify=strict) ns: p50=61 p99=74 max=6157 delta_p50=51 delta_p99=58 channels=1 algo=-1 proto=-1
+[2026-03-09 15:37:26.675] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.675] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.802] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+size_aware_v2 (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/size_aware_v2.bpf.o, verify=strict) ns: p50=62 p99=73 max=3354 delta_p50=52 delta_p99=57 channels=2 algo=0 proto=2
+[2026-03-09 15:37:26.809] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.809] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:26.962] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+lookup_only (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/lookup_only.bpf.o, verify=strict) ns: p50=88 p99=104 max=3119 delta_p50=78 delta_p99=88 channels=1 algo=-1 proto=-1
+[2026-03-09 15:37:26.970] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:26.970] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:27.163] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+lookup_update (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/lookup_update.bpf.o, verify=strict) ns: p50=113 p99=134 max=3161 delta_p50=103 delta_p99=118 channels=1 algo=-1 proto=-1
+[2026-03-09 15:37:27.171] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:27.171] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:27.374] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+adaptive_channels (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/adaptive_channels.bpf.o, verify=strict) ns: p50=112 p99=136 max=157046 delta_p50=102 delta_p99=120 channels=4 algo=-1 proto=-1
+[2026-03-09 15:37:27.382] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:27.382] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:27.598] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+slo_enforcer (/home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/slo_enforcer.bpf.o, verify=strict) ns: p50=110 p99=134 max=2958 delta_p50=100 delta_p99=118 channels=1 algo=0 proto=2
+[2026-03-09 15:37:27.606] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:27.606] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:27.691] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+hot reload safety: load=7283.371 swap=0.774 total=7284.156 pre_p50_ns=172 pre_p99_ns=860 max_call_ns=113653 slow_calls=2 threshold_ns=10000 completed_calls=400000 failed_calls=0 zero_call_loss=yes trigger_call=200000 first_changed_call=254709 old_calls=254708 new_calls=145292 unexpected_calls=0 channels=10 algo=1 proto=2 bad_replacement_rc=-1 preserved_channels=10 preserved_algo=1 preserved_proto=2
+hot reload rejected detail: verifier rejected /home/yunwei37/workspace/nccl-eBPF/src/nccl-policy-plugin/build-bpftime-migration-prebuilt/ebpf-policies/bad_lookup.bpf.o: Pre-invariant : [ instruction_count=0, meta_offset=[-409...
+[2026-03-09 15:37:27.698] [info] [bpftime_shm_internal.cpp:786] Global shm constructed. shm_open_type 0 for nccl_policy_bpftime_1000_2077500
+[2026-03-09 15:37:27.698] [info] [bpftime_shm_internal.cpp:43] Global shm initialized
+[2026-03-09 15:37:27.777] [info] [bpftime_shm_internal.cpp:66] Global shm removed
+adaptive contention response:
+phase_end_channels: baseline=12 contention=2 recovery=12 samples=30
+| sample | call_count | phase | injected_latency_ns | channels |
+| --- | --- | --- | --- | --- |
+| 1 | 10000 | baseline | 100 | 9 |
+| 2 | 20000 | baseline | 100 | 10 |
+| 3 | 30000 | baseline | 100 | 11 |
+| 4 | 40000 | baseline | 100 | 12 |
+| 5 | 50000 | baseline | 100 | 12 |
+| 6 | 60000 | baseline | 100 | 12 |
+| 7 | 70000 | baseline | 100 | 12 |
+| 8 | 80000 | baseline | 100 | 12 |
+| 9 | 90000 | baseline | 100 | 12 |
+| 10 | 100000 | baseline | 100 | 12 |
+| 11 | 110000 | contention | 10000 | 11 |
+| 12 | 120000 | contention | 10000 | 10 |
+| 13 | 130000 | contention | 10000 | 9 |
+| 14 | 140000 | contention | 10000 | 8 |
+| 15 | 150000 | contention | 10000 | 7 |
+| 16 | 160000 | contention | 10000 | 6 |
+| 17 | 170000 | contention | 10000 | 5 |
+| 18 | 180000 | contention | 10000 | 4 |
+| 19 | 190000 | contention | 10000 | 3 |
+| 20 | 200000 | contention | 10000 | 2 |
+| 21 | 210000 | recovery | 100 | 3 |
+| 22 | 220000 | recovery | 100 | 4 |
+| 23 | 230000 | recovery | 100 | 5 |
+| 24 | 240000 | recovery | 100 | 6 |
+| 25 | 250000 | recovery | 100 | 7 |
+| 26 | 260000 | recovery | 100 | 8 |
+| 27 | 270000 | recovery | 100 | 9 |
+| 28 | 280000 | recovery | 100 | 10 |
+| 29 | 290000 | recovery | 100 | 11 |
+| 30 | 300000 | recovery | 100 | 12 |
+adaptive contention response: PASS

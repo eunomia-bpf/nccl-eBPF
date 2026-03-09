@@ -14,3 +14,5 @@
 | 2026-03-09 | Phase 4: 单GPU 2-rank集成 | codex exec (background b84hfhssz) | `docs/tmp/phase4-results.md` | 完成 ✓ (getCollInfo 495次, cost table bug修复) |
 | 2026-03-09 | 文档清理+algo验证 | codex exec (background bshvnzfk6) | `docs/tmp/doc-cleanup-results.md` | 完成 ✓ (algo/proto 10/10匹配) |
 | 2026-03-09 | Profiler adapter实现 | codex exec (background bfbp3twfw) | `docs/tmp/profiler-adapter-results.md` | 完成 ✓ (mixed plugin, real telemetry闭环) |
+| 2026-03-09 | 论文初稿撰写(中文) | Claude Code 直接撰写 | `docs/paper-draft.md` | 完成 ✓ (9章492行workshop paper) |
+| 2026-03-09 | 评估改进: 多comm+竞争+多collective | codex exec (background bogkgk4wg) | `docs/tmp/eval-improvement-results.md` | 完成 ✓ (3个新实验全部PASS) |
