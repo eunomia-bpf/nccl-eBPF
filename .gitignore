@@ -1,2 +1,9 @@
 .direnv
 /build
+/build-vm
+/build-llvmbpf
+*.so
+*.a
+*.d
+nccl-tests/
+src/nccl-policy-plugin/build/
