@@ -173,6 +173,7 @@ target_link_libraries(nccl-policy PRIVATE
     ${BPFTIME_STATIC_ARCHIVES}
     "-Wl,--end-group"
     ${LLVM_LIBRARY}
+    CUDA::cudart
     dl
     elf
     m

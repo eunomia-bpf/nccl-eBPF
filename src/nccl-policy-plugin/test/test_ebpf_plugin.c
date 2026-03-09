@@ -23,6 +23,7 @@
 
 #include "native_baseline.h"
 #include "nccl_tuner.h"
+#include "nccl_profiler.h"
 #include "policy_action.h"
 #include "policy_context.h"
 #include "policy_maps.h"
@@ -112,7 +113,10 @@ typedef const void *(*bpftime_map_lookup_elem_fn)(int fd, const void *key);
 struct plugin_session {
   void *handle;
   const ncclTuner_v5_t *plugin;
+  const ncclProfiler_v6_t *profiler;
   void *plugin_context;
+  void *profiler_context;
+  int profiler_activation_mask;
   plugin_debug_get_map_fd_fn debug_get_map_fd;
   plugin_debug_reload_policy_fn debug_reload_policy;
   plugin_debug_set_synthetic_telemetry_fn debug_set_synthetic_telemetry;
@@ -155,6 +159,8 @@ struct adaptive_curve_result {
   uint32_t boundary_before_channels;
   uint32_t boundary_after_channels;
 };
+
+static void close_plugin_session(struct plugin_session *session);
 
 static uint64_t monotonic_time_ns(void) {
   struct timespec ts;
@@ -390,6 +396,8 @@ static int open_plugin_session(struct plugin_session *session,
                  policy->verify_mode);
   }
 
+  session->profiler =
+      (const ncclProfiler_v6_t *)dlsym(session->handle, "ncclProfiler_v6");
   session->debug_get_map_fd = (plugin_debug_get_map_fd_fn)dlsym(
       session->handle, "ncclPolicyPluginDebugGetMapFd");
   session->debug_reload_policy = (plugin_debug_reload_policy_fn)dlsym(
@@ -404,7 +412,29 @@ static int open_plugin_session(struct plugin_session *session,
   return 0;
 }
 
+static int open_mixed_plugin_session(struct plugin_session *session,
+                                     const char *plugin_path,
+                                     const struct policy_case *policy,
+                                     size_t n_ranks, size_t n_nodes, int rank) {
+  if (open_plugin_session(session, plugin_path, policy, n_ranks, n_nodes) != 0)
+    return -1;
+  if (!session->profiler) {
+    close_plugin_session(session);
+    return failf("dlsym failed for ncclProfiler_v6: %s", dlerror());
+  }
+  if (session->profiler->init(&session->profiler_context, 0,
+                              &session->profiler_activation_mask, "test-comm",
+                              (int)n_nodes, (int)n_ranks, rank,
+                              no_op_logger) != ncclSuccess) {
+    close_plugin_session(session);
+    return failf("profiler init failed for %s", policy->name);
+  }
+  return 0;
+}
+
 static void close_plugin_session(struct plugin_session *session) {
+  if (session->profiler && session->profiler_context)
+    session->profiler->finalize(session->profiler_context);
   if (session->plugin && session->plugin_context)
     session->plugin->finalize(session->plugin_context);
   if (session->handle)
@@ -472,6 +502,72 @@ static int set_synthetic_telemetry(struct plugin_session *session,
                                              enabled ? &config : NULL) != 0) {
     return failf("failed to configure synthetic telemetry");
   }
+  return 0;
+}
+
+static int emit_kernel_timed_collective(struct plugin_session *session,
+                                        const char *func_name, size_t n_bytes,
+                                        uint64_t ch0_start_ns,
+                                        uint64_t ch0_stop_ns,
+                                        uint64_t ch1_start_ns,
+                                        uint64_t ch1_stop_ns) {
+  ncclProfilerEventDescr_v6_t coll_descr = {};
+  ncclProfilerEventDescr_v6_t kernel_descr = {};
+  ncclProfilerEventStateArgs_v6_t kernel_args = {};
+  void *coll_handle = NULL;
+  void *kernel_handle = NULL;
+
+  if (!session->profiler || !session->profiler_context)
+    return failf("mixed session is missing profiler context");
+  if (n_bytes % sizeof(float) != 0)
+    return failf("kernel timing helper expects float-aligned byte counts");
+
+  coll_descr.type = ncclProfileColl;
+  coll_descr.rank = 0;
+  coll_descr.coll.func = func_name;
+  coll_descr.coll.count = n_bytes / sizeof(float);
+  coll_descr.coll.datatype = "ncclFloat32";
+  coll_descr.coll.nChannels = 2;
+  if (session->profiler->startEvent(session->profiler_context, &coll_handle,
+                                    &coll_descr) != ncclSuccess) {
+    return failf("profiler coll startEvent failed");
+  }
+  if (session->profiler->stopEvent(coll_handle) != ncclSuccess)
+    return failf("profiler coll stopEvent failed");
+
+  kernel_descr.type = ncclProfileKernelCh;
+  kernel_descr.parentObj = coll_handle;
+  kernel_descr.kernelCh.channelId = 0;
+  kernel_descr.kernelCh.pTimer = ch0_start_ns;
+  if (session->profiler->startEvent(session->profiler_context, &kernel_handle,
+                                    &kernel_descr) != ncclSuccess) {
+    return failf("profiler kernel channel 0 startEvent failed");
+  }
+  kernel_args.kernelCh.pTimer = ch0_stop_ns;
+  if (session->profiler->recordEventState(
+          kernel_handle, ncclProfilerKernelChStop, &kernel_args) !=
+      ncclSuccess) {
+    return failf("profiler kernel channel 0 recordEventState failed");
+  }
+  if (session->profiler->stopEvent(kernel_handle) != ncclSuccess)
+    return failf("profiler kernel channel 0 stopEvent failed");
+
+  kernel_handle = NULL;
+  kernel_descr.kernelCh.channelId = 1;
+  kernel_descr.kernelCh.pTimer = ch1_start_ns;
+  if (session->profiler->startEvent(session->profiler_context, &kernel_handle,
+                                    &kernel_descr) != ncclSuccess) {
+    return failf("profiler kernel channel 1 startEvent failed");
+  }
+  kernel_args.kernelCh.pTimer = ch1_stop_ns;
+  if (session->profiler->recordEventState(
+          kernel_handle, ncclProfilerKernelChStop, &kernel_args) !=
+      ncclSuccess) {
+    return failf("profiler kernel channel 1 recordEventState failed");
+  }
+  if (session->profiler->stopEvent(kernel_handle) != ncclSuccess)
+    return failf("profiler kernel channel 1 stopEvent failed");
+
   return 0;
 }
 
@@ -738,7 +834,7 @@ static int test_adaptive_channels_map_state(const char *plugin_path) {
       .n_nodes = 1,
   };
   struct nccl_policy_telemetry_value seeded = {
-      .last_latency_ns = 280,
+      .last_latency_ns = 240,
       .avg_latency_ns = 240,
       .p99_latency_ns = 320,
       .last_n_bytes = 4096,
@@ -795,18 +891,137 @@ static int test_adaptive_channels_map_state(const char *plugin_path) {
     close_plugin_session(&session);
     return failf("adaptive_channels did not leave telemetry state behind");
   }
-  if (observed->samples != seeded.samples + 1 ||
+  if (observed->samples != seeded.samples ||
       observed->recommended_channels != seeded.recommended_channels ||
-      observed->last_n_bytes != 65536) {
+      observed->last_n_bytes != seeded.last_n_bytes ||
+      observed->last_latency_ns != seeded.last_latency_ns) {
     close_plugin_session(&session);
     return failf("adaptive_channels telemetry state mismatch: samples=%u "
-                 "recommended_channels=%u last_n_bytes=%" PRIu64,
+                 "recommended_channels=%u last_n_bytes=%" PRIu64
+                 " last_latency_ns=%" PRIu64,
                  observed->samples, observed->recommended_channels,
-                 observed->last_n_bytes);
+                 observed->last_n_bytes, observed->last_latency_ns);
   }
 
   close_plugin_session(&session);
   printf("adaptive_channels map state: PASS\n");
+  return 0;
+}
+
+static int test_profiler_telemetry_bridge(const char *plugin_path) {
+  const struct policy_case policy = {
+      "adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
+      "strict"};
+  struct plugin_session session;
+  struct nccl_policy_telemetry_key key = {
+      .coll_type = NCCL_POLICY_COLL_ALLREDUCE,
+      .n_nodes = 1,
+  };
+  const struct nccl_policy_telemetry_value *observed = NULL;
+  struct decision_result decision = {-1, -1, -1};
+  int telemetry_map_fd = -1;
+  uint64_t observed_last_latency_ns = 0;
+  uint64_t observed_avg_latency_ns = 0;
+  uint32_t observed_samples = 0;
+  uint32_t observed_channels = 0;
+
+  if (open_mixed_plugin_session(&session, plugin_path, &policy, 2, 1, 0) != 0)
+    return -1;
+
+  if (!session.debug_get_map_fd || !session.map_lookup_elem) {
+    close_plugin_session(&session);
+    return failf("profiler bridge test requires debug map helpers");
+  }
+
+  telemetry_map_fd =
+      session.debug_get_map_fd(session.plugin_context, "telemetry_map");
+  if (telemetry_map_fd < 0) {
+    close_plugin_session(&session);
+    return failf("profiler bridge test could not find telemetry_map");
+  }
+
+  if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 1,
+                      &decision) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+  if (decision.channels != 8) {
+    close_plugin_session(&session);
+    return failf("first adaptive_channels decision mismatch: got %d expected 8",
+                 decision.channels);
+  }
+
+  if (emit_kernel_timed_collective(&session, "AllReduce", 1u << 20, 1000, 1400,
+                                   1200, 1720) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+
+  observed = lookup_telemetry_map(&session, telemetry_map_fd, &key);
+  if (observed) {
+    observed_last_latency_ns = observed->last_latency_ns;
+    observed_avg_latency_ns = observed->avg_latency_ns;
+    observed_samples = observed->samples;
+    observed_channels = observed->recommended_channels;
+  }
+  if (!observed || observed->last_latency_ns != 520 ||
+      observed->avg_latency_ns != 520 || observed->samples != 1 ||
+      observed->recommended_channels != 8) {
+    close_plugin_session(&session);
+    return failf("profiler bridge first sample mismatch: last=%" PRIu64
+                 " avg=%" PRIu64 " samples=%u channels=%u",
+                 observed_last_latency_ns, observed_avg_latency_ns,
+                 observed_samples, observed_channels);
+  }
+
+  if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 8,
+                      &decision) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+  if (decision.channels != 9) {
+    close_plugin_session(&session);
+    return failf(
+        "adaptive_channels did not react to profiler-fed low latency: got %d "
+        "expected 9",
+        decision.channels);
+  }
+
+  if (emit_kernel_timed_collective(&session, "AllReduce", 1u << 20, 2000, 2720,
+                                   2100, 3020) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+
+  observed = lookup_telemetry_map(&session, telemetry_map_fd, &key);
+  if (observed) {
+    observed_last_latency_ns = observed->last_latency_ns;
+    observed_samples = observed->samples;
+    observed_channels = observed->recommended_channels;
+  }
+  if (!observed || observed->last_latency_ns != 920 || observed->samples != 2 ||
+      observed->recommended_channels != 9) {
+    close_plugin_session(&session);
+    return failf("profiler bridge second sample mismatch: last=%" PRIu64
+                 " samples=%u channels=%u",
+                 observed_last_latency_ns, observed_samples, observed_channels);
+  }
+
+  if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 9,
+                      &decision) != 0) {
+    close_plugin_session(&session);
+    return -1;
+  }
+  if (decision.channels != 8) {
+    close_plugin_session(&session);
+    return failf(
+        "adaptive_channels did not react to profiler-fed high latency: got %d "
+        "expected 8",
+        decision.channels);
+  }
+
+  close_plugin_session(&session);
+  printf("profiler telemetry bridge: PASS\n");
   return 0;
 }
 
@@ -1203,9 +1418,9 @@ static int test_adaptive_policy_curve(const char *plugin_path,
   if (open_plugin_session(&session, plugin_path, &policy, 8, 1) != 0)
     return -1;
   if (!session.debug_get_map_fd || !session.map_update_elem ||
-      !session.map_lookup_elem || !session.debug_set_synthetic_telemetry) {
+      !session.map_lookup_elem) {
     close_plugin_session(&session);
-    return failf("adaptive curve test requires debug map + telemetry hooks");
+    return failf("adaptive curve test requires debug map helpers");
   }
 
   telemetry_map_fd =
@@ -1217,13 +1432,12 @@ static int test_adaptive_policy_curve(const char *plugin_path,
 
   for (size_t sample_idx = 0; sample_idx < expected_samples; ++sample_idx) {
     const uint32_t phase_high = sample_idx >= expected_samples / 2 ? 1u : 0u;
-    const uint64_t seeded_latency_ns = phase_high ? 100 : 200;
-    const uint64_t current_latency_ns = phase_high ? 10000 : 100;
+    const uint64_t seeded_latency_ns = phase_high ? 10000 : 100;
     const struct nccl_policy_telemetry_value *current =
         lookup_telemetry_map(&session, telemetry_map_fd, &key);
     struct nccl_policy_telemetry_value seeded = {
         .last_latency_ns = seeded_latency_ns,
-        .avg_latency_ns = seeded_latency_ns,
+        .avg_latency_ns = 100,
         .p99_latency_ns = seeded_latency_ns,
         .last_n_bytes = 1u << 20,
         .samples = current ? current->samples : 1,
@@ -1231,12 +1445,6 @@ static int test_adaptive_policy_curve(const char *plugin_path,
     };
 
     if (seed_telemetry_map(&session, telemetry_map_fd, &key, &seeded) != 0) {
-      close_plugin_session(&session);
-      return -1;
-    }
-    if (set_synthetic_telemetry(&session, current_latency_ns,
-                                current_latency_ns, current_latency_ns,
-                                1) != 0) {
       close_plugin_session(&session);
       return -1;
     }
@@ -1260,11 +1468,6 @@ static int test_adaptive_policy_curve(const char *plugin_path,
     result->channels[sample_idx] = current->recommended_channels;
     result->map_channels[sample_idx] = current->recommended_channels;
     result->sample_count++;
-  }
-
-  if (set_synthetic_telemetry(&session, 0, 0, 0, 0) != 0) {
-    close_plugin_session(&session);
-    return -1;
   }
 
   close_plugin_session(&session);
@@ -1354,6 +1557,11 @@ int main(int argc, char **argv) {
   }
 
   if (test_adaptive_channels_map_state(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_profiler_telemetry_bridge(plugin_path) != 0) {
     free(samples);
     return 1;
   }

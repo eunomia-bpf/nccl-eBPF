@@ -15,6 +15,7 @@ struct nccl_policy_telemetry_value {
   uint64_t last_n_bytes;
   uint32_t samples;
   uint32_t recommended_channels;
+  uint32_t applied_samples;
 };
 
 struct nccl_policy_config_key {

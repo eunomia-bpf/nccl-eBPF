@@ -26,13 +26,6 @@ static uint32_t clamp_channels(uint32_t channels) {
   return channels;
 }
 
-static uint64_t update_average(uint64_t current_avg, uint64_t sample,
-                               uint32_t count) {
-  if (count == 0)
-    return sample;
-  return (current_avg * 7 + sample) / 8;
-}
-
 SEC("uprobe")
 uint64_t adaptive_channels_policy(struct nccl_policy_ctx *ctx) {
   struct nccl_policy_telemetry_key key = {};
@@ -49,11 +42,6 @@ uint64_t adaptive_channels_policy(struct nccl_policy_ctx *ctx) {
   prev = bpf_map_lookup_elem(&telemetry_map, &key);
   if (!prev) {
     channels = base_channels(ctx);
-    next.last_latency_ns = ctx->last_latency_ns;
-    next.last_n_bytes = ctx->n_bytes;
-    next.avg_latency_ns = ctx->last_latency_ns;
-    next.p99_latency_ns = ctx->last_latency_ns;
-    next.samples = 1;
     next.recommended_channels = channels;
     bpf_map_update_elem(&telemetry_map, &key, &next, BPF_ANY);
     return nccl_policy_pack_action(0, 0, (uint8_t)channels, 0,
@@ -62,26 +50,16 @@ uint64_t adaptive_channels_policy(struct nccl_policy_ctx *ctx) {
 
   next = *prev;
   channels = clamp_channels(prev->recommended_channels);
-  if (ctx->last_latency_ns) {
-    if (ctx->last_latency_ns > prev->last_latency_ns + 32) {
+  if (prev->samples > prev->applied_samples) {
+    if (prev->last_latency_ns > prev->avg_latency_ns + 32) {
       channels = clamp_channels(channels - 1);
     } else if (ctx->n_bytes >= (1ULL << 20) &&
-               ctx->last_latency_ns <= prev->avg_latency_ns) {
+               prev->last_latency_ns <= prev->avg_latency_ns) {
       channels = clamp_channels(channels + 1);
     }
+    next.applied_samples = prev->samples;
   }
 
-  next.last_latency_ns = ctx->last_latency_ns;
-  next.last_n_bytes = ctx->n_bytes;
-  next.avg_latency_ns =
-      update_average(next.avg_latency_ns, ctx->last_latency_ns, next.samples);
-  if (ctx->last_latency_ns > next.p99_latency_ns)
-    next.p99_latency_ns = ctx->last_latency_ns;
-  else
-    next.p99_latency_ns =
-        (next.p99_latency_ns * 15 + ctx->last_latency_ns) / 16;
-  if (next.samples != UINT32_MAX)
-    next.samples += 1;
   next.recommended_channels = channels;
   bpf_map_update_elem(&telemetry_map, &key, &next, BPF_ANY);
 

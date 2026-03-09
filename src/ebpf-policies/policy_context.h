@@ -13,10 +13,7 @@ enum nccl_policy_coll_type {
 
 struct nccl_policy_ctx {
   uint64_t n_bytes;
-  /* Placeholder until NCCL profiler adapter integration provides real
-   * collective telemetry. The plugin currently leaves these at zero instead of
-   * feeding back its own dispatch overhead.
-   */
+  /* Populated from profiler-fed telemetry_map snapshots when available. */
   uint64_t last_latency_ns;
   uint64_t avg_latency_ns;
   uint64_t rolling_p99_ns;
