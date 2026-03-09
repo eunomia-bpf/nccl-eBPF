@@ -4,17 +4,53 @@
 
 ### 一句话定义
 
-NCCLPol 把 eBPF 的安全可扩展模型（验证 + JIT + 隔离 + 热更新）引入 GPU 集合通信运行时，使平台方能以**受验证的 eBPF 程序**（而非任意 native 共享库）扩展 NCCL 的行为——在保证安全性和可控开销的前提下，实现 SLO 保障、故障自愈、资源干扰控制等治理能力。
+NCCLPol 是一个**跨栈 eBPF 策略平面**：通过 bpftime 将内核 eBPF（网络/调度可见性）与用户态 eBPF（NCCL 插件决策）通过共享 maps 连接，使平台方能以受验证的 eBPF 程序安全扩展集合通信行为。
 
-### 核心贡献是什么（不是什么）
+### 核心贡献
 
-**核心贡献 = eBPF 运行时框架本身 + 它在集合通信 domain 的适配设计。**
+**= 跨栈 eBPF 运行时 + 安全可扩展框架 + 集合通信 domain 适配**
 
-Policy use case（SLO、故障恢复、干扰控制）是框架表达力的**展示**，不是独立贡献——因为这些逻辑用 native C++ plugin 同样能写。真正的贡献在于：
+1. **跨栈可见性（bpftime 的独特价值）**：NCCL tuner 只能看到 collType/nBytes/nRanks，完全看不到真实网络拥塞、RDMA 错误、CPU 调度干扰。内核 eBPF 能看到这些，bpftime 的 shared maps 让内核观测 → 用户态决策成为可能。这是任何 native plugin 做不到的。
+2. **安全可扩展**：验证、隔离、热更新、可审计——使 collective 通信 policy 能在生产环境真正部署
+3. **domain-specific 设计**：NCCL policy hook 模型、eBPF helper/maps ABI、telemetry 闭环架构
 
-1. **为什么要用 eBPF 而不是 native plugin**：验证、隔离、热更新、可审计、可组合——这不是"可选的锦上添花"，而是使集合通信 policy 能在生产环境真正部署的**必要条件**
-2. **为什么这个 domain 有独特挑战**：μs 级热路径的开销容忍度、多维动作空间的 eBPF 表达、跨插件状态共享的设计、$100K/hr GPU 集群的失败代价
-3. **框架的 domain-specific 设计**：NCCL 的 policy hook 模型、eBPF helper/maps ABI、telemetry 闭环架构
+### 跨栈架构（为什么用 bpftime 而不是 llvmbpf）
+
+```
+┌───────────────── Shared eBPF Maps ──────────────────┐
+│  congestion_map, error_map, bw_quota_map, telemetry │
+└──────┬──────────────────────────────────┬───────────┘
+       │ 内核侧写入                        │ 用户态读取+决策
+┌──────┴──────┐                    ┌──────┴──────────┐
+│  Kernel eBPF │                    │  Userspace eBPF  │
+│  (观测层)     │                    │  (bpftime/决策层) │
+│              │                    │                  │
+│ • XDP/TC:    │                    │ • Tuner policy:  │
+│   RoCE拥塞   │                    │   读congestion   │
+│   ECN/PFC    │                    │   map→调algo     │
+│ • kprobe IB: │                    │ • Profiler hook: │
+│   重传/错误   │                    │   写telemetry    │
+│ • tracepoint:│                    │ • uprobe NCCL:   │
+│   调度干扰    │                    │   更深可见性      │
+└──────────────┘                    └──────────────────┘
+```
+
+### 三个核心 Use Case
+
+**UC1: 网络感知 collective 调参**
+- 内核 XDP 检测 RoCE 拥塞（ECN/PFC/重传）→ 写 `congestion_map`
+- NCCL tuner policy 读 → 拥塞时切低带宽算法、降 nChannels
+- **价值**：NCCL 插件看不到网络状态，只有内核能看到真实拥塞
+
+**UC2: 多租户带宽隔离（内核执行 + 用户态适应）**
+- 内核 TC/cgroup 对每个 job 做 RDMA 硬限速 → 写 `bw_quota_map`
+- NCCL tuner policy 读 → 让 NCCL 主动适配配额（调 nChannels 匹配）
+- **价值**：NCCL 不知道自己被限速，盲目选高带宽算法反而更差
+
+**UC3: RDMA 错误检测 → 自动缓解**
+- 内核 kprobe 在 IB verbs 错误路径 → 写 `error_map`
+- NCCL tuner policy 读 → 切换 NIC 路径或降级协议
+- **价值**：NCCL profiler 只能看到"变慢了"，内核能看到"为什么"
 
 ### 类比定位
 
@@ -275,27 +311,97 @@ Tuner adapter → 应用 action（修改 cost table、nChannels）
 
 ### 6. Evaluation（3.5 页）
 
-#### 6.1 微基准测试（框架开销）—— 最重要的实验
-- **核心问题**：eBPF policy 在 collective 热路径上的开销是否可忽略？
-- 测量：no-op policy vs 无 plugin、简单 policy vs 复杂 policy
-- 分解开销：bpftime 调用、map lookup、JIT'd 代码执行、MPK 切换
-- 目标：per-invocation < 200 ns（collective 操作 10-1000 μs → < 2%）
-- 对比 native plugin 的 function call 开销
+**硬件环境**：单节点 1×RTX 5090 (32GB)，24 核 x86_64，125GB RAM，CUDA 12.9，MPI 可用。
+**评估策略**：不依赖多节点 GPU 集群。分四层递进，从纯 CPU 微基准到单 GPU 集成测试。
 
-#### 6.2 安全属性验证
-- 验证器拒绝不安全 policy 的示例（无限循环、OOB、非法 helper）
-- MPK 隔离：一个故障 policy 不影响其他 policy 和 NCCL 运行
-- 热更新：运行中替换 policy 的行为一致性和切换延迟
+#### 6.1 纯 CPU 微基准：Policy 执行开销（最核心，不需要 GPU）
 
-#### 6.3 Policy 表达力评估（三个 case study）
-- 多租户 SLO：P50/P99 step time CDF、Jain's fairness、总吞吐
-- 故障恢复：检测时间、恢复时间、丢失迭代数
-- SM 干扰：iteration time、通信/计算 overlap
+**方法**：复用 NCCL 的 `test_plugin.c` 模式——直接调用 plugin API，不经过真实 NCCL 运行时。
 
-#### 6.4 与 native plugin baseline 的对比
-- 将三个 policy 的逻辑用 native C++ plugin 实现
-- 对比：功能等价，但 NCCLPol 额外提供安全+热更新+隔离
-- 性能差异应可忽略（证明 eBPF 的安全保证不以性能为代价）
+```
+测试矩阵（每组 100 万次调用，取 P50/P99/max）：
+┌──────────────────────┬──────────────────────────────┐
+│ 配置                  │ 测什么                        │
+├──────────────────────┼──────────────────────────────┤
+│ 空函数 (baseline)     │ C 函数调用开销下限             │
+│ Native C 逻辑         │ 等价 policy 的 native 实现     │
+│ bpftime no-op eBPF    │ eBPF 运行时最小开销            │
+│ bpftime 简单 policy   │ 1 次 map lookup + 条件判断     │
+│ bpftime 复杂 policy   │ 多次 map lookup + 计算         │
+│ bpftime + MPK 隔离    │ MPK 域切换额外开销             │
+└──────────────────────┴──────────────────────────────┘
+
+输出图：
+- 柱状图：各配置的 per-invocation 延迟 (ns)
+- 分解图：bpftime 调用 vs map lookup vs JIT 执行 vs MPK 切换
+```
+
+**为什么这够**：`getCollInfo` 是纯 CPU 函数，不涉及 GPU。在真实 NCCL 中它的调用路径也是 CPU 侧。所以直接调用 plugin API 的开销测量 = 真实场景的开销测量。
+
+#### 6.2 安全属性演示（不需要 GPU）
+
+**验证器拒绝演示**：
+- 准备 5-10 个故意错误的 eBPF 程序（无限循环、数组越界、调用未注册 helper、栈溢出）
+- 展示验证器在加载时拒绝，并给出具体错误信息
+- 表格：错误类型 × 验证器响应 × 是否正确拒绝
+
+**MPK 隔离演示**：
+- 一个 eBPF policy 故意写越界 → 触发 MPK fault → NCCL 进程不 crash
+- 对比：等价的 native plugin 写越界 → 进程直接 segfault
+
+**热更新演示**：
+- 持续循环调用 `getCollInfo`，同时替换 policy 文件
+- 测量：切换延迟、切换前后行为一致性、零丢失调用
+- 对比：等价的 native plugin dlclose + dlopen → 展示 UB 风险
+
+#### 6.3 单 GPU 集成测试：Policy 实际影响 NCCL 行为
+
+**方法**：编译 NCCL + NCCLPol plugin，用 nccl-tests 的单 GPU 多线程模式。
+
+```bash
+# 2 ranks on 1 GPU (loopback)
+NCCL_TUNER_PLUGIN=./libnccl-policy.so \
+  ./all_reduce_perf -b 8 -e 128M -t 2 -g 1 -n 100
+```
+
+**实验 A：开销集成验证**
+- 对比：无 plugin vs NCCLPol(no-op) vs NCCLPol(简单 policy)
+- 量 AllReduce 延迟，确认 plugin 集成后的实际开销与微基准一致
+- 出图：延迟 vs 消息大小（三条线应几乎重叠）
+
+**实验 B：Policy 功能验证**
+- Policy 1：小消息强制 Ring/LL，大消息强制 Tree/Simple
+- 通过 `NCCL_DEBUG=INFO` 日志确认 NCCL 实际选择了 policy 指定的算法
+- 出图/表：消息大小 × policy 输出 × NCCL 实际选择 × 是否匹配
+
+**实验 C：闭环 telemetry 验证**
+- Profiler adapter 在每次 collective 完成时写 telemetry 到 eBPF maps
+- Tuner policy 读 maps 中的历史延迟，动态调整 nChannels
+- 出图：nChannels 随时间/调用次数的变化曲线（展示自适应行为）
+
+#### 6.4 模拟多租户竞争（单 GPU，多进程）
+
+**方法**：同一台机器启动 2 个 nccl-tests 进程，共享 1 个 GPU。
+
+```bash
+# 进程 A：有 SLO policy
+NCCL_TUNER_PLUGIN=./libnccl-policy.so POLICY_FILE=slo.bpf.o \
+  ./all_reduce_perf -b 1M -e 1M -t 2 -g 1 -n 1000 &
+
+# 进程 B：无 policy（竞争者）
+./all_reduce_perf -b 1M -e 1M -t 2 -g 1 -n 1000 &
+```
+
+**测量**：两个进程的 collective 延迟分布（CDF）
+**限制**：单 GPU 竞争主要是 SM 和 PCIe 带宽，不是 NIC/NVLink。在论文中诚实说明这是模拟，全规模评估留作 future work。
+**但仍有价值**：展示 SLO policy 在竞争下能稳定延迟（即使场景有限）
+
+#### 6.5 与 native plugin baseline 的性能对比
+
+- 将 SLO policy 逻辑用纯 C 实现为 native tuner plugin
+- 功能完全等价
+- 对比延迟：eBPF JIT 应与 native 几乎相同
+- 关键论点：eBPF 的安全保证（验证+隔离+热更新）不以性能为代价
 
 ### 7. Discussion（1 页）
 
@@ -329,32 +435,68 @@ Tuner adapter → 应用 action（修改 cost table、nChannels）
 
 ## 研究计划与时间线
 
-### Phase 0：可行性验证（2-3 周）
-- [ ] 编译 NCCL + example tuner plugin，验证 plugin 加载流程
-- [ ] 写最小 mixed plugin（tuner + profiler），确认 hook 被调用
-- [ ] 在 mixed plugin 内链接 bpftime 库，加载 no-op eBPF 程序，测量 overhead
-- [ ] 验证 profiler 回调 → eBPF maps → tuner 读取 的数据通路
+**硬件**：单节点 1×RTX 5090, 24 核, 125GB RAM, CUDA 12.9, MPI
+**目标**：Workshop 级别 preliminary evaluation（eBPF workshop / HotOS / poster）
 
-### Phase 1：核心框架（4-6 周）
-- [ ] 完整 NCCLPol .so（四种 adapter + bpftime + maps）
-- [ ] Policy 编程模型实现（ctx 结构、action 结构、helper 注册）
-- [ ] 验证器集成（PREVAIL + domain-specific 指令数约束）
-- [ ] MPK 隔离 + 热更新
+### Phase 0：编译验证（3-5 天）
+- [ ] 编译 NCCL（`make -j24 src.build`）
+- [ ] 编译运行 example tuner plugin 的 test（`nccl/plugins/tuner/example/test/`，纯 CPU，不需 GPU）
+- [ ] clone nccl-tests，编译，单 GPU 跑通 `all_reduce_perf -t 2 -g 1`
+- [ ] 确认 `NCCL_TUNER_PLUGIN=./libnccl-tuner-example.so` 生效（看 NCCL_DEBUG 日志）
 
-### Phase 2：Policy 实例 + 评估（4-6 周）
-- [ ] 三个 policy 实现（eBPF + 等价 native baseline）
-- [ ] 微基准测试（开销）
-- [ ] 安全属性验证
-- [ ] 多租户/故障/干扰 端到端实验
+### Phase 1：最小 eBPF Plugin（1-2 周）
+- [ ] 写一个最小 tuner plugin .so，在 `getCollInfo` 中调用 bpftime 执行一个 no-op eBPF 程序
+  - bpftime 作为静态库链接（不用 LD_PRELOAD，避免 CUDA 干扰）
+  - 如果静态链接有问题，退化为：plugin 中手动创建 llvmbpf_vm + JIT，不依赖完整 bpftime
+- [ ] 用 `test_plugin.c` 模式写 CPU-only 微基准，量 per-call 开销
+- [ ] **产出第一组数据**：eBPF policy 的 per-invocation 延迟（ns）
 
-### Phase 3：论文撰写（3-4 周）
+### Phase 2：Policy 编程模型 + 三个实例（2-3 周）
+- [ ] 定义 `nccl_policy_ctx` 和 `nccl_policy_action` 结构体
+- [ ] 注册 helper 函数（map lookup, trace_printk）
+- [ ] 实现三个 eBPF policy 程序（.bpf.c → .bpf.o）：
+  - **size-aware policy**：按消息大小选 algo/proto（功能验证）
+  - **adaptive nChannels policy**：读 telemetry map 动态调 nChannels（闭环验证）
+  - **SLO policy**：基于历史 P99 做决策（表达力展示）
+- [ ] 实现等价的 native C plugin baseline
+
+### Phase 3：安全属性演示（1 周）
+- [ ] 写 5-10 个"坏" eBPF 程序，展示验证器拒绝
+- [ ] MPK 隔离演示（如果硬件支持）
+- [ ] 热更新演示：循环调用中替换 policy
+- [ ] **产出第二组数据**：安全属性 pass/fail 表
+
+### Phase 4：单 GPU 集成 + 模拟竞争（1-2 周）
+- [ ] NCCLPol plugin 加载到真实 NCCL，跑 nccl-tests `-t 2 -g 1`
+- [ ] 通过 NCCL_DEBUG 日志确认 policy 实际改变了 algo 选择
+- [ ] Profiler adapter → eBPF maps → tuner 闭环验证
+- [ ] 两个 nccl-tests 进程同时跑，模拟竞争
+- [ ] **产出第三组数据**：集成后的 overhead + policy 功能验证 + 模拟竞争下的延迟 CDF
+
+### Phase 5：论文撰写（2-3 周）
+- 对 workshop 投稿足够的数据：overhead 微基准 + 安全演示 + 功能验证 + 模拟竞争
+- 诚实说明：全规模多节点评估是 future work
 
 ### 风险与备选
 
 | 风险 | 影响 | 备选方案 |
 |---|---|---|
-| bpftime 链接到 NCCL .so 有 CUDA 冲突 | 系统无法构建 | bpftime uprobe 模式（LD_PRELOAD，hook NCCL 导出函数） |
-| Stock ABI 动作空间太窄 | Policy 表达力不足 | 混合路径：plugin ABI + bpftime uprobe hook 内部函数 |
-| revoke/shrink 无法从 plugin 内触发 | 故障恢复受限 | action_map → 用户态 daemon 异步触发 |
-| 无 GPU 集群 | 无法做端到端 | NCCL tests + 模拟 workload + 单节点多 GPU |
-| Reviewer 说"只是 bpftime 的 domain application" | novelty 质疑 | 强调 domain-specific 设计（policy 模型、hook ABI、闭环架构）和 μs 级热路径的工程挑战 |
+| bpftime 链接到 plugin .so 失败 | 系统无法构建 | 直接用 llvmbpf（更轻量，仅 JIT 编译器，无 runtime 依赖） |
+| NCCL 编译失败 | 无法做 GPU 集成 | 仅用 CPU-only 微基准（直接调 plugin API），仍可出 overhead 数据 |
+| 单 GPU nccl-tests 太受限 | 结果不够说服力 | 强调 CPU-only 微基准才是核心（getCollInfo 是 CPU 函数），GPU 集成只是 bonus |
+| 模拟竞争不真实 | Reviewer 质疑 | 论文定位为 workshop/preliminary，诚实标注限制，承诺 future work |
+| MPK 不可用（需要 Intel 特定 CPU） | 无法演示硬件隔离 | 本机是 x86_64 应该支持，但若不支持则仅展示验证器隔离 |
+
+### 最终可出的图表（workshop 级别）
+
+| 图表 | 数据来源 | 需要 GPU？ |
+|---|---|---|
+| **Fig 1**: per-invocation overhead 柱状图（6 种配置） | CPU-only 微基准 | 否 |
+| **Fig 2**: overhead 分解（bpftime/map/JIT/MPK） | CPU-only 微基准 | 否 |
+| **Fig 3**: 安全属性 pass/fail 表 | 验证器+MPK 演示 | 否 |
+| **Fig 4**: 热更新切换延迟 | CPU-only 演示 | 否 |
+| **Fig 5**: nccl-tests 延迟 vs 消息大小（三条线） | 单 GPU 集成 | 是（1 GPU） |
+| **Fig 6**: Policy 功能验证（algo 选择匹配表） | 单 GPU + NCCL_DEBUG | 是（1 GPU） |
+| **Fig 7**: 闭环 nChannels 自适应曲线 | 单 GPU 集成 | 是（1 GPU） |
+| **Fig 8**: 模拟竞争下延迟 CDF | 单 GPU 双进程 | 是（1 GPU） |
+| **Fig 9**: eBPF vs native plugin 性能对比 | CPU 微基准+GPU 集成 | 混合 |
