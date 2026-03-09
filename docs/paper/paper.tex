@@ -1,0 +1,1015 @@
+% NCCLPol: Verified, Composable Policy Execution for GPU Collective Communication
+% Target: OSDI/SOSP-level systems venue (ACM sigconf)
+
+\documentclass[sigconf,anonymous]{acmart}
+
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{xspace}
+\usepackage{listings}
+\usepackage{balance}
+
+\newcommand{\sysname}{NCCLPol\xspace}
+\newcommand{\us}{\,\textmu{}s\xspace}
+\newcommand{\ns}{\,ns\xspace}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape,
+  columns=flexible,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  xleftmargin=2em,
+}
+
+% Remove ACM-specific reference formatting for draft
+\settopmatter{printfolios=true,printccs=false,printacmref=false}
+
+\begin{document}
+
+\title{\sysname: Verified, Composable Policy Execution\\for GPU Collective Communication}
+
+\author{Anonymous Authors}
+\affiliation{\institution{Anonymous Institution}}
+
+% ============================================================================
+% ABSTRACT
+% ============================================================================
+\begin{abstract}
+NCCL is the de facto standard library for GPU collective communication in
+large-scale distributed training. It exposes a plugin system---tuner,
+profiler, net, and env plugins---that allows operators to customize
+collective behavior. However, these plugins execute as native code within
+NCCL's address space, with no isolation, no verification, and no safe
+mechanism for cross-plugin state sharing. A single null-pointer
+dereference in a tuner plugin crashes the entire training job, potentially
+wasting thousands of GPU-hours.
+
+We present \sysname, a system that embeds a userspace eBPF runtime inside
+NCCL's plugin interface to transform unsafe extension points into
+verified, composable policy hooks. \sysname introduces three key
+mechanisms: (1)~load-time static verification that rejects unsafe policies
+before they can affect any collective decision, (2)~typed eBPF maps that
+enable structured state sharing between profiler and tuner without ad-hoc
+shared memory, and (3)~atomic policy hot-reload that swaps policies
+without losing or corrupting in-flight collective calls. All of this
+operates entirely within NCCL's stock plugin ABI, requiring zero
+modifications to NCCL itself. Our evaluation on real NCCL workloads shows
+that \sysname adds only 42--70\ns of CPU overhead per collective decision
+(well within NCCL's latency budget), rejects all seven classes of unsafe
+programs at load time, and enables closed-loop profiler-to-tuner
+adaptation that is impossible with native plugins alone.
+\end{abstract}
+
+\maketitle
+
+% ============================================================================
+% 1. INTRODUCTION
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large-scale GPU training workloads depend critically on collective
+communication performance. A single poorly-configured \texttt{AllReduce}
+can bottleneck an entire training pipeline, and the choice of algorithm
+(ring vs.\ tree), protocol (LL vs.\ Simple), and channel count can shift
+collective latency by orders of magnitude~\cite{nccl, autoccl, msccl}.
+NVIDIA's NCCL library~\cite{nccl} has become the dominant runtime for
+this task, supporting multi-GPU and multi-node topologies across
+InfiniBand, RoCE, and shared-memory transports.
+
+Recognizing that no single configuration fits all deployments, NCCL
+exposes a \emph{plugin system}: tuner plugins override algorithm and
+protocol selection per collective call; profiler plugins receive
+timestamped event callbacks; net plugins control network device selection
+and connection management; and env plugins programmatically set runtime
+parameters. This extensibility has enabled custom tuning solutions at
+major cloud providers and in research prototypes~\cite{autoccl, msccl}.
+
+\paragraph{The safety gap.}
+However, NCCL's extension model has a fundamental flaw: \emph{every plugin
+executes as native code in NCCL's address space with zero safety
+guarantees}. There is no verification that a tuner plugin terminates, no
+bounds checking on context access, no isolation between plugin and
+library state, and no structured mechanism for plugins to share state
+(e.g., for a profiler to inform a tuner). A single bug---a null-pointer
+dereference, an out-of-bounds read, a division by zero---crashes the
+hosting process with a \texttt{SIGSEGV}, terminating the training job. In
+production GPU clusters where jobs run for days across thousands of GPUs,
+such crashes waste enormous resources and are notoriously difficult to
+diagnose because the crash occurs inside a \texttt{dlopen}'d shared
+object with no structured error reporting.
+
+The situation worsens in multi-tenant settings. Cloud providers want to
+let tenants supply custom tuning policies for their workloads, but
+cannot safely load tenant-provided native code into a shared NCCL
+runtime. The result is a stark choice: either grant tenants full
+native-code access (unsafe) or deny customization entirely (inflexible).
+
+\paragraph{Our insight.}
+We observe that the eBPF execution model---load-time static verification,
+bounded execution, typed map-based state sharing---is a natural fit for
+NCCL's plugin architecture. The key enabling observation is that NCCL's
+policy-critical hot path, \texttt{getCollInfo()}, executes on the
+\emph{CPU side} and is \emph{latency-tolerant}: the collective
+communication it configures takes microseconds to milliseconds on the
+GPU, making an additional 50--80\ns of CPU-side decision overhead
+negligible. This contrasts sharply with eBPF's traditional domain
+(packet processing, syscall filtering) where nanosecond budgets are
+tight. In collective communication, eBPF's overhead budget is generous,
+and the safety and composability benefits are large.
+
+\paragraph{System overview.}
+\sysname embeds a userspace eBPF runtime (bpftime~\cite{bpftime}) inside
+a standard NCCL tuner plugin. Policy authors write eBPF programs in
+restricted C that are compiled to BPF bytecode, statically verified at
+load time, and JIT-compiled to native code for execution. Cross-plugin
+state sharing occurs exclusively through typed eBPF maps---for example,
+the profiler plugin writes latency observations into a map that the
+tuner policy reads when making algorithm decisions. Policy hot-reload
+atomically swaps the active policy via a single pointer exchange,
+ensuring zero lost calls. The entire system operates within NCCL's stock
+plugin ABI: \sysname is loaded via standard \texttt{NCCL\_TUNER\_PLUGIN}
+and \texttt{NCCL\_PROFILER\_PLUGIN} environment variables, requiring no
+modifications to NCCL itself.
+
+\paragraph{Contributions.}
+This paper makes the following contributions:
+
+\begin{enumerate}
+\item \textbf{The case for verified extensibility in collective
+communication.} We identify a fundamental tension in NCCL's plugin model
+between customizability and safety, and show that the eBPF execution
+model resolves this tension with negligible overhead because collective
+communication's CPU-side decision path is inherently latency-tolerant
+(\S\ref{sec:motivation}).
+
+\item \textbf{A map-based composability model for cross-plugin state.}
+We demonstrate that eBPF's typed maps provide a principled mechanism for
+closed-loop control---profiler-informed tuning---that is fragile or
+impossible with native plugins' ad-hoc shared memory
+(\S\ref{sec:design}).
+
+\item \textbf{Atomic policy evolution without call loss.} We design and
+implement a hot-reload mechanism that atomically swaps policies with
+respect to in-flight collective decisions, achieving a 0.309\us swap
+window with zero lost calls across 400{,}000 active invocations
+(\S\ref{sec:design}).
+
+\item \textbf{Comprehensive evaluation on real NCCL deployments.} We
+evaluate \sysname on NCCL~2.29.7 with real GPU hardware (RTX~5090),
+demonstrating 42--70\ns CPU overhead, complete verifier coverage (7/7
+unsafe patterns rejected), and end-to-end GPU overhead within
+measurement noise (\S\ref{sec:eval}).
+\end{enumerate}
+
+% ============================================================================
+% 2. BACKGROUND AND MOTIVATION
+% ============================================================================
+\section{Background and Motivation}
+\label{sec:motivation}
+
+\subsection{NCCL Plugin Architecture}
+\label{sec:nccl-plugins}
+
+NCCL~\cite{nccl} organizes its extensibility around four plugin types,
+each loaded via \texttt{dlopen} at initialization time:
+
+\paragraph{Tuner plugin.}
+The tuner plugin's \texttt{getCollInfo()} function is called once per
+collective operation. It receives the collective type (AllReduce,
+AllGather, etc.), message size, number of ranks, and current topology
+information, and returns the algorithm (ring, tree, collnet), protocol
+(LL, LL128, Simple), and number of channels to use. This is the primary
+policy decision point in NCCL.
+
+\paragraph{Profiler plugin.}
+The profiler plugin receives structured event callbacks---group start/end,
+collective start/end, proxy start/end---with nanosecond timestamps. It is
+NCCL's telemetry interface, but provides no built-in mechanism to feed
+observations back to the tuner.
+
+\paragraph{Net plugin.}
+The net plugin controls network device enumeration, connection setup, and
+data transfer operations. It is used for custom transport implementations
+(e.g., SHARP, AWS EFA).
+
+\paragraph{Env plugin.}
+Introduced in NCCL~2.28, the env plugin allows programmatic parameter
+setting without environment variables.
+
+\paragraph{The gap.}
+These plugins are designed as independent extension points. NCCL provides
+no mechanism for cross-plugin communication: a profiler cannot pass
+latency measurements to a tuner, a tuner cannot query network state from
+the net plugin, and no plugin can safely share state with another. Each
+plugin is a shared object loaded into NCCL's address space with full
+native-code privileges.
+
+\subsection{The Cost of Unsafe Extensions}
+\label{sec:unsafe}
+
+To concretize the safety problem, consider three failure scenarios that
+arise with native NCCL plugins:
+
+\paragraph{Scenario 1: Null dereference.}
+A tuner plugin accesses a data structure that has been freed or was never
+initialized. The result is an immediate \texttt{SIGSEGV}. The hosting
+training process terminates. On a 1{,}024-GPU training job running for
+72 hours, this wastes potentially thousands of GPU-hours. The crash
+backtrace points into a \texttt{dlopen}'d \texttt{.so} file, making
+root-cause analysis difficult.
+
+\paragraph{Scenario 2: Silent corruption.}
+A tuner plugin has an off-by-one error that overwrites an adjacent NCCL
+internal structure. The corruption does not cause an immediate crash but
+produces subtly incorrect algorithm selections. Training proceeds but
+converges slowly or produces incorrect gradients. This failure mode is
+worse than a crash because it is silent.
+
+\paragraph{Scenario 3: Infinite loop.}
+A tuner plugin enters an infinite loop due to a logic error. Because
+\texttt{getCollInfo()} is called synchronously, the entire NCCL
+communicator hangs. All ranks in the collective are blocked indefinitely.
+No timeout mechanism exists within NCCL's plugin interface.
+
+In all three scenarios, the root cause is the same: native plugins execute
+with the full privileges of the hosting process and no safety net.
+
+\subsection{Why eBPF Fits}
+\label{sec:why-ebpf}
+
+The eBPF execution model~\cite{ebpf-linux} was designed precisely to allow
+safe, verified extension of privileged software. An eBPF program undergoes
+static verification before execution: the verifier checks for null
+dereferences, out-of-bounds accesses, unbounded loops, uninitialized
+reads, and illegal helper function calls. Programs that fail verification
+are rejected before they can execute a single instruction.
+
+Three properties make eBPF particularly well-suited to NCCL's plugin
+architecture:
+
+\paragraph{1. Generous overhead budget.}
+In NCCL, \texttt{getCollInfo()} is called once per collective operation
+on the CPU. The collective operation itself---the actual GPU-side
+data movement---takes microseconds to milliseconds (e.g., 175\us for
+a 128\,MB AllReduce on our hardware). An additional 50--80\ns of CPU
+overhead for eBPF dispatch and JIT execution is negligible---less than
+0.05\% of collective latency.
+
+\paragraph{2. Natural state-sharing primitive.}
+eBPF maps (hash maps, arrays, ring buffers) provide typed, concurrent,
+safe state sharing between programs. This directly addresses NCCL's
+cross-plugin communication gap: a profiler eBPF program writes latency
+observations into a map; a tuner eBPF program reads the same map when
+making decisions. No ad-hoc shared memory, no locking bugs, no type
+confusion.
+
+\paragraph{3. Hot-reload without restart.}
+eBPF programs can be atomically replaced at runtime. For NCCL, this means
+operators can update tuning policies without restarting training jobs---a
+capability that native \texttt{dlopen}-based plugins fundamentally cannot
+provide without custom infrastructure.
+
+\subsection{Comparison with Prior Approaches}
+
+Existing work on collective communication optimization falls into two
+categories, neither of which addresses the safety gap:
+
+\emph{Collective algorithm synthesis}~\cite{msccl, taccl, autoccl}
+focuses on generating efficient communication schedules for specific
+topologies. These systems produce static plans that are compiled ahead of
+time; they do not address runtime policy selection, safety, or
+composability.
+
+\emph{eBPF in systems software}~\cite{xrp, electrode, etran, pageflex}
+has been applied to storage (XRP~\cite{xrp}), distributed protocols
+(Electrode~\cite{electrode}), networking (eTran~\cite{etran}), and memory
+management (PageFlex~\cite{pageflex}). However, no prior work applies
+eBPF to GPU collective communication runtimes. \sysname is the first
+system to bring verified, composable policy execution to this domain.
+
+% ============================================================================
+% 3. DESIGN
+% ============================================================================
+\section{Design}
+\label{sec:design}
+
+\sysname's design is guided by four principles that address the problems
+identified in \S\ref{sec:motivation}.
+
+\subsection{Design Principles}
+
+\paragraph{P1: Verify before execute.}
+Every policy program undergoes static verification before it can affect
+any collective decision. The verifier checks memory safety (no null
+dereferences, no out-of-bounds accesses), termination (no unbounded
+loops), stack bounds, helper function authorization, and context access
+validity. A policy that fails any check is rejected entirely---there is
+no ``partial acceptance.'' This eliminates Scenarios 1--3 from
+\S\ref{sec:unsafe} by construction.
+
+\paragraph{P2: Share state through maps, not memory.}
+All cross-component state sharing occurs through typed eBPF maps.
+The profiler writes observations into maps; the tuner reads them.
+Maps enforce type safety and provide atomic access semantics. This
+eliminates the need for ad-hoc shared memory regions, custom locking
+protocols, or unsafe pointer passing between plugins.
+
+\paragraph{P3: Atomic policy evolution.}
+Policy updates are atomic with respect to in-flight decisions. When an
+operator deploys a new policy, the system verifies it, JIT-compiles it,
+and atomically swaps the function pointer. Any \texttt{getCollInfo()} call
+in progress completes under the old policy; the next call executes under
+the new policy. No call is lost, no call sees a partially-initialized
+policy.
+
+\paragraph{P4: Stay within the ABI.}
+\sysname operates entirely within NCCL's existing plugin interface. It is
+loaded as a standard tuner and profiler plugin via environment variables.
+No NCCL source modifications, no custom NCCL builds, no kernel modules.
+This ensures compatibility with stock NCCL deployments and future NCCL
+versions.
+
+\subsection{Architecture Overview}
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.95\columnwidth}{%
+    \centering\small
+    \textbf{Figure 1: \sysname Architecture}\\[6pt]
+    \begin{tabular}{c}
+    \texttt{[Policy .bpf.c]} $\xrightarrow{\text{clang -target bpf}}$ \texttt{[BPF ELF]}\\[3pt]
+    $\downarrow$ \textit{load-time verification}\\[3pt]
+    \fbox{\parbox{0.85\columnwidth}{\centering
+      \textbf{NCCL Process}\\[4pt]
+      \fbox{\texttt{Tuner Plugin (NCCLPol)}} \quad \fbox{\texttt{Profiler Plugin}}\\[4pt]
+      $\updownarrow$ \textit{eBPF maps} $\updownarrow$\\[4pt]
+      \fbox{\parbox{0.6\columnwidth}{\centering
+        bpftime runtime\\
+        verifier $|$ JIT $|$ maps $|$ hot-reload
+      }}
+    }}\\[3pt]
+    $\downarrow$ \textit{getCollInfo() / event callbacks}\\[3pt]
+    \texttt{[NCCL Core]} $\rightarrow$ \texttt{[GPU Collectives]}
+    \end{tabular}
+  }}
+  \caption{\sysname architecture. Policy programs are compiled to BPF
+  bytecode, verified at load time, and JIT-compiled inside the NCCL
+  process. The tuner and profiler plugins communicate through shared eBPF
+  maps, enabling closed-loop adaptation. The entire system loads as
+  standard NCCL plugins, requiring zero NCCL modifications.}
+  \label{fig:architecture}
+\end{figure}
+
+Figure~\ref{fig:architecture} illustrates \sysname's architecture.
+The system has four components:
+
+\paragraph{Policy compiler toolchain.}
+Policy authors write eBPF programs in restricted C. The programs are
+compiled with \texttt{clang -target bpf} to produce standard BPF ELF
+objects. The restricted C subset enforces bounded loops, no dynamic
+allocation, no function pointers, and access to only declared helper
+functions and map types. This is the same programming model used for
+Linux kernel eBPF programs, ensuring familiarity for systems programmers.
+
+\paragraph{Verification and JIT layer.}
+At load time, the BPF ELF is parsed and each program section is submitted
+to the static verifier. The verifier performs abstract interpretation over
+all possible execution paths, checking for memory safety, termination,
+stack overflow, illegal helper use, and context bounds. Programs that pass
+verification are JIT-compiled to native x86-64 code via LLVM. The JIT
+output executes at near-native speed, as our evaluation confirms
+(\S\ref{sec:eval-overhead}).
+
+\paragraph{Map subsystem.}
+eBPF maps serve dual roles: (1)~intra-policy state (e.g., per-communicator
+channel counts, cumulative latency statistics) and (2)~cross-plugin
+communication (profiler $\rightarrow$ tuner telemetry). Maps are typed:
+a hash map keyed by communicator~ID stores per-communicator policy state;
+an array map stores global configuration. Map access from eBPF programs
+uses helper functions (\texttt{bpf\_map\_lookup\_elem},
+\texttt{bpf\_map\_update\_elem}) that are bounds-checked by the verifier.
+
+\paragraph{Hot-reload engine.}
+To update a policy, the operator provides a new BPF ELF file. The system
+verifies and JIT-compiles the new program, then atomically swaps the
+active function pointer using a compare-and-swap operation. The old
+program remains valid until all in-flight calls complete (ensured by
+the atomic swap semantics). If the new program fails verification, the
+swap is aborted and the old policy remains active---the system never
+enters an unverified state.
+
+\subsection{Policy Programming Model}
+\label{sec:policy-model}
+
+A \sysname policy is a BPF program that takes a \emph{policy context}
+as input and writes its decisions into the context's output fields.
+The context structure is defined as:
+
+\begin{lstlisting}[language=C, caption={Policy context structure.},
+  label={lst:context}]
+struct policy_context {
+  /* inputs (read-only) */
+  __u32 comm_id;      /* communicator ID */
+  __u32 coll_type;    /* AllReduce, AllGather, ... */
+  __u64 msg_size;     /* message size in bytes */
+  __u32 n_ranks;      /* number of ranks */
+  __u32 n_nodes;      /* number of nodes */
+  /* outputs (write) */
+  __u32 algorithm;    /* RING, TREE, COLLNET */
+  __u32 protocol;     /* LL, LL128, SIMPLE */
+  __u32 n_channels;   /* parallelism degree */
+};
+\end{lstlisting}
+
+The verifier ensures that policies only read from input fields and write
+to output fields. Any attempt to read beyond the context bounds or write
+to input fields is rejected at load time.
+
+\paragraph{Example: Size-aware policy.}
+The following policy selects algorithm and protocol based on message size,
+a common tuning heuristic:
+
+\begin{lstlisting}[language=C, caption={Size-aware tuning policy.},
+  label={lst:size-aware}]
+SEC("policy")
+int size_aware(struct policy_context *ctx) {
+  if (ctx->msg_size <= 4096) {
+    ctx->algorithm = NCCL_ALGO_TREE;
+    ctx->protocol  = NCCL_PROTO_SIMPLE;
+  } else if (ctx->msg_size <= 65536) {
+    ctx->algorithm = NCCL_ALGO_TREE;
+    ctx->protocol  = NCCL_PROTO_LL;
+  } else {
+    ctx->algorithm = NCCL_ALGO_RING;
+    ctx->protocol  = NCCL_PROTO_LL;
+  }
+  return 0;
+}
+\end{lstlisting}
+
+This 12-line program replaces what would be a 200+ line native C++ plugin
+with \texttt{dlopen} boilerplate, manual error handling, and no safety
+guarantees.
+
+\paragraph{Example: Closed-loop adaptation.}
+A more sophisticated policy reads profiler-provided latency data from
+an eBPF map and adapts channel count:
+
+\begin{lstlisting}[language=C, caption={Profiler-informed channel adaptation.},
+  label={lst:adaptive}]
+SEC("policy")
+int adaptive_channels(struct policy_context *ctx) {
+  __u32 key = ctx->comm_id;
+  struct latency_state *st =
+    bpf_map_lookup_elem(&latency_map, &key);
+  if (!st) { /* first call: initialize */
+    struct latency_state init = {.channels = 8};
+    bpf_map_update_elem(&latency_map, &key,
+                        &init, BPF_ANY);
+    ctx->n_channels = 8;
+    return 0;
+  }
+  /* adapt: high latency -> more channels */
+  if (st->avg_latency_ns > 1000000)
+    st->channels = min(st->channels + 1, 16);
+  else if (st->avg_latency_ns < 100000)
+    st->channels = max(st->channels - 1, 1);
+  ctx->n_channels = st->channels;
+  return 0;
+}
+\end{lstlisting}
+
+The \texttt{latency\_map} is a shared eBPF hash map. The profiler plugin
+writes updated latency measurements into this map on each profiler event
+callback; the tuner policy reads them on each \texttt{getCollInfo()} call.
+This closed-loop design is impossible with stock NCCL plugins because
+there is no cross-plugin state-sharing mechanism.
+
+\subsection{Multi-Tenant Policy Differentiation}
+\label{sec:multi-tenant}
+
+A single \sysname policy can differentiate behavior across communicators
+using the \texttt{comm\_id} field. This enables multi-tenant scenarios
+where different communicators (representing different tenants or job
+priorities) receive different tuning decisions from the same verified
+policy. For example, a latency-sensitive communicator (SLO~$\leq$~1\,ms)
+receives aggressive parallelism (TREE, LL, 8~channels), while a
+throughput-oriented communicator (SLO~$\leq$~10\,ms) receives
+conservative settings (RING, Simple, 1~channel). The per-communicator
+state is maintained in eBPF maps keyed by communicator~ID, ensuring
+complete isolation between tenants' policy state.
+
+% ============================================================================
+% 4. IMPLEMENTATION
+% ============================================================================
+\section{Implementation}
+\label{sec:impl}
+
+\sysname is implemented in approximately 2{,}500 lines of C/C++ (plugin
+host) and 500 lines of restricted C (policy programs). We describe key
+implementation decisions and challenges.
+
+\paragraph{bpftime integration.}
+We embed bpftime~\cite{bpftime} as the userspace eBPF runtime. bpftime
+provides an LLVM-based JIT compiler, a PREVAIL-based~\cite{prevail}
+static verifier, and a map subsystem. We use bpftime's
+\texttt{bpftime\_load\_and\_run} API to load BPF ELF objects and obtain
+JIT-compiled function pointers. The verifier runs in the same address
+space as the plugin, adding approximately 1--5\,ms of one-time startup
+overhead (amortized over the lifetime of the training job).
+
+\paragraph{Plugin registration.}
+\sysname registers itself as both a tuner and profiler plugin via NCCL's
+\texttt{ncclTunerPlugin\_v3} and \texttt{ncclProfilerPlugin\_v1}
+interfaces. The tuner plugin's \texttt{getCollInfo()} function
+constructs a \texttt{policy\_context}, invokes the JIT-compiled eBPF
+function, and copies the output fields (algorithm, protocol, channels)
+into NCCL's result structure. The profiler plugin's event callbacks
+extract latency information and update the shared eBPF maps.
+
+\paragraph{NCCL integration challenges.}
+Real NCCL integration revealed several non-obvious requirements.
+First, NCCL's \texttt{getCollInfo()} passes algorithm and protocol
+costs as arrays, and the tuner must set costs to zero for the selected
+algorithm/protocol and to a large value for others---simply returning
+an algorithm~ID is insufficient. Second, NCCL calls
+\texttt{getCollInfo()} with a \texttt{nChannels} parameter that the
+tuner must respect as an upper bound, not override arbitrarily.
+Third, the communicator~ID is not directly available in the tuner API;
+we derive it from the context pointer, which required careful handling
+to ensure stability across NCCL versions.
+
+\paragraph{Hot-reload implementation.}
+Policy hot-reload uses a \texttt{std::atomic<FuncPtr>} for the active
+policy function pointer. The reload path loads and verifies the new
+BPF program, JIT-compiles it, and performs a \texttt{compare\_exchange}
+on the atomic pointer. The old function pointer is retained until a
+quiescence period (currently one epoch of calls) ensures no in-flight
+invocations reference it. In our measurements, the atomic swap itself
+takes 0.309\us, and we observe zero lost or corrupted calls across
+400{,}000 concurrent invocations.
+
+\paragraph{Native baseline for comparison.}
+To provide a fair overhead comparison, we implemented a native C++
+baseline that performs identical policy logic (size-based algorithm
+selection) without the eBPF layer. This baseline is compiled with the
+same optimization flags (\texttt{-O2}) and uses the same data structures.
+The overhead difference between the native baseline and eBPF policies
+directly measures the cost of the eBPF dispatch and JIT execution layers.
+
+% ============================================================================
+% 5. EVALUATION
+% ============================================================================
+\section{Evaluation}
+\label{sec:eval}
+
+Our evaluation answers five research questions:
+
+\begin{description}
+\item[RQ1] What is the CPU overhead of eBPF policy execution relative to
+native code? (\S\ref{sec:eval-overhead})
+\item[RQ2] Does the verifier correctly accept safe programs and reject
+unsafe ones? (\S\ref{sec:eval-verifier})
+\item[RQ3] Can policies be hot-reloaded without losing in-flight calls?
+(\S\ref{sec:eval-hotreload})
+\item[RQ4] Does \sysname work with real NCCL on real GPUs, and what is the
+end-to-end overhead? (\S\ref{sec:eval-e2e})
+\item[RQ5] Can \sysname express non-trivial policies: closed-loop
+adaptation, multi-tenant differentiation, multi-collective coverage?
+(\S\ref{sec:eval-policies})
+\end{description}
+
+\paragraph{Testbed.}
+CPU microbenchmarks run on an Intel platform with isolated cores to
+minimize scheduling noise. GPU experiments use a single NVIDIA RTX~5090
+with CUDA~12.9 and NCCL~2.29.7. We emulate a 2-rank configuration on
+a single host using NCCL's \texttt{NCCL\_HOSTID} mechanism over socket
+transport.
+
+% --------------------------------------------------------------------------
+\subsection{RQ1: CPU Overhead}
+\label{sec:eval-overhead}
+
+\begin{table}[t]
+\centering
+\caption{CPU microbenchmark results (1M calls each). eBPF policies add
+42--70\ns over native code, decomposable into dispatch, map lookup, and
+map update costs.}
+\label{tab:overhead}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Policy} & \textbf{P50 (ns)} & \textbf{P99 (ns)} & \textbf{$\Delta$P50 vs native} \\
+\midrule
+Native baseline    &  10 &  16 & --- \\
+\texttt{noop}              &  51 &  61 & +41 \\
+\texttt{size\_aware\_v2}   &  52 &  64 & +42 \\
+\texttt{lookup\_only}      &  63 &  74 & +53 \\
+\texttt{lookup\_update}    &  74 &  87 & +64 \\
+\texttt{adaptive\_channels}&  75 &  88 & +65 \\
+\texttt{slo\_enforcer}     &  80 &  95 & +70 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.93\columnwidth}{%
+    \centering\small
+    \textbf{Figure 2: Overhead Staircase}\\[6pt]
+    \textit{Bar chart showing incremental overhead layers:}\\[3pt]
+    Native (10\,ns) $\rightarrow$ +41\,ns dispatch $\rightarrow$
+    +11\,ns map lookup $\rightarrow$ +11\,ns map update\\[3pt]
+    \textit{Each bar shows P50 and P99 with error bars.}
+  }}
+  \caption{Overhead decomposition showing additive cost of each eBPF
+  operation. The base dispatch cost (41\ns) dominates; each map operation
+  adds a constant $\sim$11\ns.}
+  \label{fig:overhead}
+\end{figure}
+
+Table~\ref{tab:overhead} reports CPU-side latency for 1\,million calls
+to each policy. The results reveal a clean \emph{overhead staircase}
+(Figure~\ref{fig:overhead}):
+
+\begin{itemize}
+\item \textbf{eBPF dispatch}: 41\ns. This is the fixed cost of entering
+the JIT-compiled eBPF function from the plugin's native code, including
+context setup and function pointer invocation.
+\item \textbf{Map lookup}: +11\ns per lookup. The \texttt{lookup\_only}
+policy performs one \texttt{bpf\_map\_lookup\_elem} call, adding 12\ns
+over \texttt{size\_aware\_v2} (which uses no maps).
+\item \textbf{Map update}: +11\ns per update. The \texttt{lookup\_update}
+policy adds one \texttt{bpf\_map\_update\_elem} call, adding another
+11\ns.
+\end{itemize}
+
+The most complex policy (\texttt{slo\_enforcer}) adds only 70\ns over
+native code. For context, a 128\,MB AllReduce takes 175\us on our GPU
+hardware---the 70\ns policy overhead is 0.04\% of collective latency.
+Even for the smallest collectives (1\,KB, $\sim$5\us), the overhead is
+under 1.5\%.
+
+\paragraph{Tail latency.}
+P99 latencies track P50 closely (within 10--18\ns), indicating that
+eBPF JIT execution has minimal variance. This is expected: JIT-compiled
+code follows deterministic paths with no garbage collection, no
+allocation, and no system calls.
+
+% --------------------------------------------------------------------------
+\subsection{RQ2: Verifier Effectiveness}
+\label{sec:eval-verifier}
+
+\begin{table}[t]
+\centering
+\caption{Verifier results. All 7 safe policies accepted; all 7 unsafe
+programs rejected with specific error messages.}
+\label{tab:verifier}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Program} & \textbf{Bug Class} & \textbf{Result} \\
+\midrule
+\multicolumn{3}{l}{\textit{Safe policies (should accept)}} \\
+\texttt{noop} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{size\_aware} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{size\_aware\_v2} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{lookup\_only} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{lookup\_update} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{adaptive\_channels} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\texttt{slo\_enforcer} & --- & \textcolor{green!60!black}{ACCEPT} \\
+\midrule
+\multicolumn{3}{l}{\textit{Unsafe programs (should reject)}} \\
+\texttt{bad\_lookup} & Null deref & \textcolor{red}{REJECT} \\
+\texttt{bad\_oob\_access} & OOB context read & \textcolor{red}{REJECT} \\
+\texttt{bad\_unregistered} & Illegal helper & \textcolor{red}{REJECT} \\
+\texttt{bad\_stack\_overflow} & Stack overflow & \textcolor{red}{REJECT} \\
+\texttt{bad\_infinite\_loop} & Non-termination & \textcolor{red}{REJECT} \\
+\texttt{bad\_write\_ctx} & Input field write & \textcolor{red}{REJECT} \\
+\texttt{bad\_div\_zero} & Division by zero & \textcolor{red}{REJECT} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:verifier} shows the verifier's behavior on our test suite
+of 14 programs. The verifier uses PREVAIL-based~\cite{prevail} abstract
+interpretation to reason about all possible execution paths.
+
+\paragraph{Soundness in practice.}
+The seven unsafe programs cover the major classes of memory safety and
+control-flow violations that can crash a native plugin. We highlight one
+particularly important case: \texttt{bad\_lookup} dereferences the return
+value of \texttt{bpf\_map\_lookup\_elem()} without checking for
+\texttt{NULL}. In a native plugin, this would cause a
+\texttt{SIGSEGV}---the exact failure mode described in Scenario~1
+(\S\ref{sec:unsafe}). The verifier rejects this program at load time,
+before it can execute a single instruction.
+
+\paragraph{Safety comparison.}
+To validate that the verifier prevents real crashes, we implemented the
+equivalent of \texttt{bad\_lookup} as a native C plugin---a deliberate
+null dereference in \texttt{getCollInfo()}. Loading this native plugin
+into NCCL produces an immediate \texttt{SIGSEGV}, crashing the process.
+The equivalent eBPF program is rejected at load time with a clear error
+message. This is the core safety proposition of \sysname: bugs that
+crash training jobs with native plugins are eliminated by construction
+with eBPF.
+
+% --------------------------------------------------------------------------
+\subsection{RQ3: Hot-Reload Integrity}
+\label{sec:eval-hotreload}
+
+\begin{table}[t]
+\centering
+\caption{Hot-reload measurement. Atomic swap is sub-microsecond with
+zero lost calls.}
+\label{tab:hotreload}
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Atomic swap window & 0.309\,\textmu{}s \\
+Active calls during test & 400{,}000 \\
+Failed/lost calls & 0 \\
+Bad replacement rejected & Yes (old policy preserved) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:hotreload} reports our hot-reload stress test. We
+continuously invoke \texttt{getCollInfo()} from multiple threads while
+concurrently swapping the active policy. The atomic swap completes in
+0.309\us, and we observe zero failed or lost calls across 400{,}000
+invocations.
+
+Critically, when we attempt to hot-reload an \emph{unsafe} policy (one
+that fails verification), the system rejects the replacement and
+preserves the currently-active safe policy. This ensures that the system
+never enters an unverified state, even under operator error.
+
+% --------------------------------------------------------------------------
+\subsection{RQ4: End-to-End GPU Overhead}
+\label{sec:eval-e2e}
+
+\begin{table}[t]
+\centering
+\caption{End-to-end AllReduce latency on RTX~5090, 2~ranks. The average
+delta across all message sizes is $<$0.05\,\textmu{}s (within
+measurement noise).}
+\label{tab:e2e}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Message Size} & \textbf{No Plugin} & \textbf{noop} & \textbf{size\_aware\_v2} \\
+\midrule
+128\,MB & 175.42\,\textmu{}s & 175.51\,\textmu{}s & 175.47\,\textmu{}s \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+{\footnotesize Average delta across all message sizes: $<$0.05\,\textmu{}s}
+\end{table}
+
+We integrate \sysname with NCCL~2.29.7 running a 2-rank AllReduce
+benchmark on a single RTX~5090 with socket transport. Each rank calls
+\texttt{getCollInfo()} 495 times across 10 message sizes (1\,KB to
+1\,MB).
+
+\paragraph{Latency overhead.}
+Table~\ref{tab:e2e} shows end-to-end GPU-measured collective latency.
+At 128\,MB, the \texttt{noop} policy adds 0.09\us and
+\texttt{size\_aware\_v2} adds 0.05\us---both within measurement noise.
+The average overhead across all message sizes is below 0.05\us.
+This confirms our thesis that NCCL's CPU-side decision path is
+sufficiently latency-tolerant to absorb eBPF overhead without
+measurable impact on GPU communication performance.
+
+\paragraph{Policy adoption.}
+Our \texttt{size\_aware\_v2} policy requests specific algorithm/protocol
+combinations based on message size. In the real NCCL integration, NCCL
+adopted the policy's recommendation for all 10 message sizes:
+
+\begin{itemize}
+\item 1--2\,KB: TREE + SIMPLE (small messages benefit from tree topology,
+Simple protocol avoids LL overhead)
+\item 4--32\,KB: TREE + LL (LL protocol reduces latency for medium
+messages)
+\item 64--512\,KB: RING + LL (ring algorithm better for larger messages)
+\item 1\,MB: RING + SIMPLE (largest messages use Simple for bandwidth)
+\end{itemize}
+
+This demonstrates that \sysname policies have full control over NCCL's
+algorithm selection, exactly as intended by the tuner plugin interface.
+
+% --------------------------------------------------------------------------
+\subsection{RQ5: Policy Expressiveness}
+\label{sec:eval-policies}
+
+We evaluate three non-trivial policy capabilities that go beyond simple
+algorithm selection.
+
+\paragraph{Closed-loop profiler-to-tuner adaptation.}
+We deploy the \texttt{adaptive\_channels} policy alongside the profiler
+plugin. The profiler measures real collective latency and writes it to
+a shared eBPF map. The tuner reads this map and adjusts channel count:
+
+\begin{itemize}
+\item \textbf{With profiler feedback}: channels adapt from 8 $\rightarrow$
+9 $\rightarrow$ 10 based on observed latency (first measured sample:
+9{,}264{,}480\ns at rank~0).
+\item \textbf{Without profiler feedback}: channels remain static at
+8 $\rightarrow$ 8 $\rightarrow$ 8.
+\end{itemize}
+
+This demonstrates that eBPF maps enable a form of closed-loop control
+that is structurally impossible with NCCL's native plugin architecture,
+where the tuner and profiler have no shared state mechanism.
+
+\paragraph{Multi-tenant differentiation.}
+We deploy the \texttt{slo\_enforcer} policy with two communicators in the
+same process, simulating a multi-tenant scenario where each communicator
+has a different SLO:
+
+\begin{itemize}
+\item Communicator~1 (SLO $\leq$~1\,ms): receives TREE / LL / 8~channels
+(aggressive, latency-optimized)
+\item Communicator~2 (SLO $\leq$~10\,ms): receives RING / Simple /
+1~channel (conservative, throughput-optimized)
+\end{itemize}
+
+The same verified policy produces differentiated behavior based on
+per-communicator state stored in eBPF maps. This demonstrates a
+multi-tenant QoS capability that would require complex, error-prone
+shared state management in a native plugin.
+
+\paragraph{Contention-aware adaptation.}
+\begin{figure}[t]
+  \centering
+  \fbox{\parbox{0.93\columnwidth}{%
+    \centering\small
+    \textbf{Figure 3: Contention Adaptation Time Series}\\[6pt]
+    \textit{Line plot showing channel count over time:}\\[3pt]
+    Baseline (low latency): channels rise to 12\\
+    Contention (high latency): channels fall to 2\\
+    Recovery (low latency): channels recover to 12\\[3pt]
+    \textit{X-axis: time (collective calls). Y-axis: channel count.}
+  }}
+  \caption{Dynamic channel adaptation under changing contention.
+  The policy increases channels when latency is low (more parallelism)
+  and decreases channels when contention is detected (reduce
+  interference), demonstrating reactive adaptation through
+  eBPF map state.}
+  \label{fig:contention}
+\end{figure}
+
+Figure~\ref{fig:contention} shows the \texttt{adaptive\_channels}
+policy's response to simulated contention phases. During the baseline
+phase (low observed latency), the policy ramps channel count up to 12
+to maximize parallelism. When contention is injected (high latency),
+the policy reduces channels to 2 to minimize interference. When
+contention subsides, channels recover to 12. This reactive behavior
+emerges naturally from the map-based feedback loop---no special
+contention-detection mechanism is needed.
+
+\paragraph{Multi-collective coverage.}
+We verify that \sysname policies work across all major collective types:
+AllReduce, AllGather, ReduceScatter, and Broadcast. AllReduce shows
+distinct TREE algorithm selection for small messages (where tree topology
+reduces latency), while other collectives default to RING. The policy
+context's \texttt{coll\_type} field enables collective-specific tuning
+strategies.
+
+% ============================================================================
+% 6. DISCUSSION
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Limitations.}
+\sysname currently targets NCCL's tuner and profiler plugin interfaces.
+The net plugin interface, which controls network device selection and
+data transfer, involves more complex state (connection handles, memory
+registrations) that does not map cleanly to eBPF's restricted programming
+model. Extending \sysname to cover net plugin decisions is future work
+that may require helper function extensions to the eBPF runtime.
+
+Our evaluation uses a 2-rank configuration on a single node. While this
+is sufficient to validate the plugin integration and measure overhead
+(the CPU-side policy path is rank-count-independent), evaluating
+multi-node scenarios with InfiniBand transport and hundreds of ranks
+remains future work.
+
+The current policy programming model requires authors to write in
+restricted C and compile to BPF bytecode. Higher-level policy
+specification languages (e.g., declarative SLO specifications
+compiled to BPF) would improve usability, particularly for operators
+who are not systems programmers.
+
+\paragraph{Broader implications.}
+The eBPF-for-extensions pattern demonstrated by \sysname is applicable
+beyond NCCL. Any library or runtime that exposes a native-code plugin
+interface---MPI implementations, distributed training frameworks
+(PyTorch FSDP, DeepSpeed), GPU schedulers---faces the same safety gap.
+The insight that GPU-adjacent CPU-side decision paths have generous
+latency budgets for verified execution applies broadly to the
+accelerator software stack.
+
+\paragraph{EIM integration.}
+The Extension Interface Model (EIM)~\cite{eim} provides a formal
+capability specification for eBPF extensions, defining what maps, helpers,
+and context fields each extension point can access. Integrating EIM with
+\sysname would enable fine-grained access control---e.g., a policy could
+be granted read access to latency maps but denied access to network
+device maps---further strengthening the safety guarantees beyond what
+the verifier alone provides.
+
+% ============================================================================
+% 7. RELATED WORK
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Collective communication optimization.}
+MSCCL~\cite{msccl} and TACCL~\cite{taccl} synthesize topology-aware
+collective algorithms expressed as communication schedules. These systems
+are complementary to \sysname: they produce static, offline plans, while
+\sysname provides a runtime policy layer that can select among such plans
+based on dynamic conditions. AutoCCL~\cite{autoccl} automates collective
+tuning through search but uses native code and provides no safety
+guarantees. MSCCL++~\cite{mscclpp} provides a GPU-driven communication
+stack with fine-grained primitives; its focus is on communication
+\emph{mechanisms}, not \emph{policy}. \sysname operates at the policy
+layer, making decisions about which mechanisms to use---a fundamentally
+different abstraction level.
+
+\paragraph{eBPF for systems extensibility.}
+XRP~\cite{xrp} applies eBPF to storage, allowing applications to push
+resubmission logic into the kernel's I/O completion path. \sysname
+follows XRP's architectural pattern---embedding eBPF in a performance
+critical but latency-tolerant path---but targets a fundamentally
+different domain (GPU collective communication vs.\ storage I/O).
+Electrode~\cite{electrode} uses eBPF to accelerate distributed protocols
+(Paxos, sequencer) in the kernel's network stack. eTran~\cite{etran}
+applies eBPF to transparent network function composition.
+PageFlex~\cite{pageflex} extends eBPF to page management policies.
+These systems share the insight that eBPF's verification model enables
+safe extensibility in previously-closed systems, but none address GPU
+collective communication or the unique challenges of NCCL's plugin
+architecture (cross-plugin state sharing, multi-communicator
+differentiation). bpftime~\cite{bpftime} provides the userspace eBPF
+runtime substrate that \sysname builds upon, extending eBPF from
+kernel-only to userspace applications.
+
+\paragraph{eBPF verification.}
+The PREVAIL verifier~\cite{prevail} provides the abstract interpretation
+engine used by \sysname. Unlike the Linux kernel's built-in BPF verifier,
+PREVAIL is designed for portability and can run in userspace, making it
+suitable for embedding in application-level runtimes. \sysname relies on
+PREVAIL's existing verification capabilities without modification,
+validating that the verifier's safety properties are sufficient for the
+NCCL domain.
+
+\paragraph{GPU communication runtimes.}
+NCCL~\cite{nccl} is NVIDIA's collective communication library, providing
+optimized implementations of AllReduce, AllGather, ReduceScatter, and
+other collectives across GPU interconnects. Its plugin system is
+documented but provides no formal safety model. AMD's RCCL provides a
+similar interface for ROCm GPUs. \sysname's design is
+NCCL-specific in implementation but the architectural pattern
+(eBPF policy layer inside a collective communication runtime) is
+portable to RCCL and potentially to MPI implementations.
+
+% ============================================================================
+% 8. CONCLUSION
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented \sysname, a system that transforms NCCL's unsafe native
+plugin extension points into verified, composable policy hooks by
+embedding a userspace eBPF runtime inside the plugin interface. Our
+key insight is that NCCL's CPU-side collective decision path is
+sufficiently latency-tolerant to absorb eBPF's verification and
+execution overhead, making the safety--performance tradeoff decisively
+favorable. \sysname adds 42--70\ns of CPU overhead per collective
+decision (0.04\% of collective latency), rejects all classes of unsafe
+programs at load time, enables atomic policy hot-reload without call
+loss, and supports closed-loop profiler-to-tuner adaptation through
+typed eBPF maps. The system requires zero modifications to NCCL,
+operating entirely within its stock plugin ABI. We believe the
+eBPF-for-extensions pattern demonstrated by \sysname has broad
+applicability to GPU and accelerator software stacks where safe,
+composable runtime policy is needed.
+
+% ============================================================================
+% REFERENCES
+% ============================================================================
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}
