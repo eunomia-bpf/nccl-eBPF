@@ -7,3 +7,4 @@
 | 2026-03-09 | Phase 1.5: 迁移 bpftime + 3 policies | codex exec (background b4ypeps5e) | `docs/tmp/bpftime-migration-results.md`, 6 new .bpf.c, native_baseline | 完成 ✓ (noop P50=45ns, verifier works) |
 | 2026-03-09 | Review #1: 代码质量审查 | codex exec (background b2c2e1iy4) | `docs/tmp/review1-results.md` | 完成 ✓ (6 个高优 + 8 个中优问题) |
 | 2026-03-09 | Revise #1: 修复所有 Review 问题 | codex exec (background bezhh3wgt) | `docs/tmp/revise1-results.md` | 完成 ✓ (all strict verifier pass, P50=42-78ns) |
+| 2026-03-09 | 性能测试: CPU + GPU 基准 | codex exec (background bz2adthf2) | `docs/tmp/benchmark-results.md`, `docs/tmp/benchmark-latency.csv` | 完成 ✓ (GPU 开销 <0.05us, 可忽略) |
