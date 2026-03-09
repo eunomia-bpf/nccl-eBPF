@@ -755,6 +755,9 @@ load_policy_state(PluginContext *ctx, const char *policy_path) {
 
 void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
                          int num_proto, int *n_channels) {
+  // NCCL passes a contiguous [algo][proto] matrix cast to float**.
+  float (*table)[NCCL_NUM_PROTOCOLS] =
+      reinterpret_cast<float (*)[NCCL_NUM_PROTOCOLS]>(coll_cost_table);
   const uint8_t flags = nccl_policy_action_flags_get(action);
   const int algo = nccl_policy_action_algo(action);
   const int proto = nccl_policy_action_proto(action);
@@ -763,14 +766,15 @@ void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
   if ((flags & NCCL_POLICY_ACTION_SET_CHANNELS) && channels > 0)
     *n_channels = channels;
 
-  if (!coll_cost_table)
+  if (!table)
     return;
 
   if ((flags & NCCL_POLICY_ACTION_SET_ALGO) &&
       (flags & NCCL_POLICY_ACTION_SET_PROTO) && algo >= 0 && proto >= 0 &&
-      algo < num_algo && proto < num_proto &&
-      coll_cost_table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
-    coll_cost_table[algo][proto] = 0.0f;
+      algo < num_algo && proto < num_proto && algo < NCCL_NUM_ALGORITHMS &&
+      proto < NCCL_NUM_PROTOCOLS &&
+      table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
+    table[algo][proto] = 0.0f;
   }
 }
 
