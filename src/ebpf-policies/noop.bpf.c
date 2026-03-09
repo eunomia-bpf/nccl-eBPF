@@ -1,9 +1,8 @@
+#include "bpf_compat.h"
 #include "policy_context.h"
 
-#define SEC(NAME) __attribute__((section(NAME), used))
-
-SEC("policy")
-int noop_policy(struct nccl_policy_ctx *ctx)
+SEC("uprobe")
+uint64_t noop_policy(struct nccl_policy_ctx *ctx)
 {
   (void)ctx;
   return 0;

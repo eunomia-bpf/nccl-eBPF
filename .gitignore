@@ -9,5 +9,7 @@
 *.bpf.o
 nccl-tests/
 src/nccl-policy-plugin/build/
+src/nccl-policy-plugin/build-bpftime-migration/
+src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
 docs/tmp/phase0-logs/
 libllvmbpf_vm.a
