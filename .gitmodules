@@ -7,3 +7,6 @@
 [submodule "nccl"]
 	path = nccl
 	url = https://github.com/NVIDIA/nccl.git
+[submodule "bpftime"]
+	path = bpftime
+	url = https://github.com/eunomia-bpf/bpftime.git
