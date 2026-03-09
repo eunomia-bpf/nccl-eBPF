@@ -16,3 +16,4 @@
 | 2026-03-09 | Profiler adapter实现 | codex exec (background bfbp3twfw) | `docs/tmp/profiler-adapter-results.md` | 完成 ✓ (mixed plugin, real telemetry闭环) |
 | 2026-03-09 | 论文初稿撰写(中文) | Claude Code 直接撰写 | `docs/paper-draft.md` | 完成 ✓ (9章492行workshop paper) |
 | 2026-03-09 | 评估改进: 多comm+竞争+多collective | codex exec (background bogkgk4wg) | `docs/tmp/eval-improvement-results.md` | 完成 ✓ (3个新实验全部PASS) |
+| 2026-03-09 | Trace数据集调研 | codex exec (background bqftur1xi) | `docs/tmp/trace-dataset-survey.md` | 完成 ✓ (PARAM/HTA/ASTRA-sim为top 3) |
