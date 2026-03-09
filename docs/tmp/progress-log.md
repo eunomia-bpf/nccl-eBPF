@@ -12,3 +12,5 @@
 | 2026-03-09 | Revise #2: 开销分解+热更新+自适应 | codex exec (background btyi37kes) | `docs/tmp/revise2-results.md` | 完成 ✓ (dispatch+41ns, lookup+11ns, reload 0.3us) |
 | 2026-03-09 | Phase 3: 安全属性演示 | codex exec (background b9asp7zdt) | `docs/tmp/phase3-safety-results.md` | 完成 ✓ (14/14 verifier, crash对比, 热更新安全) |
 | 2026-03-09 | Phase 4: 单GPU 2-rank集成 | codex exec (background b84hfhssz) | `docs/tmp/phase4-results.md` | 完成 ✓ (getCollInfo 495次, cost table bug修复) |
+| 2026-03-09 | 文档清理+algo验证 | codex exec (background bshvnzfk6) | `docs/tmp/doc-cleanup-results.md` | 完成 ✓ (algo/proto 10/10匹配) |
+| 2026-03-09 | Profiler adapter实现 | codex exec (background bfbp3twfw) | `docs/tmp/profiler-adapter-results.md` | 完成 ✓ (mixed plugin, real telemetry闭环) |
