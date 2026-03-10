@@ -1,15 +1,18 @@
-\resizebox{\columnwidth}{!}{%
+% Contention timeseries — sized directly for single column, no \resizebox
 \begin{tikzpicture}
   \begin{axis}[
     nccl axis,
-    width=\columnwidth,
-    height=0.7\columnwidth,
+    width=0.88\columnwidth,
+    height=5cm,
     xmin=10,
     xmax=300,
     ymin=1,
     ymax=12.8,
     xlabel={Call count ($\times 10^3$)},
     ylabel={Channels},
+    xlabel style={font=\footnotesize},
+    ylabel style={font=\footnotesize},
+    tick label style={font=\footnotesize},
     xtick={50,100,150,200,250,300},
     ytick={2,4,6,8,10,12},
   ]
@@ -31,9 +34,8 @@
       (210,3) (220,4) (230,5) (240,6) (250,7) (260,8) (270,9) (280,10) (290,11) (300,12)
     };
 
-    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:55,12.35) {Baseline};
-    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:150,12.35) {Contention};
-    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:250,12.35) {Recovery};
+    \node[font=\footnotesize\bfseries, text=ncclslate] at (axis cs:55,12.35) {Baseline};
+    \node[font=\footnotesize\bfseries, text=ncclslate] at (axis cs:150,12.35) {Contention};
+    \node[font=\footnotesize\bfseries, text=ncclslate] at (axis cs:250,12.35) {Recovery};
   \end{axis}
 \end{tikzpicture}%
-}

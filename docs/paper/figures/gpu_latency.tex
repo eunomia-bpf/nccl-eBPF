@@ -1,42 +1,97 @@
-\resizebox{\columnwidth}{!}{%
+% GPU latency — sized directly for single column, no \resizebox
+% Main plot + zoomed inset for small messages
 \begin{tikzpicture}
   \begin{axis}[
     nccl axis,
-    width=\columnwidth,
-    height=0.7\columnwidth,
+    name=mainplot,
+    width=0.88\columnwidth,
+    height=5cm,
     xmode=log,
     ymode=log,
     log basis x=2,
     xlabel={Message size (bytes)},
     ylabel={AllReduce latency (\textmu{}s)},
+    xlabel style={font=\footnotesize},
+    ylabel style={font=\footnotesize},
+    tick label style={font=\footnotesize},
     xmin=4, xmax=268435456,
     ymin=1, ymax=300,
     xtick={8,512,32768,1048576,67108864},
     xticklabels={8B,512B,32KB,1MB,64MB},
-    legend style={font=\scriptsize, at={(0.03,0.97)}, anchor=north west,
+    legend style={font=\footnotesize, at={(0.03,0.97)}, anchor=north west,
                   cells={anchor=west}, row sep=1pt},
-    legend entries={No plugin, \texttt{noop}, \texttt{size\_aware\_v2}, \texttt{slo\_enforcer}},
+    legend entries={No plugin, \texttt{noop}, \texttt{sz\_v2}, \texttt{slo}},
   ]
     % No plugin
-    \addplot[color=black!70, line width=1.2pt, mark=*, mark size=1.5pt] coordinates {
+    \addplot[color=black!70, line width=1.2pt, mark=*, mark size=2pt] coordinates {
       (8,1.85) (64,2.15) (512,2.09) (4096,2.17) (32768,2.18)
       (262144,2.34) (1048576,3.98) (8388608,9.93) (67108864,87.00) (134217728,175.42)
     };
     % noop
-    \addplot[color=ncclblue, line width=1.2pt, mark=square*, mark size=1.5pt] coordinates {
+    \addplot[color=ncclblue, line width=1.2pt, mark=square*, mark size=2pt] coordinates {
       (8,1.93) (64,2.11) (512,2.24) (4096,2.11) (32768,2.14)
       (262144,2.34) (1048576,4.02) (8388608,9.95) (67108864,86.89) (134217728,175.51)
     };
     % size_aware_v2
-    \addplot[color=ncclteal, line width=1.2pt, mark=triangle*, mark size=1.8pt] coordinates {
+    \addplot[color=ncclteal, line width=1.2pt, mark=triangle*, mark size=2.2pt] coordinates {
       (8,1.87) (64,2.17) (512,2.21) (4096,2.15) (32768,2.21)
       (262144,2.31) (1048576,4.03) (8388608,9.95) (67108864,86.93) (134217728,175.47)
     };
     % slo_enforcer
-    \addplot[color=ncclorange, line width=1.2pt, mark=diamond*, mark size=1.8pt] coordinates {
+    \addplot[color=ncclorange, line width=1.2pt, mark=diamond*, mark size=2.2pt] coordinates {
       (8,1.80) (64,2.19) (512,2.26) (4096,2.21) (32768,2.17)
       (262144,2.42) (1048576,3.97) (8388608,9.94) (67108864,86.99) (134217728,175.49)
     };
+
+    % Draw rectangle showing zoomed region
+    \draw[thick, dashed, draw=ncclslate!60] (axis cs:4,1.7) rectangle (axis cs:8192,2.5);
+
+  \end{axis}
+
+  % Zoomed inset for small messages (8B--4KB)
+  \begin{axis}[
+    at={(mainplot.north east)},
+    anchor=north east,
+    xshift=-0.3cm,
+    yshift=-0.3cm,
+    width=0.42\columnwidth,
+    height=2.4cm,
+    xmode=log,
+    log basis x=2,
+    xmin=4, xmax=8192,
+    ymin=1.65, ymax=2.45,
+    xlabel={},
+    ylabel={},
+    tick label style={font=\scriptsize},
+    xtick={8,64,512,4096},
+    xticklabels={8B,64B,512B,4KB},
+    ytick={1.8,2.0,2.2},
+    grid=major,
+    grid style={draw=black!10},
+    axis line style={draw=black!55},
+    tick style={draw=black!55},
+    axis background/.style={fill=white},
+    scale only axis,
+    clip=false,
+  ]
+    % No plugin
+    \addplot[color=black!70, line width=1pt, mark=*, mark size=1.8pt] coordinates {
+      (8,1.85) (64,2.15) (512,2.09) (4096,2.17)
+    };
+    % noop
+    \addplot[color=ncclblue, line width=1pt, mark=square*, mark size=1.8pt] coordinates {
+      (8,1.93) (64,2.11) (512,2.24) (4096,2.11)
+    };
+    % size_aware_v2
+    \addplot[color=ncclteal, line width=1pt, mark=triangle*, mark size=2pt] coordinates {
+      (8,1.87) (64,2.17) (512,2.21) (4096,2.15)
+    };
+    % slo_enforcer
+    \addplot[color=ncclorange, line width=1pt, mark=diamond*, mark size=2pt] coordinates {
+      (8,1.80) (64,2.19) (512,2.26) (4096,2.21)
+    };
+
+    % Border
+    \draw[thick, draw=ncclslate!60] (rel axis cs:0,0) rectangle (rel axis cs:1,1);
   \end{axis}
 \end{tikzpicture}%
-}

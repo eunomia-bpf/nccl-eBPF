@@ -1,41 +1,79 @@
-\resizebox{\columnwidth}{!}{%
-\begin{tikzpicture}[font=\footnotesize, >=Latex]
-  \draw[nccl soft box, fill=black!1] (0,0) rectangle (8.4,7.2);
-  \node[anchor=west, font=\bfseries\footnotesize] at (0.22,6.92) {NCCL process};
+% Architecture figure — designed for figure* (full textwidth, ~4.5cm tall)
+% Use clip to ensure nothing extends beyond the bounding box
+\begin{tikzpicture}[font=\small, >=Latex,
+  every node/.style={inner sep=4pt}]
 
-  \node[nccl box, fill=ncclblue!9, minimum width=4.7cm, minimum height=0.82cm] (core) at (4.2,6.15) {\textbf{NCCL Core}};
-  \node[nccl box, fill=ncclblue!9, minimum width=2.35cm, minimum height=1.05cm] (tuner) at (2.05,4.95) {\textbf{Tuner v5 Adapter}\\\scriptsize \texttt{getCollInfo()}};
-  \node[nccl box, fill=ncclteal!12, minimum width=2.35cm, minimum height=1.05cm] (prof) at (6.35,4.95) {\textbf{Profiler v6 Adapter}\\\scriptsize event callbacks};
+  % In sigconf, \textwidth ~ 17.78cm. Use 17.0cm for safe margin.
+  \pgfmathsetmacro{\fw}{16.5}
 
-  \draw[nccl flow] (3.1,5.82) .. controls +(220:1.0) and +(90:0.3) .. node[left, font=\scriptsize, text=ncclslate] {collective metadata} (tuner.north);
-  \draw[nccl feedback] (5.3,5.82) .. controls +(320:1.0) and +(90:0.3) .. node[right, font=\scriptsize, text=ncclslate] {timestamps} (prof.north);
+  % --- Outer NCCL process box ---
+  \draw[nccl soft box, fill=black!1] (0,0) rectangle (\fw cm,4.5cm);
+  \node[anchor=north west, font=\small\bfseries] at (0.2cm,4.35cm) {NCCL process};
 
-  \draw[nccl soft box, fill=ncclblue!4, draw=ncclblue!40] (0.55,0.45) rectangle (7.85,4.1);
-  \node[anchor=west, font=\bfseries\footnotesize, text=ncclink] at (0.82,3.82) {bpftime runtime};
+  % NCCL Core block (left)
+  \node[nccl box, fill=ncclblue!9, minimum width=2.6cm, minimum height=2.8cm]
+    (core) at (1.7cm, 2.1cm) {};
+  \node[font=\small\bfseries] at (1.7cm, 2.6cm) {NCCL Core};
+  \node[font=\footnotesize, text=ncclslate] at (1.7cm, 2.0cm) {collectives,};
+  \node[font=\footnotesize, text=ncclslate] at (1.7cm, 1.6cm) {transports};
 
-  \node[nccl chip, minimum width=1.35cm] at (1.5,3.15) {\textbf{Verifier}};
-  \node[nccl chip, minimum width=1.1cm] at (3.15,3.15) {\textbf{JIT}};
-  \node[nccl chip, minimum width=1.15cm] at (4.8,3.15) {\textbf{Maps}};
-  \node[nccl chip, minimum width=1.35cm] at (6.45,3.15) {\textbf{Helpers}};
-  \draw[draw=black!30, line width=0.7pt] (4.8,2.92) -- (4.8,2.78);
+  % Tuner Adapter
+  \node[nccl box, fill=ncclblue!9, minimum width=2.5cm, minimum height=1.0cm]
+    (tuner) at (5.0cm, 3.1cm) {};
+  \node[font=\small\bfseries] at (5.0cm, 3.3cm) {Tuner Adapter};
+  \node[font=\footnotesize, text=ncclslate] at (5.0cm, 2.85cm) {\texttt{getCollInfo()}};
 
-  \node[font=\scriptsize\bfseries, text=ncclink] at (4.2,2.68) {Shared eBPF maps};
-  \node[nccl chip, fill=ncclgold!15, draw=ncclgold!70!black, minimum width=2.0cm] (telemetry) at (4.2,2.1) {\texttt{telemetry\_map}};
-  \node[nccl chip, fill=ncclgold!10, draw=ncclgold!70!black, minimum width=1.8cm] (config) at (4.2,1.34) {\texttt{config\_map}};
+  % Profiler Adapter
+  \node[nccl box, fill=ncclteal!12, minimum width=2.5cm, minimum height=1.0cm]
+    (prof) at (5.0cm, 1.1cm) {};
+  \node[font=\small\bfseries] at (5.0cm, 1.35cm) {Profiler Adapter};
+  \node[font=\footnotesize, text=ncclslate] at (5.0cm, 0.9cm) {event callbacks};
 
-  \node[font=\scriptsize\bfseries, text=ncclink] at (4.2,0.82) {eBPF policies};
-  \node[nccl box, fill=ncclteal!12, minimum width=2.05cm, minimum height=0.92cm] (profpol) at (1.95,1.48) {\textbf{Profiler policy}\\\scriptsize writes latency};
-  \node[nccl box, fill=ncclblue!12, minimum width=2.2cm, minimum height=0.92cm] (tunpol) at (6.45,1.48) {\textbf{Tuner policy}\\\scriptsize algo / proto / channels};
+  % Arrows: Core -> Adapters
+  \draw[nccl flow] (core.east |- tuner) -- node[above, font=\footnotesize, text=ncclslate] {metadata} (tuner.west);
+  \draw[nccl feedback] (core.east |- prof) -- node[above, font=\footnotesize, text=ncclslate] {timestamps} (prof.west);
 
-  \draw[nccl feedback] ([xshift=-0.22cm]prof.south) -- ([xshift=-0.22cm]profpol.north);
-  \draw[nccl flow] ([xshift=-0.24cm]tuner.south) -- ([xshift=-0.24cm]tunpol.north);
-  \draw[nccl flow] ([xshift=0.24cm]tunpol.north) -- node[right, font=\scriptsize, text=ncclslate] {decision} ([xshift=0.24cm]tuner.south);
+  % bpftime runtime box
+  \draw[nccl soft box, fill=ncclblue!4, draw=ncclblue!40]
+    (7.0cm, 0.25cm) rectangle (12.0cm, 4.1cm);
+  \node[anchor=north west, font=\small\bfseries, text=ncclink] at (7.2cm, 3.95cm)
+    {bpftime runtime};
+  \node[font=\footnotesize, text=ncclslate] at (9.5cm, 3.5cm)
+    {verifier, JIT, maps, helpers};
 
-  \draw[nccl feedback] (profpol.east) -- node[above, font=\scriptsize, text=ncclslate] {update} (telemetry.west);
-  \draw[nccl feedback] (telemetry.east) -- node[above, font=\scriptsize, text=ncclslate] {read telemetry} (tunpol.west);
-  \draw[nccl alert] (config.east) .. controls +(0.75,0) and +(-0.9,-0.2) .. node[below, font=\scriptsize, text=ncclslate] {read config} (tunpol.south west);
+  % Shared maps
+  \node[nccl chip, fill=ncclgold!15, draw=ncclgold!70!black, minimum width=4.2cm]
+    (maps) at (9.5cm, 2.7cm) {\footnotesize\texttt{telemetry / config maps}};
 
-  \node[nccl chip, fill=white, minimum width=1.55cm] (elf) at (-0.55,3.65) {\texttt{policy.bpf.o}};
-  \draw[nccl flow] (elf.south) -- node[right, font=\scriptsize, text=ncclslate] {load} (0.55,3.15);
+  % Tuner policy
+  \node[nccl box, fill=ncclblue!12, minimum width=4.2cm, minimum height=0.65cm]
+    (tunpol) at (9.5cm, 1.8cm) {};
+  \node[font=\small\bfseries] at (9.5cm, 1.8cm) {Tuner eBPF policy};
+
+  % Profiler policy
+  \node[nccl box, fill=ncclteal!12, minimum width=4.2cm, minimum height=0.65cm]
+    (profpol) at (9.5cm, 0.85cm) {};
+  \node[font=\small\bfseries] at (9.5cm, 0.85cm) {Profiler eBPF policy};
+
+  % Arrows: Adapters -> bpftime policies
+  \draw[nccl flow] (tuner.east) -- (tunpol.west);
+  \draw[nccl feedback] (prof.east) -- (profpol.west);
+
+  % Decision arrow back
+  \draw[nccl flow, dashed] ([yshift=3pt]tunpol.west) -- node[above, font=\footnotesize, text=ncclslate, pos=0.5] {decision} ([yshift=3pt]tuner.east);
+
+  % Map arrows (profiler writes, tuner reads)
+  \draw[nccl feedback, shorten >=1pt] ([xshift=-0.5cm]profpol.north) -- node[left, font=\footnotesize, text=ncclslate] {write} ([xshift=-0.5cm]maps.south);
+  \draw[nccl flow, shorten >=1pt] ([xshift=0.5cm]maps.south) -- node[right, font=\footnotesize, text=ncclslate] {read} ([xshift=0.5cm]tunpol.north);
+
+  % policy.bpf.o (external load) — right side within box
+  \node[nccl chip, fill=white, minimum width=1.8cm]
+    (elf) at (13.8cm, 3.3cm) {\footnotesize\texttt{policy.bpf.o}};
+  \draw[nccl flow] (elf.west) -- node[above, font=\footnotesize, text=ncclslate] {load} (12.0cm, 3.3cm);
+
+  % Hot-reload annotation
+  \node[nccl chip, fill=ncclgreen!18, draw=ncclgreen!80!black, minimum width=1.8cm]
+    (reload) at (13.8cm, 1.8cm) {\footnotesize hot-reload};
+  \draw[nccl alert] (reload.west) -- (12.0cm, 1.8cm);
+
 \end{tikzpicture}%
-}

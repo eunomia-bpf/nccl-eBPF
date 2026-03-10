@@ -1,46 +1,50 @@
-\resizebox{\columnwidth}{!}{%
+% Overhead staircase — sized directly for single column, no \resizebox
 \begin{tikzpicture}
   \begin{axis}[
     nccl axis,
-    width=\columnwidth,
-    height=0.72\columnwidth,
+    width=0.88\columnwidth,
+    height=5.5cm,
     ybar,
     ymin=0,
-    ymax=130,
-    bar width=8pt,
+    ymax=135,
+    bar width=10pt,
     xlabel={Policy},
     ylabel={P50 latency (ns)},
+    xlabel style={font=\footnotesize},
+    ylabel style={font=\footnotesize},
+    tick label style={font=\footnotesize},
     xtick={0,1,2,3,4,5,6},
     xticklabels={
-      \texttt{native},
-      \texttt{noop},
-      \texttt{size\_aware\_v2},
-      \texttt{lookup\_only},
-      \texttt{lookup\_update},
-      \texttt{adaptive\_ch.},
-      \texttt{slo\_enforcer}
+      native,
+      noop,
+      sz\_v2,
+      lkup,
+      lk+up,
+      adapt,
+      slo
     },
-    xticklabel style={rotate=28, anchor=east, font=\scriptsize},
+    xticklabel style={rotate=20, anchor=east, font=\footnotesize},
     nodes near coords,
-    nodes near coords style={font=\scriptsize, anchor=south, text=ncclink},
+    nodes near coords style={font=\footnotesize, anchor=south, text=ncclink},
+    enlarge x limits=0.08,
   ]
     \addplot[draw=black!20, fill=black!25] coordinates {(0,10)};
     \addplot[draw=ncclblue!55!black, fill=ncclblue!38] coordinates {
       (1,61) (2,62) (3,88) (4,113) (5,112) (6,110)
     };
 
-    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:0.95,95) {+51\,ns dispatch};
-    \draw[nccl alert] (axis cs:0.88,91) -- (axis cs:0.5,35);
+    % Annotation chips — positioned to stay within axis bounds
+    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:1.5,95) {+51\,ns};
+    \draw[nccl alert] (axis cs:1.4,91) -- (axis cs:1.0,65);
 
-    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:2.95,115) {+26\,ns lookup};
-    \draw[nccl alert] (axis cs:2.86,111) -- (axis cs:2.5,75);
+    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:3.5,118) {+26\,ns};
+    \draw[nccl alert] (axis cs:3.4,114) -- (axis cs:3.0,92);
 
-    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:3.98,127) {+25\,ns update};
-    \draw[nccl alert] (axis cs:3.92,124) -- (axis cs:3.5,100);
+    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:4.5,130) {+25\,ns};
+    \draw[nccl alert] (axis cs:4.4,127) -- (axis cs:4.0,117);
 
     \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, draw=ncclslate]
-      (axis cs:4.3,108) -- (axis cs:6.3,108)
-      node[midway, below=5pt, font=\scriptsize, text=ncclslate] {map-heavy policies $\sim$110\,ns};
+      (axis cs:4.3,106) -- (axis cs:6.0,106)
+      node[midway, below=5pt, font=\footnotesize, text=ncclslate] {map-heavy};
   \end{axis}
 \end{tikzpicture}%
-}
