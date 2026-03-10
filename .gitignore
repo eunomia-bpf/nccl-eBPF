@@ -11,5 +11,34 @@ nccl-tests/
 src/nccl-policy-plugin/build/
 src/nccl-policy-plugin/build-bpftime-migration/
 src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
-docs/tmp/phase0-logs/
 libllvmbpf_vm.a
+
+# LaTeX build artifacts
+docs/paper/*.aux
+docs/paper/*.bbl
+docs/paper/*.blg
+docs/paper/*.log
+docs/paper/*.out
+docs/paper/*.fls
+docs/paper/*.fdb_latexmk
+docs/paper/*.synctex.gz
+
+# Ephemeral experiment data (docs/tmp/)
+docs/tmp/*.log
+docs/tmp/*.py
+docs/tmp/*.sh
+docs/tmp/*.tsv
+docs/tmp/*.txt
+docs/tmp/__pycache__/
+docs/tmp/phase0-logs/
+docs/tmp/benchmarks/
+docs/tmp/traces/
+docs/tmp/*-raw/
+docs/tmp/*-logs/
+docs/tmp/*-validation/
+docs/tmp/final-exp*/
+docs/tmp/test-nccl-*
+
+# Misc
+/echo
+Done\ A
