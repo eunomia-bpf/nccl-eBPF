@@ -17,7 +17,7 @@
   \node[nccl chip, minimum width=1.1cm] at (3.15,3.15) {\textbf{JIT}};
   \node[nccl chip, minimum width=1.15cm] at (4.8,3.15) {\textbf{Maps}};
   \node[nccl chip, minimum width=1.35cm] at (6.45,3.15) {\textbf{Helpers}};
-  \draw[draw=black!30, line width=0.7pt] (4.8,2.92) -- (4.8,2.5);
+  \draw[draw=black!30, line width=0.7pt] (4.8,2.92) -- (4.8,2.78);
 
   \node[font=\scriptsize\bfseries, text=ncclink] at (4.2,2.68) {Shared eBPF maps};
   \node[nccl chip, fill=ncclgold!15, draw=ncclgold!70!black, minimum width=2.0cm] (telemetry) at (4.2,2.1) {\texttt{telemetry\_map}};
@@ -35,7 +35,7 @@
   \draw[nccl feedback] (telemetry.east) -- node[above, font=\scriptsize, text=ncclslate] {read telemetry} (tunpol.west);
   \draw[nccl alert] (config.east) .. controls +(0.75,0) and +(-0.9,-0.2) .. node[below, font=\scriptsize, text=ncclslate] {read config} (tunpol.south west);
 
-  \node[nccl chip, fill=white, minimum width=1.55cm] (elf) at (-0.72,3.15) {\texttt{policy.bpf.o}};
-  \draw[nccl flow] (elf.east) -- node[above, font=\scriptsize, text=ncclslate] {load} (0.55,3.15);
+  \node[nccl chip, fill=white, minimum width=1.55cm] (elf) at (-0.55,3.65) {\texttt{policy.bpf.o}};
+  \draw[nccl flow] (elf.south) -- node[right, font=\scriptsize, text=ncclslate] {load} (0.55,3.15);
 \end{tikzpicture}%
 }

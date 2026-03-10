@@ -37,6 +37,10 @@
 
     \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:3.98,127) {+25\,ns update};
     \draw[nccl alert] (axis cs:3.92,124) -- (axis cs:3.5,100);
+
+    \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, draw=ncclslate]
+      (axis cs:4.3,108) -- (axis cs:6.3,108)
+      node[midway, below=5pt, font=\scriptsize, text=ncclslate] {map-heavy policies $\sim$110\,ns};
   \end{axis}
 \end{tikzpicture}%
 }

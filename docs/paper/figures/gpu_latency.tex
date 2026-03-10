@@ -1,0 +1,42 @@
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}
+  \begin{axis}[
+    nccl axis,
+    width=\columnwidth,
+    height=0.7\columnwidth,
+    xmode=log,
+    ymode=log,
+    log basis x=2,
+    xlabel={Message size (bytes)},
+    ylabel={AllReduce latency (\textmu{}s)},
+    xmin=4, xmax=268435456,
+    ymin=1, ymax=300,
+    xtick={8,512,32768,1048576,67108864},
+    xticklabels={8B,512B,32KB,1MB,64MB},
+    legend style={font=\scriptsize, at={(0.03,0.97)}, anchor=north west,
+                  cells={anchor=west}, row sep=1pt},
+    legend entries={No plugin, \texttt{noop}, \texttt{size\_aware\_v2}, \texttt{slo\_enforcer}},
+  ]
+    % No plugin
+    \addplot[color=black!70, line width=1.2pt, mark=*, mark size=1.5pt] coordinates {
+      (8,1.85) (64,2.15) (512,2.09) (4096,2.17) (32768,2.18)
+      (262144,2.34) (1048576,3.98) (8388608,9.93) (67108864,87.00) (134217728,175.42)
+    };
+    % noop
+    \addplot[color=ncclblue, line width=1.2pt, mark=square*, mark size=1.5pt] coordinates {
+      (8,1.93) (64,2.11) (512,2.24) (4096,2.11) (32768,2.14)
+      (262144,2.34) (1048576,4.02) (8388608,9.95) (67108864,86.89) (134217728,175.51)
+    };
+    % size_aware_v2
+    \addplot[color=ncclteal, line width=1.2pt, mark=triangle*, mark size=1.8pt] coordinates {
+      (8,1.87) (64,2.17) (512,2.21) (4096,2.15) (32768,2.21)
+      (262144,2.31) (1048576,4.03) (8388608,9.95) (67108864,86.93) (134217728,175.47)
+    };
+    % slo_enforcer
+    \addplot[color=ncclorange, line width=1.2pt, mark=diamond*, mark size=1.8pt] coordinates {
+      (8,1.80) (64,2.19) (512,2.26) (4096,2.21) (32768,2.17)
+      (262144,2.42) (1048576,3.97) (8388608,9.94) (67108864,86.99) (134217728,175.49)
+    };
+  \end{axis}
+\end{tikzpicture}%
+}
