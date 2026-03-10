@@ -105,7 +105,7 @@ struct TunerContext {
   uint64_t total_latency_ns = 0;
   uint64_t last_latency_ns = 0;
   uint64_t rolling_p99_ns = 0;
-  int last_channels = 1;
+  int last_channels = 0;
   struct SyntheticTelemetryState {
     bool enabled = false;
     uint64_t last_latency_ns = 0;
@@ -1189,12 +1189,18 @@ void apply_policy_action(uint64_t action, float **coll_cost_table, int num_algo,
   if (!coll_cost_table)
     return;
 
+  /* NCCL passes collCostTable as float (*)[NCCL_NUM_PROTOCOLS] cast to float**.
+   * It is a contiguous 2D array, NOT an array of float* pointers.
+   * Treat it as a flat 2D array to avoid interpreting float values as pointers. */
   if ((flags & NCCL_POLICY_ACTION_SET_ALGO) &&
       (flags & NCCL_POLICY_ACTION_SET_PROTO) && algo >= 0 && proto >= 0 &&
       algo < num_algo && proto < num_proto && algo < NCCL_NUM_ALGORITHMS &&
-      proto < NCCL_NUM_PROTOCOLS && coll_cost_table[algo] &&
-      coll_cost_table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
-    coll_cost_table[algo][proto] = 0.0f;
+      proto < NCCL_NUM_PROTOCOLS) {
+    float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])coll_cost_table;
+    if (table[algo][proto] != NCCL_ALGO_PROTO_IGNORE) {
+      /* Set this algo/proto to cost 0.0 so NCCL selects it as best */
+      table[algo][proto] = 0.0f;
+    }
   }
 }
 

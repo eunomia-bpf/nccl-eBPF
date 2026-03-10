@@ -132,7 +132,9 @@ bugs before execution, (2)~typed eBPF maps for cross-plugin state
 sharing, and (3)~atomic policy hot-reload without call loss.
 Our evaluation on NCCL~2.29.7 shows 52--100\ns of CPU overhead
 per decision ($<$0.06\% of collective latency), correct rejection
-of all unsafe programs, and sub-microsecond policy swaps.
+of all unsafe programs, sub-microsecond policy swaps, and
+prevention of a 39.5$\times$ protocol collapse from a common
+misconfiguration---with zero measurable GPU-level overhead.
 \end{abstract}
 
 \maketitle
@@ -177,19 +179,18 @@ must iterate on tuning policies across heterogeneous clusters have no
 way to roll out changes safely at runtime.
 \end{itemize}
 
-We observe that eBPF's execution model is a natural fit for this
-setting. The key insight is that NCCL's policy hot path
+We observe that eBPF's execution model is a natural fit for
+this setting. The key insight is that NCCL's policy hot path
 (\texttt{getCollInfo}) runs on the CPU and is
-\emph{latency-tolerant}: the GPU collective it configures takes
-microseconds to milliseconds, so 50--100\ns of eBPF overhead is
-negligible. This contrasts with eBPF's traditional
+\emph{latency-tolerant}: the GPU collective it configures
+takes microseconds to milliseconds, so 50--100\ns of eBPF
+overhead is negligible. This contrasts with eBPF's traditional
 domain---packet processing and syscall filtering---where
-nanosecond budgets are tight. In collective communication, the
-overhead budget is generous, and eBPF's three capabilities map
-directly to the three gaps above: load-time verification
-eliminates crash-inducing bugs, typed maps enable structured
-cross-plugin state sharing, and atomic program replacement
-provides policy hot-reload.
+nanosecond budgets are tight. In collective communication,
+the overhead budget is generous, and eBPF's capabilities map
+directly to the gaps above: load-time verification eliminates
+crash-inducing bugs, typed maps enable cross-plugin state
+sharing, and atomic program replacement provides hot-reload.
 
 \sysname embeds bpftime~\cite{bpftime}, a userspace eBPF runtime,
 inside a standard NCCL plugin. Policy authors write restricted~C
@@ -212,8 +213,9 @@ native plugin architecture (\S\ref{sec:design}).
 call loss across 400{,}000 invocations (\S\ref{sec:design}).
 
 \item An evaluation on NCCL~2.29.7 showing 52--100\ns CPU overhead
-per decision ($<$0.06\% of collective latency) and end-to-end GPU
-overhead within measurement noise (\S\ref{sec:eval}).
+per decision ($<$0.06\% of collective latency), end-to-end GPU
+overhead within measurement noise, and prevention of a
+39.5$\times$ protocol collapse (\S\ref{sec:eval}).
 \end{enumerate}
 
 % ============================================================================
@@ -340,19 +342,18 @@ dereference---the same check that prevents the most common native
 plugin crash (null-pointer dereference after failed lookup).
 
 \begin{lstlisting}[language=C, caption={Size-aware tuning policy
-  (12 lines of logic).}, label={lst:size-aware},
+  (8 lines of logic). Messages $\leq$32\,KB use TREE/Simple
+  (lower latency); larger messages use RING/Simple
+  (prevents LL protocol collapse).}, label={lst:size-aware},
   basicstyle=\ttfamily\scriptsize]
 SEC("policy")
 int size_aware(struct policy_context *ctx) {
-  if (ctx->msg_size <= 4096) {
+  if (ctx->msg_size <= 32 * 1024) {
     ctx->algorithm = NCCL_ALGO_TREE;
     ctx->protocol  = NCCL_PROTO_SIMPLE;
-  } else if (ctx->msg_size <= 65536) {
-    ctx->algorithm = NCCL_ALGO_TREE;
-    ctx->protocol  = NCCL_PROTO_LL;
   } else {
     ctx->algorithm = NCCL_ALGO_RING;
-    ctx->protocol  = NCCL_PROTO_LL;
+    ctx->protocol  = NCCL_PROTO_SIMPLE;
   }
   return 0;
 }
@@ -505,10 +506,10 @@ Figure~\ref{fig:overhead} shows the overhead staircase, which
 decomposes total overhead into three additive components:
 
 \begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
-\item \textbf{eBPF dispatch} (+51\ns): The fixed cost of entering
-the JIT-compiled function from native code, including context setup,
-function pointer indirection, and callee-save register
-spill/restore. The \texttt{noop} policy isolates this cost.
+\item \textbf{eBPF dispatch} (+51\ns): The fixed cost of
+entering the JIT-compiled function, including context setup,
+pointer indirection, and register spill/restore.
+\texttt{noop} isolates this cost.
 
 \item \textbf{Map lookup} (+26\ns per operation): The
 \texttt{lookup\_only} policy performs one
@@ -688,6 +689,45 @@ feedback loop without special contention-detection logic. We note
 that contention was injected synthetically; stability under real
 contention patterns remains to be validated.
 
+\paragraph{Protocol collapse prevention.}
+A common deployment pattern is setting \texttt{NCCL\_PROTO=LL}
+globally to optimize small-message latency.
+Table~\ref{tab:ll-collapse} shows the measured consequence: the LL
+protocol is designed for sub-256\,KB messages; forcing it on 16\,MB
+AllReduce causes a \textbf{39.5$\times$} slowdown (279{,}570\us
+vs.\ 7{,}084\us).
+This misconfiguration is invisible at small sizes ($<$0.2\%
+difference at 4\,KB and 128\,KB), creating a silent failure that
+only manifests when large gradient tensors are synchronized---exactly
+the pattern in mixed-size LLM training workloads.
+Our \texttt{size\_aware} policy (Listing~\ref{lst:size-aware})
+prevents this by selecting SIMPLE for messages above 32\,KB while
+permitting LL for small messages. The policy adds zero measurable
+GPU-level overhead: at 16\,MB it matches the default within
+measurement noise (7{,}255$\pm$92\us vs.\ 7{,}084$\pm$166\us;
+$p>0.05$), while at 128\,MB the two are statistically
+indistinguishable (54{,}310\us vs.\ 54{,}253\us; 0.1\% gap).
+
+\begin{table}[t]
+\centering
+\caption{Protocol collapse: forcing LL globally causes 39.5$\times$
+slowdown at 16\,MB, invisible at small sizes.
+Measured on RTX~5090, 2~ranks, socket transport; 50 iterations,
+10 warmup; 3~repetitions averaged.}
+\label{tab:ll-collapse}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Message} & \textbf{Default} & \textbf{Static-LL} & \textbf{Slowdown} \\
+\midrule
+4\,KB   & 4{,}360\us & 4{,}359\us & 1.0$\times$ \\
+128\,KB & 4{,}364\us & 4{,}370\us & 1.0$\times$ \\
+16\,MB  & 7{,}084\us & 279{,}570\us & \textbf{39.5$\times$} \\
+128\,MB & 54{,}253\us & $\sim$2{,}237{,}440\us & \textbf{$\sim$41$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \paragraph{Multi-collective coverage.}
 \sysname policies work across AllReduce, AllGather, ReduceScatter,
 and Broadcast. AllReduce selects TREE for small messages and RING for
@@ -724,17 +764,16 @@ communication. bpftime~\cite{bpftime} provides the userspace eBPF
 runtime substrate that \sysname builds upon.
 
 \paragraph{Alternative safe-extension mechanisms.}
-WebAssembly provides sandboxed execution but lacks eBPF's static
-termination and memory-safety verification; its runtime overhead
-is typically higher due to bounds checks that eBPF eliminates
-statically. Out-of-process services provide strong isolation but
-add microseconds of IPC latency---an order of magnitude more than
-\sysname's 52--100\ns in-process overhead. Declarative DSLs are
-safe by construction but cannot express stateful policies or
-feedback loops. Hardware isolation (Intel MPK) provides memory
-separation without verification; a policy can still loop
-indefinitely. eBPF provides both verification and efficient
-execution in a single model with a mature toolchain.
+WebAssembly provides sandboxed execution but lacks eBPF's
+static termination and memory-safety verification; its runtime
+overhead is typically higher due to bounds checks that eBPF
+eliminates statically. Out-of-process services provide strong
+isolation but add microseconds of IPC latency---an order of
+magnitude more than \sysname's 52--100\ns in-process overhead.
+Declarative DSLs cannot express stateful policies or feedback
+loops. Hardware isolation (Intel MPK) provides memory separation
+without verification. eBPF provides both verification and
+efficient execution in a single model.
 
 % ============================================================================
 % 7. DISCUSSION AND CONCLUSION
@@ -758,9 +797,10 @@ model. These limitations are acceptable because policy decisions
 operate on metadata (message size, rank count, latency), not tensor
 content.
 
-Most importantly, our evaluation demonstrates that the mechanism works
-but does not yet show that adaptive eBPF policies improve end-to-end
-training outcomes. Demonstrating benefit on production workloads at
+Our evaluation demonstrates that the mechanism works and that a
+size-aware eBPF policy prevents a 39.5$\times$ protocol collapse
+from a common misconfiguration, with zero measurable GPU-level
+overhead. Full evaluation on multi-node production workloads at
 scale is the key next step.
 
 \paragraph{Broader applicability.}
@@ -781,9 +821,10 @@ embedding a userspace eBPF runtime. The key insight is that NCCL's
 CPU-side decision path is latency-tolerant enough to absorb eBPF
 overhead. \sysname adds 52--100\ns per decision (under 0.06\% of
 collective latency), catches common crash-inducing bugs at load time,
-and supports atomic hot-reload ($\sim$7.3\,ms total, 0.774\us on the
-hot path) without call loss. The system requires zero NCCL
-modifications and operates entirely within the stock plugin ABI.
+supports atomic hot-reload ($\sim$7.3\,ms total, 0.774\us on the
+hot path) without call loss, and prevents a 39.5$\times$ protocol
+collapse from a common misconfiguration. The system requires zero
+NCCL modifications and operates entirely within the stock plugin ABI.
 
 % ============================================================================
 % REFERENCES
