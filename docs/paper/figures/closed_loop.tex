@@ -1,0 +1,37 @@
+\begin{tikzpicture}
+  \begin{axis}[
+    nccl axis,
+    width=\columnwidth,
+    height=0.55\columnwidth,
+    xmin=0.9,
+    xmax=3.1,
+    ymin=7.7,
+    ymax=10.3,
+    xtick={1,2,3},
+    ytick={8,9,10},
+    xlabel={Logged call},
+    ylabel={Requested channels},
+    legend style={
+      font=\scriptsize,
+      draw=none,
+      fill=white,
+      fill opacity=0.85,
+      text opacity=1,
+      at={(0.03,0.97)},
+      anchor=north west,
+    },
+  ]
+    \addplot[color=ncclteal!85!black, line width=1.4pt, mark=*, mark size=2.3pt] coordinates {
+      (1,8) (2,9) (3,10)
+    };
+    \addlegendentry{Profiler enabled}
+
+    \addplot[color=black!60, line width=1.4pt, mark=square*, mark size=2.0pt] coordinates {
+      (1,8) (2,8) (3,8)
+    };
+    \addlegendentry{Profiler disabled}
+
+    \node[font=\scriptsize, align=center, text=ncclslate] at (axis cs:2.16,8.22) {first sample\\9.26 ms};
+    \node[font=\scriptsize, align=center, text=ncclslate] at (axis cs:2.58,8.05) {no profiler\\updates};
+  \end{axis}
+\end{tikzpicture}

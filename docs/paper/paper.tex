@@ -9,6 +9,81 @@
 \usepackage{listings}
 \usepackage{balance}
 \usepackage{enumitem}
+\usepackage{tikz}
+\usepackage{pgfplots}
+
+\usetikzlibrary{arrows.meta,backgrounds,calc,fit,matrix,positioning}
+\usepgfplotslibrary{groupplots}
+\pgfplotsset{compat=1.18}
+
+\definecolor{ncclblue}{HTML}{2F5D7E}
+\definecolor{ncclteal}{HTML}{3D8A86}
+\definecolor{ncclgold}{HTML}{C79332}
+\definecolor{ncclorange}{HTML}{C46A3C}
+\definecolor{ncclred}{HTML}{A84448}
+\definecolor{ncclgreen}{HTML}{6E8F4A}
+\definecolor{ncclslate}{HTML}{53636F}
+\definecolor{ncclink}{HTML}{1F2B37}
+
+\pgfplotsset{
+  nccl axis/.style={
+    scale only axis,
+    axis line style={draw=black!55},
+    tick style={draw=black!55},
+    tick label style={font=\footnotesize},
+    label style={font=\footnotesize},
+    title style={font=\footnotesize},
+    grid=major,
+    grid style={draw=black!10},
+    minor tick num=0,
+    enlarge x limits=0.04,
+    clip=false,
+  },
+}
+
+\tikzset{
+  nccl box/.style={
+    rounded corners=3pt,
+    draw=black!50,
+    very thick,
+    fill=white,
+    align=center,
+    inner sep=5pt,
+  },
+  nccl soft box/.style={
+    rounded corners=4pt,
+    draw=black!45,
+    very thick,
+    fill=black!2,
+  },
+  nccl chip/.style={
+    rounded corners=2pt,
+    draw=black!35,
+    thick,
+    fill=white,
+    align=center,
+    inner sep=3pt,
+  },
+  nccl flow/.style={-Latex, line width=1pt, draw=ncclblue},
+  nccl feedback/.style={-Latex, line width=1pt, draw=ncclteal},
+  nccl alert/.style={-Latex, line width=1pt, draw=ncclorange},
+  nccl verdict ok/.style={
+    rounded corners=2pt,
+    draw=ncclgreen!80!black,
+    fill=ncclgreen!18,
+    align=center,
+    inner sep=3pt,
+    minimum width=2.25cm,
+  },
+  nccl verdict bad/.style={
+    rounded corners=2pt,
+    draw=ncclorange!90!black,
+    fill=ncclorange!20,
+    align=center,
+    inner sep=3pt,
+    minimum width=2.25cm,
+  },
+}
 
 \newcommand{\sysname}{NCCLPol\xspace}
 \newcommand{\us}{\,\textmu{}s\xspace}
@@ -460,29 +535,7 @@ denial-of-service attacks.
 
 \begin{figure}[t]
   \centering
-  \fbox{\parbox{0.95\columnwidth}{%
-    \centering\small
-    \textbf{Figure 1: \sysname Architecture}\\[6pt]
-    \begin{tabular}{c}
-    \texttt{[Policy .bpf.c]} $\xrightarrow{\text{clang -target bpf}}$ \texttt{[BPF ELF]}\\[3pt]
-    $\downarrow$ \textit{load-time verification (PREVAIL)}\\[3pt]
-    \fbox{\parbox{0.88\columnwidth}{\centering
-      \textbf{NCCL Process Address Space}\\[4pt]
-      \fbox{\texttt{Tuner Plugin (NCCLPol)}} \quad \fbox{\texttt{Profiler Plugin}}\\[4pt]
-      $\updownarrow$ \textit{typed eBPF maps (hash, array)} $\updownarrow$\\[4pt]
-      \fbox{\parbox{0.65\columnwidth}{\centering
-        \textbf{bpftime userspace runtime}\\
-        verifier $|$ LLVM JIT $|$ maps $|$ hot-reload
-      }}\\[4pt]
-      \fbox{\parbox{0.65\columnwidth}{\centering
-        \textbf{Native baseline layer}\\
-        context marshaling $|$ cost array translation
-      }}
-    }}\\[3pt]
-    $\downarrow$ \textit{getCollInfo() / event callbacks}\\[3pt]
-    \texttt{[NCCL Core]} $\rightarrow$ \texttt{[GPU Collectives]}
-    \end{tabular}
-  }}
+  \input{figures/architecture}
   \caption{\sysname architecture. Policy programs are compiled to BPF
   bytecode, verified at load time via PREVAIL, and JIT-compiled by
   bpftime's LLVM backend inside the NCCL process. The tuner and profiler
@@ -491,6 +544,13 @@ denial-of-service attacks.
   NCCL-specific marshaling (cost array translation, channel clamping).
   The entire system loads as standard NCCL plugins via environment
   variables, requiring zero NCCL modifications.}
+  \Description{Architecture diagram of the NCCLPol mixed-plugin design.
+  Inside an NCCL process, NCCL Core calls a Tuner v5 adapter and a
+  Profiler v6 adapter. Both feed into a bpftime runtime containing the
+  verifier, JIT, maps, and helpers. The profiler policy updates a
+  telemetry map, the tuner policy reads telemetry and config maps, and
+  returns algorithm, protocol, and channel decisions back to the tuner
+  adapter.}
   \label{fig:architecture}
 \end{figure}
 
@@ -852,24 +912,18 @@ Native baseline    &  10 &  16 & --- \\
 
 \begin{figure}[t]
   \centering
-  \fbox{\parbox{0.93\columnwidth}{%
-    \centering\small
-    \textbf{Figure 2: Overhead Staircase} \textit{[placeholder]}\\[6pt]
-    \textit{Stacked bar chart (6 bars, one per policy from
-    Table~\ref{tab:overhead}), showing incremental overhead layers:}\\[3pt]
-    Native base (10\,ns) $|$ +41\,ns eBPF dispatch $|$
-    +11\,ns map lookup $|$ +11\,ns map update\\[3pt]
-    \textit{Y-axis: P50 latency (ns). Each bar annotated with P99 value.}\\[3pt]
-    \textit{Dashed line at 80\,ns marks the most complex policy
-    (slo\_enforcer).}\\[3pt]
-    \textit{Data source: Table~\ref{tab:overhead}. Will be replaced
-    with actual plot.}
-  }}
+  \input{figures/overhead_staircase}
   \caption{Overhead decomposition showing additive cost of each eBPF
   operation layer. The base dispatch cost (41\ns) dominates; each
   additional map operation adds a constant $\sim$11\ns. The clean
   staircase pattern indicates that overhead scales predictably with
   policy complexity.}
+  \Description{Bar chart of P50 policy latency in nanoseconds. Native is
+  10 ns, noop 51 ns, size-aware-v2 52 ns, lookup-only 63 ns,
+  lookup-update 74 ns, adaptive-channels 75 ns, and slo-enforcer
+  80 ns. Callouts mark the incremental deltas: plus 41 ns dispatch,
+  plus 1 ns context access, plus 11 ns lookup, plus 11 ns update,
+  plus 1 ns logic, and plus 5 ns extra complexity.}
   \label{fig:overhead}
 \end{figure}
 
@@ -971,9 +1025,27 @@ author-constructed test cases, not drawn from a real bug corpus.}
 \end{tabular}
 \end{table}
 
+\begin{figure}[t]
+  \centering
+  \input{figures/verifier_matrix}
+  \caption{Verifier matrix and native crash comparison. The strict
+  verifier accepts all 7 safe policies and rejects all 7 unsafe
+  programs. The same null-dereference bug that crashes a native tuner
+  plugin with \texttt{SIGSEGV} is rejected at load time in eBPF before
+  the policy can execute.}
+  \Description{Two-panel figure. The left panel lists seven safe eBPF
+  programs accepted by the verifier and seven unsafe programs rejected.
+  The right panel compares the same null-dereference bug in native code
+  versus eBPF: the native tuner crashes at runtime with SIGSEGV, while
+  the eBPF version is rejected at load time.}
+  \label{fig:verifier}
+\end{figure}
+
 Table~\ref{tab:verifier} shows the verifier's behavior on our test suite
 of 14 programs. The verifier uses PREVAIL-based~\cite{prevail} abstract
 interpretation to reason about all possible execution paths.
+Figure~\ref{fig:verifier} visualizes both the 7/7 accept--reject matrix
+and the core safety contrast against native plugins.
 
 \paragraph{Coverage of native-plugin failure modes.}
 The seven unsafe programs are not arbitrary; each targets a specific bug
@@ -1071,11 +1143,31 @@ Old policy preserved after rejection & Yes \\
 \end{tabular}
 \end{table}
 
+\begin{figure}[t]
+  \centering
+  \input{figures/hot_reload_timeline}
+  \caption{Hot-reload timeline under active traffic. A reload request at
+  call~200{,}000 prepares the replacement off-path while the old policy
+  continues serving calls. After verification and JIT compilation
+  ($\sim$11.06\,ms), the atomic swap itself takes only 0.309\us; calls
+  after the boundary observe the new policy. A bad replacement is
+  rejected without interrupting service.}
+  \Description{Timeline of 400,000 policy calls. The old policy serves
+  calls until a reload is requested at call 200,000. Verification, JIT,
+  and preparation run while the old policy continues serving traffic.
+  At call 298,126 the atomic swap occurs in 0.309 microseconds, after
+  which the new policy serves the remaining calls. A later bad
+  replacement is rejected and the current policy remains active.}
+  \label{fig:hotreload}
+\end{figure}
+
 Table~\ref{tab:hotreload} reports our hot-reload stress test. We
 continuously invoke \texttt{getCollInfo()} from multiple threads while
 concurrently swapping the active policy. The atomic swap completes in
 0.309\us, and we observe zero failed, lost, or corrupted calls across
-400{,}000 invocations.
+400{,}000 invocations. Figure~\ref{fig:hotreload} shows the timeline:
+the old policy continues serving calls during the entire verification
+and JIT phase, and only the final pointer swap is latency-sensitive.
 
 \paragraph{Full reload cost.}
 The 0.309\,\textmu{}s figure is the atomic pointer-swap time alone. The
@@ -1171,34 +1263,10 @@ scale (e.g., with NCCL's internal thread synchronization or transport
 setup).
 
 \paragraph{Policy adoption verification.}
-\begin{figure}[t]
-  \centering
-  \fbox{\parbox{0.93\columnwidth}{%
-    \centering\small
-    \textbf{Figure 3: Policy Adoption by Message Size}
-    \textit{[placeholder]}\\[6pt]
-    \textit{Heatmap: rows = message sizes, columns = algorithm$\times$protocol.
-    Cell shading indicates policy request vs.\ NCCL's actual selection:}\\[3pt]
-    \begin{tabular}{rl}
-    1--2\,KB: & TREE + SIMPLE \\
-    4--32\,KB: & TREE + LL \\
-    64--512\,KB: & RING + LL \\
-    1\,MB: & RING + SIMPLE \\
-    \end{tabular}\\[3pt]
-    \textit{10/10 sizes match on our test topology.
-    Will be replaced with actual plot.}
-  }}
-  \caption{Algorithm and protocol adoption by message size. NCCL
-  accepts the policy's recommendation for all 10 message sizes tested,
-  confirming that \sysname policies have effective influence over NCCL's
-  algorithm selection via the cost-array mechanism on our test topology.}
-  \label{fig:adoption}
-\end{figure}
-
 Our \texttt{size\_aware\_v2} policy requests specific algorithm/protocol
-combinations based on message size. As shown in
-Figure~\ref{fig:adoption}, NCCL adopted the policy's recommendation for
-all 10 message sizes on our test topology:
+combinations based on message size. Our integration logs show that NCCL
+adopted the policy's recommendation for all 10 message sizes on our test
+topology:
 
 \begin{itemize}[leftmargin=*]
 \item 1--2\,KB: TREE + SIMPLE (tree reduces latency for small messages;
@@ -1249,9 +1317,26 @@ The tuner reads this map and adjusts channel count:
 8 $\rightarrow$ 8 $\rightarrow$ 8 across all collectives.
 \end{itemize}
 
+\begin{figure}[t]
+  \centering
+  \input{figures/closed_loop}
+  \caption{Real NCCL closed-loop adaptation with the mixed plugin path.
+  When the profiler plugin writes real latency samples into
+  \texttt{telemetry\_map}, the \texttt{adaptive\_channels} tuner raises
+  its requested channel count from 8 to 9 to 10 across successive logged
+  decisions. Disabling the profiler keeps the same policy flat at
+  8 channels.}
+  \Description{Comparison line plot of requested channel count over
+  three logged NCCL calls. With the profiler enabled, the tuner
+  increases channels from 8 to 9 to 10 after receiving telemetry.
+  With the profiler disabled, the same policy stays flat at 8.}
+  \label{fig:closed-loop}
+\end{figure}
+
 The difference confirms that the profiler data is flowing through the
-eBPF map to the tuner and actually affecting decisions. This closed-loop
-control has no built-in support in NCCL's native plugin architecture,
+eBPF map to the tuner and actually affecting decisions
+(Figure~\ref{fig:closed-loop}). This closed-loop control has no
+built-in support in NCCL's native plugin architecture,
 where the tuner and profiler plugins are loaded independently with no
 shared state mechanism. An operator using native plugins who wanted this
 behavior would need to implement ad-hoc shared memory between two
@@ -1260,34 +1345,9 @@ error-prone undertaking that \sysname's typed map abstraction avoids
 entirely.
 
 \paragraph{5b: Multi-tenant differentiation.}
-\begin{figure}[t]
-  \centering
-  \fbox{\parbox{0.93\columnwidth}{%
-    \centering\small
-    \textbf{Figure 4: Multi-Tenant Differentiation}
-    \textit{[placeholder]}\\[6pt]
-    \textit{Side-by-side comparison of two communicators under the same
-    policy binary, differentiated by comm\_id:}\\[3pt]
-    \begin{tabular}{lll}
-    & \textbf{Comm 1 (SLO 1ms)} & \textbf{Comm 2 (SLO 10ms)} \\
-    Algorithm & TREE & RING \\
-    Protocol & LL & SIMPLE \\
-    Channels & 8 & 1 \\
-    Strategy & Aggressive & Conservative \\
-    \end{tabular}\\[3pt]
-    \textit{Shows parameter differentiation, not outcome improvement.
-    Will be replaced with actual plot.}
-  }}
-  \caption{Multi-tenant differentiation. The same \texttt{slo\_enforcer}
-  policy produces different algorithm/protocol/channel selections for two
-  communicators with different SLO requirements, using per-communicator
-  state in eBPF maps.}
-  \label{fig:multitenant}
-\end{figure}
-
 We deploy the \texttt{slo\_enforcer} policy with two communicators in the
 same process, simulating a multi-tenant scenario where each communicator
-has a different SLO (Figure~\ref{fig:multitenant}):
+has a different SLO:
 
 \begin{itemize}[leftmargin=*]
 \item Communicator~1 (SLO $\leq$~1\,ms): receives TREE / LL / 8~channels
@@ -1311,24 +1371,17 @@ multi-tenant workloads is future work.
 \paragraph{5c: Contention-aware adaptation.}
 \begin{figure}[t]
   \centering
-  \fbox{\parbox{0.93\columnwidth}{%
-    \centering\small
-    \textbf{Figure 5: Contention Adaptation Time Series}
-    \textit{[placeholder]}\\[6pt]
-    \textit{Line plot: X-axis = collective call index,
-    Y-axis = channel count (1--16).}\\[3pt]
-    Phase 1 -- Baseline (low latency): channels rise to 12\\
-    Phase 2 -- Contention injected (via map write): channels fall to 2\\
-    Phase 3 -- Recovery (low latency): channels recover to 12\\[3pt]
-    \textit{Shaded region indicates synthetic contention injection
-    period (manual map write, not real interconnect contention).
-    Will be replaced with actual plot.}
-  }}
+  \input{figures/contention_timeseries}
   \caption{Dynamic channel adaptation under changing contention.
   The policy increases channels when latency is low (more parallelism)
   and decreases channels when contention is detected (reduce
   interference). Recovery is symmetric with ramp-up, demonstrating
   stable feedback control through eBPF map state.}
+  \Description{Time-series line plot of requested channels versus call
+  count from 10 thousand to 300 thousand. In the baseline phase the
+  channel count rises from 9 to 12 and stays there. In the contention
+  phase it falls steadily from 11 to 2. In the recovery phase it rises
+  symmetrically back to 12.}
   \label{fig:contention}
 \end{figure}
 

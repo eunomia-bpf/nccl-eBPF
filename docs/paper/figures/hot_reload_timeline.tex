@@ -1,0 +1,39 @@
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[font=\footnotesize, >=Latex]
+  \node[anchor=east, font=\scriptsize\bfseries] at (-0.08,0.9) {decision path};
+  \node[anchor=east, font=\scriptsize\bfseries] at (-0.08,0.2) {reload path};
+
+  \draw[black!45, line width=0.8pt] (0,0) -- (10.15,0);
+  \node[below, font=\scriptsize\bfseries] at (5.05,-0.68) {collective call index};
+
+  \foreach \x/\lab/\sub in {
+    0/{0}/{start},
+    5/{200K}/{reload},
+    7.45/{298126}/{first new},
+    10/{400K}/{done}
+  }{
+    \draw[black!45] (\x,0.08) -- (\x,-0.08);
+    \node[below, font=\scriptsize] at (\x,-0.12) {\lab};
+    \node[below, font=\scriptsize, text=ncclslate] at (\x,-0.38) {\sub};
+  }
+
+  \draw[line width=4.8pt, draw=ncclblue] (0,0.9) -- (7.45,0.9);
+  \draw[line width=4.8pt, draw=ncclteal] (7.45,0.9) -- (10,0.9);
+  \node[above, font=\scriptsize, text=ncclslate] at (2.55,1.08) {old policy serves calls};
+  \node[above, font=\scriptsize, text=ncclslate] at (8.72,1.08) {new policy serves calls};
+
+  \draw[line width=3.2pt, draw=ncclgold!85!black, dash pattern=on 6pt off 3pt] (5,0.2) -- (7.45,0.2);
+  \node[above, font=\scriptsize, align=center, text=ncclslate] at (6.22,0.38) {verify + JIT + prepare\\$\approx 11.06$ ms};
+
+  \fill[ncclorange!88] (7.4,-0.18) rectangle (7.5,1.42);
+  \node[above, font=\scriptsize, align=center, text=ncclorange!90!black] at (7.45,1.75) {atomic swap\\0.309\us};
+  \draw[nccl alert] (7.45,1.58) -- (7.45,1.18);
+
+  \node[nccl chip, minimum width=2.7cm] at (2.0,1.82) {400{,}000 / 400{,}000 complete};
+  \node[nccl chip, minimum width=1.85cm] at (2.0,1.35) {0 lost calls};
+
+  \node[nccl box, fill=ncclorange!12, draw=ncclorange!90!black, minimum width=2.35cm, minimum height=0.95cm] (bad) at (8.8,2.05) {\textbf{Bad replacement}\\\scriptsize \texttt{bad\_lookup} rejected};
+  \draw[nccl alert] (bad.south) to[out=-95,in=25] (8.25,0.92);
+  \node[font=\scriptsize, text=ncclslate] at (8.82,1.42) {current policy preserved};
+\end{tikzpicture}%
+}

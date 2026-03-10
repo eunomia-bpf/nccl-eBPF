@@ -1,0 +1,49 @@
+\begin{tikzpicture}
+  \begin{axis}[
+    nccl axis,
+    width=\columnwidth,
+    height=0.72\columnwidth,
+    ybar,
+    ymin=0,
+    ymax=90,
+    bar width=8pt,
+    xlabel={Policy},
+    ylabel={P50 latency (ns)},
+    xtick={0,1,2,3,4,5,6},
+    xticklabels={
+      \texttt{native},
+      \texttt{noop},
+      \texttt{size\_aware\_v2},
+      \texttt{lookup\_only},
+      \texttt{lookup\_update},
+      \texttt{adaptive\_channels},
+      \texttt{slo\_enforcer}
+    },
+    xticklabel style={rotate=28, anchor=east, font=\scriptsize},
+    nodes near coords,
+    nodes near coords style={font=\scriptsize, anchor=south, text=ncclink},
+  ]
+    \addplot[draw=black!20, fill=black!25] coordinates {(0,10)};
+    \addplot[draw=ncclblue!55!black, fill=ncclblue!38] coordinates {
+      (1,51) (2,52) (3,63) (4,74) (5,75) (6,80)
+    };
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:0.95,70.5) {+41\,ns dispatch};
+    \draw[nccl alert] (axis cs:0.88,67.5) -- (axis cs:0.5,30.5);
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:2.05,58.0) {+1\,ns ctx};
+    \draw[nccl alert] (axis cs:1.97,56.0) -- (axis cs:1.5,51.5);
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:2.95,78.0) {+11\,ns lookup};
+    \draw[nccl alert] (axis cs:2.86,75.2) -- (axis cs:2.5,57.5);
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:3.98,86.0) {+11\,ns update};
+    \draw[nccl alert] (axis cs:3.92,83.4) -- (axis cs:3.5,68.5);
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:5.0,79.0) {+1\,ns logic};
+    \draw[nccl alert] (axis cs:4.92,77.0) -- (axis cs:4.5,74.5);
+
+    \node[nccl chip, font=\scriptsize, fill=white] at (axis cs:6.02,86.0) {+5\,ns complex};
+    \draw[nccl alert] (axis cs:5.96,83.2) -- (axis cs:5.5,77.5);
+  \end{axis}
+\end{tikzpicture}

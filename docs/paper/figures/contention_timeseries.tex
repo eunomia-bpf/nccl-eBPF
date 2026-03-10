@@ -1,0 +1,37 @@
+\begin{tikzpicture}
+  \begin{axis}[
+    nccl axis,
+    width=\columnwidth,
+    height=0.7\columnwidth,
+    xmin=10,
+    xmax=300,
+    ymin=1,
+    ymax=12.8,
+    xlabel={Call count ($\times 10^3$)},
+    ylabel={Channels},
+    xtick={50,100,150,200,250,300},
+    ytick={2,4,6,8,10,12},
+  ]
+    \path[fill=ncclblue!10, fill opacity=0.45] (axis cs:10,1) rectangle (axis cs:100,12.8);
+    \path[fill=ncclorange!12, fill opacity=0.45] (axis cs:100,1) rectangle (axis cs:200,12.8);
+    \path[fill=ncclteal!10, fill opacity=0.45] (axis cs:200,1) rectangle (axis cs:300,12.8);
+
+    \addplot[draw=black!25, dashed] coordinates {(100,1) (100,12.8)};
+    \addplot[draw=black!25, dashed] coordinates {(200,1) (200,12.8)};
+
+    \addplot[
+      color=ncclblue!85!black,
+      line width=1.4pt,
+      mark=*,
+      mark size=1.9pt,
+    ] coordinates {
+      (10,9) (20,10) (30,11) (40,12) (50,12) (60,12) (70,12) (80,12) (90,12) (100,12)
+      (110,11) (120,10) (130,9) (140,8) (150,7) (160,6) (170,5) (180,4) (190,3) (200,2)
+      (210,3) (220,4) (230,5) (240,6) (250,7) (260,8) (270,9) (280,10) (290,11) (300,12)
+    };
+
+    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:55,12.35) {Baseline};
+    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:150,12.35) {Contention};
+    \node[font=\scriptsize\bfseries, text=ncclslate] at (axis cs:250,12.35) {Recovery};
+  \end{axis}
+\end{tikzpicture}

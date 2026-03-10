@@ -1,0 +1,47 @@
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[font=\footnotesize, >=Latex]
+  \draw[nccl soft box, fill=black!1] (0,0) rectangle (5.25,6.4);
+  \node[font=\bfseries\footnotesize] at (2.63,6.0) {Strict verifier matrix};
+  \node[font=\scriptsize\bfseries, text=ncclgreen!70!black] at (1.45,5.45) {7 safe programs};
+  \node[font=\scriptsize\bfseries, text=ncclorange!90!black] at (3.8,5.45) {7 unsafe programs};
+
+  \foreach \name/\y in {
+    {noop}/4.8,
+    {size\_aware}/4.2,
+    {size\_aware\_v2}/3.6,
+    {lookup\_only}/3.0,
+    {lookup\_update}/2.4,
+    {adaptive\_channels}/1.8,
+    {slo\_enforcer}/1.2
+  }{
+    \node[nccl verdict ok] at (1.45,\y) {\texttt{\name}\\[-2pt]\scriptsize ACCEPT};
+  }
+
+  \foreach \name/\y in {
+    {bad\_lookup}/4.8,
+    {bad\_oob\_access}/4.2,
+    {bad\_unregistered}/3.6,
+    {bad\_stack\_overflow}/3.0,
+    {bad\_infinite\_loop}/2.4,
+    {bad\_write\_ctx}/1.8,
+    {bad\_div\_zero}/1.2
+  }{
+    \node[nccl verdict bad] at (3.8,\y) {\texttt{\name}\\[-2pt]\scriptsize REJECT};
+  }
+
+  \node[font=\scriptsize\bfseries, text=ncclink] at (2.63,0.45) {14 / 14 verdicts correct};
+
+  \draw[nccl soft box, fill=black!1] (5.6,0.95) rectangle (8.95,5.55);
+  \node[font=\bfseries\footnotesize] at (7.28,5.15) {Same null-deref bug};
+  \node[nccl chip, minimum width=2.3cm] at (7.28,4.48) {\scriptsize after \texttt{map\_lookup}};
+
+  \node[nccl box, fill=ncclred!12, draw=ncclred!80!black, minimum width=1.35cm, minimum height=0.9cm] (native) at (6.4,3.35) {\textbf{Native}\\\scriptsize tuner \texttt{.so}};
+  \node[nccl box, fill=ncclorange!14, draw=ncclorange!90!black, minimum width=1.45cm, minimum height=0.9cm] (ebpf) at (8.15,3.35) {\textbf{eBPF}\\\scriptsize \texttt{bad\_lookup}};
+
+  \node[nccl box, fill=ncclred!18, draw=ncclred!80!black, minimum width=1.45cm, minimum height=0.9cm] (segv) at (6.4,1.95) {\textbf{Runtime}\\\scriptsize SIGSEGV};
+  \node[nccl box, fill=ncclgreen!18, draw=ncclgreen!75!black, minimum width=1.45cm, minimum height=0.9cm] (reject) at (8.15,1.95) {\textbf{Load time}\\\scriptsize reject};
+
+  \draw[nccl alert] (native.south) -- (segv.north);
+  \draw[nccl flow] (ebpf.south) -- (reject.north);
+\end{tikzpicture}%
+}
