@@ -464,6 +464,129 @@ Tuner policy → 读 telemetry_map → 调 channels / algo / proto
 - [ ] 在 abstract、introduction、discussion 中显式写出限制
 - [ ] 清理任何残留的 cross-stack / MPK / EIM / net/env overclaim
 
+### Phase 6：Policy Effectiveness 实验（进行中）
+
+#### 6.1 已完成实验结果（2026-03-09）
+
+##### 实验 P2-1：LL vs Simple 协议带宽对比
+- **结果**：LL 在大消息下导致灾难性退化（不是理论预期的 2x，而是 42x）
+- **数据**（128MB AllReduce）：Simple = 51,229μs (2.62 GB/s)，LL = 2,237,440μs (0.06 GB/s)
+- **原因**：LL 的固定小 buffer + socket 的 per-chunk syscall 交互造成灾难性放大
+- **详细文档**：`docs/tmp/p2-proto-bandwidth-experiment.md`
+
+##### 实验 P2-2：SHM Transport 测试
+- **结果**：SHM 不可用（NCCL_HOSTID hack 与 SHM transport 互斥）
+- **原因**：SHM 要求 same hostHash，但 same hostHash 触发 duplicate GPU 检查
+- **结论**：socket transport 是当前硬件唯一可用的 transport
+- **详细文档**：`docs/tmp/p2-shm-transport-experiment.md`
+
+##### 实验 P2-3：系统性 Algo/Proto 穷举扫描
+- **方法**：对 11 个消息大小 × 5 种 (algo, proto) 组合运行 nccl-tests
+- **NCCL 默认选择**：
+  - 8B-64KB: RING/LL（1-4 channels）
+  - 128KB-128MB: RING/Simple（4 channels）
+  - Tree 从未被默认选择
+- **关键发现**：
+  1. **NCCL 默认在大消息上已经最优**（RING/Simple，无提升空间）
+  2. **小消息 (8B-32KB)：Tree/Simple 比 NCCL 默认 (RING/LL) 快 ~2.4%**（~100μs，4253μs vs 4356μs）
+  3. **LL 崩溃阈值在 256KB-512KB**：512KB 时 2x，1MB 时 4x，4MB 时 16x，128MB 时 44x
+  4. **2-rank 下 RING ≈ TREE**（拓扑退化，代价差 <2%）
+  5. **NCCL 将 channels 钳制在 4**（plugin 返回更大值被静默截断）
+- **详细文档**：`docs/tmp/p2-default-vs-optimal-sweep.md`
+
+##### 综合分析文档
+- Policy effectiveness 总体分析：`docs/tmp/policy-effectiveness-research.md`
+- Eval gap 分析：`docs/tmp/eval-gap-analysis.md`
+
+#### 6.2 关键量化结论
+
+| 场景 | 性能影响 |
+|------|---------|
+| LL 错误配置 @ 128MB（worst case） | **43.7× 退化** vs 最优 |
+| Tree/Simple @ 32KB（better policy） | **2.4% 改善** vs NCCL 默认 |
+| Channel count bug（1-ch fallback） | **2.4× 退化** @ 16MB |
+| 修正后 eBPF policy vs NCCL 默认 | 小消息 ±2.4%，大消息持平 |
+
+#### 6.3 对论文叙事的影响
+
+**核心困难**：在当前硬件（1 GPU, 2-rank, socket transport）上，NCCL 默认已近最优。
+- Socket transport ~4.3ms TCP loopback 延迟主导一切
+- 2-rank 下 RING ≈ TREE
+- Policy 的 "better tuning" 价值在此环境下难以展示（仅 2.4%）
+
+**可行的叙事方向**：
+1. **Safety = preventing catastrophic failure**（44x 退化防护）— 最强
+2. **Marginal improvement at small sizes**（2.4% Tree/Simple）— 真实但小
+3. **Closed-loop adaptation**（profiler→tuner 闭环）— correctness 已证明，performance TBD
+4. **Governance value**（hot-reload, audit, composability）— 不需要性能数据
+
+#### 6.4 后续实验结果（2026-03-09 晚）
+
+##### Broadcast 协议扫描（P3-1）
+- **结果**：Issue #1810 在 NCCL 2.29.7 上不复现。NCCL 默认为 Broadcast 选 Simple（已修复）
+- **LL 退化**：强制 LL 导致 6x 带宽退化（128MB: 4.58 vs 0.76 GB/s）
+- **详细文档**：`docs/tmp/p3-broadcast-proto-sweep.md`
+
+##### AllGather/ReduceScatter 协议扫描（P3-2）
+- **结果**：NCCL 默认均选 RING/Simple，已经最优
+- **LL 退化**：AllGather LL 退化最严重（16MB 处 **78x**），比 AllReduce 的 42x 更大
+- **新发现**：NCCL 2.29 在 32KB 用了新的 PAT(Pipeline All-to-all Tree) 算法
+- **详细文档**：`docs/tmp/p3-allgather-reducescatter-sweep.md`
+
+##### 跨 Collective LL 退化汇总
+
+| Collective | LL 退化 (大消息) | NCCL 2.29.7 默认 |
+|-----------|-----------------|-----------------|
+| AllGather | **78x** @ 16MB | 正确 (Simple) |
+| AllReduce | **44x** @ 128MB | 正确 (Simple) |
+| ReduceScatter | **>15x** @ 4MB | 正确 (Simple) |
+| Broadcast | **6x** @ 128MB | 正确 (Simple) |
+
+##### size_aware_v3 vs NCCL 默认（P3-3）
+- **修复了 v2 的 bug**：v2 在 32KB-1MB 选 RING/LL 导致 512KB 处 2x 退化
+- **v3 修正**：≤32KB 选 TREE/SIMPLE，>32KB 选 RING/SIMPLE
+- **v3 vs 默认**：小消息 +1-1.3% 改善，大消息持平
+- **核心发现**：v2→v3 的 bug 修复本身就是 policy hot-reload 价值的直接体现
+- **JIT 问题**：复杂 BPF 程序（含分支）在 NCCL rebuild 后崩溃，需排查
+- **详细文档**：`docs/tmp/p3-policy-vs-default-experiment.md`
+
+#### 6.5 最终评估结论
+
+**NCCL 2.29.7 的默认 tuner 在当前硬件上已经近最优。** 在 4 种 collective 类型、11 个消息大小上，NCCL 默认选择均为最优或接近最优（差距 <2.4%）。
+
+**NCCLPol 的核心价值不是 "better tuning"，而是：**
+1. **Safety**：防止错误配置/buggy plugin 导致 6x-78x 灾难性退化
+2. **Bug 快速修复**：v2 的 LL bug 可以通过热重载零停机替换为 v3
+3. **Verification**：在加载时拦截危险 policy（null deref, OOB, infinite loop）
+4. **Closed-loop**：profiler→tuner 闭环提供了 NCCL 原生不具备的自适应能力
+5. **Composability**：eBPF maps 提供跨 plugin 状态共享
+
+### Phase 7：探索 "Beats Default" Policy（待做）
+
+**目标**：找到一个场景，eBPF policy 可以在性能上真正超越 NCCL 默认选择。
+
+**已排除的方向**：
+- AllReduce algo/proto 扫描：NCCL 2.29.7 默认在所有 size 上已近最优（gap <2.4%）
+- Broadcast Issue #1810：NCCL 2.29.7 已修复，默认选 Simple
+- AllGather/ReduceScatter：同样默认已最优
+- SHM transport：不可用（HOSTID hack 互斥）
+
+**待探索方向**：
+- [ ] **Closed-loop beats static**：构造 workload 变化场景（如模拟网络拥塞/恢复），展示 profiler 闭环自适应优于任何固定配置
+- [ ] **跨版本 NCCL 适配**：在不同 NCCL 版本间，默认代价模型可能有回归（Issue #1997），policy 可以快速适配
+- [ ] **多 communicator 差异化**：在同一进程中，不同 communicator 有不同最优配置，NCCL 默认对每个独立调优但不考虑竞争
+- [ ] **Channel count 在非 socket transport 场景**：如果能获取多 GPU 或 NVLink 环境，channel count 调优空间更大
+- [ ] **PAT 算法利用**：NCCL 2.29 新增 PAT 算法（32KB 处使用），policy 是否能扩展其使用范围获益？
+- [ ] **nccl-tests 以外的 benchmark**：用真实 training workload（如 PyTorch DDP）测试 policy 效果
+- [ ] **其他 NCCL 版本**：在较旧版本（如 2.22）上测试，默认选择可能更差
+
+**关键约束**：当前硬件（1 GPU, 2-rank, socket transport）是最大瓶颈。Socket 4.3ms TCP loopback 掩盖了大部分调优差异。真正的 "beats default" 实验可能需要多 GPU / InfiniBand 环境。
+
+**待做：**
+- [ ] 修复 JIT regression（复杂 BPF 程序崩溃）
+- [ ] 将 LL 退化数据和 v2→v3 bug 修复故事整合进论文
+- [ ] 继续探索 "beats default" 方向
+
 ### 风险与备选
 
 | 风险 | 影响 | 备选方案 |
