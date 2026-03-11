@@ -115,7 +115,7 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent data corruption, and significant downtime due to restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces---without modifying NCCL itself. \sysname{} offers load-time static verification to prevent unsafe plugin execution, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on NCCL~2.29.7 demonstrate that \sysname{} imposes just 52--103\ns overhead per tuner decision (less than 0.06\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and resolves intermittent 2$\times$ throughput degradation in AllGather workloads.
+NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. \sysname{} offers load-time static verification to prevent unsafe plugin execution, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on NCCL~2.29.7 demonstrate that \sysname{} imposes just 52--103\ns overhead per tuner decision (less than 0.06\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and resolves intermittent 2$\times$ throughput degradation in AllGather workloads.
 \end{abstract}
 
 \maketitle
@@ -158,7 +158,7 @@ adjustments across plugins impossible. Updating plugin logic
 requires restarting affected jobs, resulting in disruptive downtime
 and hindering rapid policy iteration in production environments.
 
-We identify a deep architectural analogy between NCCL plugin
+We identify a structural analogy between NCCL plugin
 extension points and kernel-level hooks, where the eBPF
 framework~\cite{ebpf-linux} has already successfully addressed
 similar challenges~\cite{xrp, electrode, pageflex}. In both
@@ -168,11 +168,11 @@ mirrors eBPF's original packet-processing use case, and NCCL's
 tuner and profiler interfaces correspond to kernel tracepoints
 where lightweight policy-driven decisions influence critical runtime
 behavior. Inspired by eBPF's verified extensibility model, we
-present \sysname, which integrates a fully verified, userspace eBPF
+present \sysname, which integrates a verified, userspace eBPF
 runtime~\cite{bpftime} directly within NCCL's existing plugin
 interface, without modifying NCCL source code.
 
-\sysname provides three critical advantages: (1)~load-time static
+\sysname provides three properties: (1)~load-time static
 verification guarantees safety before execution, preventing crashes
 and state corruption; (2)~structured, typed maps enable composable,
 cross-plugin state sharing, enabling previously impossible
@@ -181,14 +181,13 @@ capability allows operators to update policies seamlessly at
 runtime without interruption.
 
 We implement \sysname atop NCCL version 2.29.7 using bpftime, a
-lightweight userspace eBPF runtime. Through rigorous evaluation, we
-demonstrate that \sysname adds only 52--103\ns overhead per policy
+lightweight userspace eBPF runtime. Our evaluation shows that
+\sysname adds 52--103\ns overhead per policy
 decision, representing less than 0.06\% of collective latency.
 Furthermore, atomic updates incur a downtime of just 0.774\us and
 introduce zero dropped calls across 400{,}000 policy invocations.
-Crucially, \sysname entirely eliminates intermittent 2$\times$
-AllGather throughput degradation issues observed on our hardware
-testbed.
+On our testbed, \sysname eliminates intermittent 2$\times$
+AllGather throughput degradation.
 
 This paper makes three contributions:
 
