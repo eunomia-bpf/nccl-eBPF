@@ -1,4 +1,5 @@
 % Overhead staircase — sized directly for single column, no \resizebox
+% Data from docs/tmp/benchmarks/cpu_microbenchmark.txt (raw measurements)
 \begin{tikzpicture}
   \begin{axis}[
     nccl axis,
@@ -6,45 +7,40 @@
     height=5.5cm,
     ybar,
     ymin=0,
-    ymax=135,
-    bar width=10pt,
+    ymax=100,
+    bar width=12pt,
     xlabel={Policy},
     ylabel={P50 latency (ns)},
     xlabel style={font=\footnotesize},
     ylabel style={font=\footnotesize},
     tick label style={font=\footnotesize},
-    xtick={0,1,2,3,4,5,6},
+    xtick={0,1,2,3,4},
     xticklabels={
       native,
       noop,
       sz\_v2,
-      lkup,
-      lk+up,
       adapt,
       slo
     },
     xticklabel style={rotate=20, anchor=east, font=\footnotesize},
     nodes near coords,
     nodes near coords style={font=\footnotesize, anchor=south, text=ncclink},
-    enlarge x limits=0.08,
+    enlarge x limits=0.12,
   ]
     \addplot[draw=black!20, fill=black!25] coordinates {(0,10)};
     \addplot[draw=ncclblue!55!black, fill=ncclblue!38] coordinates {
-      (1,61) (2,62) (3,88) (4,113) (5,112) (6,110)
+      (1,43) (2,44) (3,66) (4,81)
     };
 
     % Annotation chips — positioned to stay within axis bounds
-    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:1.5,95) {+51\,ns};
-    \draw[nccl alert] (axis cs:1.4,91) -- (axis cs:1.0,65);
+    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:1.0,70) {+33\,ns};
+    \draw[nccl alert] (axis cs:0.95,66) -- (axis cs:1.0,47);
 
-    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:3.5,118) {+26\,ns};
-    \draw[nccl alert] (axis cs:3.4,114) -- (axis cs:3.0,92);
-
-    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:4.5,130) {+25\,ns};
-    \draw[nccl alert] (axis cs:4.4,127) -- (axis cs:4.0,117);
+    \node[nccl chip, font=\footnotesize, fill=white] at (axis cs:3.0,90) {+23\,ns};
+    \draw[nccl alert] (axis cs:2.95,86) -- (axis cs:3.0,70);
 
     \draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, draw=ncclslate]
-      (axis cs:4.3,106) -- (axis cs:6.0,106)
+      (axis cs:2.7,60) -- (axis cs:4.3,60)
       node[midway, below=5pt, font=\footnotesize, text=ncclslate] {map-heavy};
   \end{axis}
 \end{tikzpicture}%
