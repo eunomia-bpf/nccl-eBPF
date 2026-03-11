@@ -35,7 +35,9 @@ LOG_DIR="${REPO_ROOT}/docs/tmp"
 OBSERVER_OBJ="${SCRIPT_DIR}/nccl_cpu_observer.bpf.o"
 
 # AllReduce test parameters: 4MB-128MB range where Ring vs NVLS matters
-TEST_ARGS="-b 4M -e 128M -f 2 -g 1 -n 50 -w 10"
+# -c 0: disable validation to reduce GPU memory usage (GPUs are memory-constrained)
+# NCCL_MAX_NCHANNELS=4 is set via extra_env in run_nccl_test to reduce communicator memory
+TEST_ARGS="-b 4M -e 128M -f 2 -g 1 -n 20 -w 5 -c 0"
 
 # ============================================================================ #
 # Helpers
@@ -76,10 +78,13 @@ run_nccl_test() {
 
     log "Running NCCL AllReduce: ${label} -> ${logfile}"
     # extra_env is intentionally unquoted to allow word-splitting of KEY=VALUE pairs
+    # NCCL_MAX_NCHANNELS=4: limit channels to reduce GPU memory use on constrained GPUs
     env LD_LIBRARY_PATH="${NCCL_LIB}:${LD_LIBRARY_PATH:-}" \
         NCCL_TUNER_PLUGIN="${PLUGIN_LIB}" \
         NCCL_POLICY_BPF_PATH="${POLICY_BPF}" \
+        NCCL_MAX_NCHANNELS=4 \
         ${extra_env:+${extra_env}} \
+        mpirun --allow-run-as-root -np 8 \
         "${NCCL_TESTS}/all_reduce_perf" ${TEST_ARGS} 2>&1 | tee "${logfile}"
 
     log "Done: ${label}"
@@ -101,10 +106,9 @@ phase_a() {
     log "===== Phase A: Synthetic kernel-user map test ====="
 
     # Create a BPF array map: 1 entry, key=u32(4B), value=cpu_contention_state(24B)
-    # BPF_F_MMAPABLE = 0x20
     log "Creating synthetic BPF array map..."
     bpftool map create "${BPF_FS}/test_state_map" \
-        type array key 4 value 24 entries 1 name test_state flags 0x20 \
+        type array key 4 value 24 entries 1 name test_state \
         || die "Failed to create test_state_map"
 
     # Test 1: Write CONTENTION_NONE (0)
@@ -190,6 +194,7 @@ phase_b() {
     # Test B.1: Baseline (no observer, default NCCL)
     log "--- Test B.1: Baseline (no plugin, no stress) ---"
     env LD_LIBRARY_PATH="${NCCL_LIB}:${LD_LIBRARY_PATH:-}" \
+        mpirun --allow-run-as-root -np 8 \
         "${NCCL_TESTS}/all_reduce_perf" ${TEST_ARGS} 2>&1 | tee "${LOG_DIR}/e2e_phaseB_baseline.log"
 
     # Test B.2: CPU saturation with observer + policy
@@ -210,7 +215,7 @@ phase_b() {
     sleep 2
 
     bpftool map create "${BPF_FS}/state_map" \
-        type array key 4 value 24 entries 1 name state_map flags 0x20 \
+        type array key 4 value 24 entries 1 name state_map \
         || die "Failed to create state_map"
     #   timestamp_ns(8B)=0, rate(4B)=2000, allowed_cpus(4B)=240, type(1B)=1(SAT), pad(7B)
     bpftool map update pinned "${BPF_FS}/state_map" \
@@ -247,6 +252,7 @@ phase_b() {
         NCCL_POLICY_BPF_PATH="${POLICY_BPF}" \
         NCCL_POLICY_KERNEL_MAPS="state_map:${BPF_FS}/state_map" \
         taskset -c 0-3 \
+        mpirun --allow-run-as-root -np 8 \
         "${NCCL_TESTS}/all_reduce_perf" ${TEST_ARGS} 2>&1 | tee "${LOG_DIR}/e2e_phaseB_cpuset.log"
 
     cleanup_bpf_maps

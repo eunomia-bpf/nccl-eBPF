@@ -1,21 +1,24 @@
 .direnv
+
+# Build directories
 /build
 /build-vm
 /build-llvmbpf
 /build-bpftime
-*.so
-*.a
-*.d
-*.bpf.o
-nccl-tests/
+build/
+build-bpftime/
+nccl/build/
+nccl-tests/build/
 src/nccl-policy-plugin/build/
 src/nccl-policy-plugin/build-bpftime-migration/
 src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
 src/nccl-net-ebpf-plugin/build/
-libllvmbpf_vm.a
 
 # C/C++ compiled objects and binaries
 *.o
+*.so
+*.a
+*.d
 *.out
 *.exe
 *.elf
@@ -24,6 +27,10 @@ libllvmbpf_vm.a
 *.mod.c
 *.symvers
 modules.order
+libllvmbpf_vm.a
+
+# BPF objects (compiled output; keep *.bpf.c sources)
+src/kernel_observer/*.bpf.o
 
 # CMake build artifacts
 CMakeCache.txt
@@ -56,12 +63,20 @@ bpftime/build-*/
 *.iml
 # macOS
 .DS_Store
+# Windows
+Thumbs.db
 # ctags / cscope
 tags
 TAGS
 cscope.out
 cscope.in.out
 cscope.po.out
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
 
 # LaTeX build artifacts
 docs/paper/*.aux
@@ -76,11 +91,11 @@ docs/paper/*.synctex.gz
 # Ephemeral experiment data (docs/tmp/)
 # Keep .md design documents; ignore everything else
 docs/tmp/*.log
+docs/tmp/*.csv
 docs/tmp/*.py
 docs/tmp/*.sh
 docs/tmp/*.tsv
 docs/tmp/*.txt
-docs/tmp/*.csv
 docs/tmp/__pycache__/
 docs/tmp/phase0-logs/
 docs/tmp/benchmarks/
@@ -97,7 +112,7 @@ docs/tmp/test-nccl-*
 /paper.out
 /texput.log
 
-# Misc
+# Root-level stray binaries / generated files
 /echo
 Done\ A
 /check

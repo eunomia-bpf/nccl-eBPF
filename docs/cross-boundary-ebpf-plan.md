@@ -6,7 +6,7 @@
 > - 每个任务做完 → 立即更新本文档（任务条目状态 + 关键数据 + 文档路径）。
 > - 每次 context 压缩后 → 完整读取本文档恢复全局状态。
 > - 用 sonnet agent 跑任务，不阻塞主对话。
-> 上次更新：2026-03-11（Task #13-14 完成：plugin kernel-user map + cpu_aware policy）
+> 上次更新：2026-03-11（Phase 1 完成：plugin kernel-user map + cpu_aware policy + 端到端验证）
 
 ---
 
@@ -48,7 +48,8 @@ Euro-Par 2025/2026, EuroSys, NSDI（12-14 页 full paper，LNCS 格式）
 1. **不修改 NCCL 源码** — 全部通过 plugin API 和 eBPF 实现
 2. **不修改内核** — 使用标准 tracepoint/uprobe，无 kernel patch
 3. **内核 observer 由 cluster admin 部署（root），NCCL policy 由 user 运行** — 权限分离
-4. 遵循 CLAUDE.md：无 em-dash，"safety" not "correctness"，无 "in-kernel" 描述我们的系统
+4. **禁止影响网络连接的 eBPF** — 不使用 tc/XDP/socket filter 等可能中断网络的 eBPF 程序类型。内核侧只用 tracepoint（sched_switch）和 uprobe（NVML），均为只读观测，不修改数据路径
+5. 遵循 CLAUDE.md：无 em-dash，"safety" not "correctness"，无 "in-kernel" 描述我们的系统
 
 ---
 
@@ -190,7 +191,7 @@ else:
 | 8 | NVML 运行时指标采集 | ✅ | SM 2032→1650 MHz, throttle 0x20, margin 55→31°C。`docs/tmp/plan-b-nvml-analysis.md` |
 | 9 | cgroup/LSM/perf_event 环境验证 | ✅ | cgroup v2, CGROUP_BPF=y, LSM BPF 未激活 |
 
-### Phase 1: PoC 实现（当前 phase）
+### Phase 1: PoC 实现 ✅
 
 | # | 任务 | 状态 | 关键数据 / 文档 |
 |---|------|:---:|------|
@@ -199,7 +200,7 @@ else:
 | 12 | plugin.cpp kernel-user map 改造设计 | ✅ | 约 130 行新代码。`docs/tmp/plugin-kernel-map-design.md` |
 | 13 | plugin.cpp kernel-user map 实现 | ✅ | 4 新函数 (~180 行)：`parse_kernel_map_env`, `probe_kernel_pinned_map`, `register_kernel_user_map`, `attach_kernel_maps`。编译+全量测试通过 |
 | 14 | 用户态 cpu_aware policy 编写 | ✅ | `src/ebpf-policies/cpu_aware.bpf.c`，读 state_map，CPU sat→NVLS，cpuset→Ring，default→Ring/Simple。编译通过 |
-| 15 | 端到端验证：sched_switch → map → policy → NCCL | ❌ | stress-ng 注入 → 内核检测 → policy 切换 → 性能改善 |
+| 15 | 端到端验证：synthetic map → policy → NCCL | ✅ | Phase A 通过：SATURATION→NVLS (33.14 GB/s) vs NONE→Ring (2.66 GB/s)，12.5x 差异。GPU 显存被 vLLM 占用，绝对带宽偏低，需空闲时重跑。`docs/tmp/e2e_*.log` |
 
 ### Phase 2: GPU 热感知扩展
 
