@@ -122,6 +122,7 @@ add_policy_object(bad_infinite_loop_policy bad_infinite_loop
                   BAD_INFINITE_LOOP_BPF_O)
 add_policy_object(bad_write_ctx_policy bad_write_ctx BAD_WRITE_CTX_BPF_O)
 add_policy_object(bad_div_zero_policy bad_div_zero BAD_DIV_ZERO_BPF_O)
+add_policy_object(cpu_aware_policy cpu_aware CPU_AWARE_BPF_O)
 
 set(POLICY_OBJECTS
     ${NOOP_BPF_O}
@@ -137,7 +138,8 @@ set(POLICY_OBJECTS
     ${BAD_STACK_OVERFLOW_BPF_O}
     ${BAD_INFINITE_LOOP_BPF_O}
     ${BAD_WRITE_CTX_BPF_O}
-    ${BAD_DIV_ZERO_BPF_O})
+    ${BAD_DIV_ZERO_BPF_O}
+    ${CPU_AWARE_BPF_O})
 
 add_custom_target(ebpf_policies ALL DEPENDS ${POLICY_OBJECTS})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in

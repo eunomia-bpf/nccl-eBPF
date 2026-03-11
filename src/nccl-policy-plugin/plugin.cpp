@@ -1,4 +1,5 @@
 #include <atomic>
+#include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
@@ -496,6 +497,182 @@ bool create_bpftime_maps(SharedCommState *shared,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Kernel-user map support: allows eBPF policies running in NCCL to read maps
+// written by kernel eBPF programs (e.g., CPU contention observer) via
+// bpftime's kernel-user map mechanism.
+// ---------------------------------------------------------------------------
+
+struct KernelMapInfo {
+  uint32_t kernel_map_id;
+  uint32_t type;
+  uint32_t key_size;
+  uint32_t value_size;
+  uint32_t max_entries;
+};
+
+// Parse the NCCL_POLICY_KERNEL_MAPS environment variable.
+// Format: "map_name:pinned_path,map_name2:pinned_path2"
+// Returns a mapping from logical map name to pinned BPF filesystem path.
+// Malformed entries are skipped with a warning.
+std::unordered_map<std::string, std::string>
+parse_kernel_map_env(ncclDebugLogger_t log_function, const char *env_value) {
+  std::unordered_map<std::string, std::string> result;
+
+  if (!env_value || env_value[0] == '\0')
+    return result;
+
+  std::string input(env_value);
+  size_t pos = 0;
+
+  while (pos < input.size()) {
+    size_t comma = input.find(',', pos);
+    if (comma == std::string::npos)
+      comma = input.size();
+
+    std::string entry = input.substr(pos, comma - pos);
+    pos = comma + 1;
+
+    if (entry.empty())
+      continue;
+
+    size_t colon = entry.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= entry.size()) {
+      log_plugin_message(log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                         "malformed kernel map entry '%s', expected "
+                         "map_name:pinned_path",
+                         entry.c_str());
+      continue;
+    }
+
+    std::string map_name = entry.substr(0, colon);
+    std::string pinned_path = entry.substr(colon + 1);
+    result.emplace(std::move(map_name), std::move(pinned_path));
+  }
+
+  return result;
+}
+
+// Probe a kernel pinned BPF map at the given path and retrieve its metadata.
+// Returns true on success, false if the map is not found or inaccessible.
+// The fd obtained from bpf_obj_get() is closed after querying; bpftime will
+// re-open via bpf_map_get_fd_by_id() internally.
+bool probe_kernel_pinned_map(const char *pinned_path,
+                             KernelMapInfo *out_info) {
+  int fd = bpf_obj_get(pinned_path);
+  if (fd < 0)
+    return false;
+
+  struct bpf_map_info info = {};
+  unsigned int info_len = sizeof(info);
+  if (bpf_obj_get_info_by_fd(fd, &info, &info_len) < 0) {
+    close(fd);
+    return false;
+  }
+
+  out_info->kernel_map_id = info.id;
+  out_info->type = info.type;
+  out_info->key_size = info.key_size;
+  out_info->value_size = info.value_size;
+  out_info->max_entries = info.max_entries;
+  close(fd);
+  return true;
+}
+
+// Create a bpftime kernel-user map that mirrors a kernel pinned map.
+// If a userspace map with the same logical name already exists in
+// policy_state->map_fds (created by create_bpftime_maps from the BPF object),
+// the old map is closed and replaced with the kernel-user variant.
+// The verifier entry uses the ORIGINAL kernel map type (not +1000), because the
+// PREVAIL verifier does not recognize kernel-user type offsets.
+// Returns the new bpftime fd on success, or -1 on failure.
+int register_kernel_user_map(SharedCommState *shared,
+                             SharedCommState::LoadedPolicyState *policy_state,
+                             const std::string &logical_name,
+                             const KernelMapInfo &km_info) {
+  bpftime::bpf_map_attr attr = {};
+  attr.type = static_cast<int>(km_info.type + KERNEL_USER_MAP_OFFSET);
+  attr.kernel_bpf_map_id = km_info.kernel_map_id;
+  attr.key_size = km_info.key_size;
+  attr.value_size = km_info.value_size;
+  attr.max_ents = km_info.max_entries;
+
+  // Kernel maps are shared across policy instances, so use a simple
+  // "kernel_" prefix rather than the per-instance namespace.
+  const std::string runtime_name = "kernel_" + logical_name;
+
+  // If a userspace map with this name already exists, close it first.
+  auto existing_it = policy_state->map_fds.find(logical_name);
+  if (existing_it != policy_state->map_fds.end()) {
+    int old_fd = existing_it->second;
+    policy_state->verifier_maps.erase(old_fd);
+    bpftime_close(old_fd);
+    policy_state->map_fds.erase(existing_it);
+  }
+
+  int fd = bpftime_maps_create(-1, runtime_name.c_str(), attr);
+  if (fd < 0) {
+    log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                       NCCL_LOG_WARN,
+                       "failed to create kernel-user map %s (kernel_id=%u)",
+                       logical_name.c_str(), km_info.kernel_map_id);
+    return -1;
+  }
+
+  policy_state->map_fds.emplace(logical_name, fd);
+  policy_state->verifier_maps.emplace(
+      fd, bpftime::verifier::BpftimeMapDescriptor{
+              .original_fd = fd,
+              .type = km_info.type, // original type, NOT +1000
+              .key_size = km_info.key_size,
+              .value_size = km_info.value_size,
+              .max_entries = km_info.max_entries,
+              .inner_map_fd = static_cast<unsigned int>(-1),
+          });
+  return fd;
+}
+
+// Read NCCL_POLICY_KERNEL_MAPS and attach each specified kernel pinned map as
+// a bpftime kernel-user map.  If a kernel map is unavailable, the existing
+// userspace map (if any) is preserved and a warning is logged.
+void attach_kernel_maps(SharedCommState *shared,
+                        SharedCommState::LoadedPolicyState *policy_state) {
+  const char *env = getenv("NCCL_POLICY_KERNEL_MAPS");
+  if (!env || env[0] == '\0')
+    return;
+
+  auto kernel_map_specs =
+      parse_kernel_map_env(shared ? shared->log_function : nullptr, env);
+
+  for (const auto &kv : kernel_map_specs) {
+    const std::string &map_name = kv.first;
+    const std::string &pinned_path = kv.second;
+    KernelMapInfo km_info = {};
+
+    if (!probe_kernel_pinned_map(pinned_path.c_str(), &km_info)) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "kernel map '%s' unavailable at %s, falling back to "
+                         "userspace map",
+                         map_name.c_str(), pinned_path.c_str());
+      continue;
+    }
+
+    if (register_kernel_user_map(shared, policy_state, map_name, km_info) < 0) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "failed to register kernel-user map '%s'",
+                         map_name.c_str());
+    } else {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_INFO,
+                         "attached kernel map '%s' (id=%u, path=%s)",
+                         map_name.c_str(), km_info.kernel_map_id,
+                         pinned_path.c_str());
+    }
+  }
+}
+
 bool extract_program_spec(SharedCommState *shared, struct bpf_object *obj,
                           ProgramSpec *spec) {
   struct bpf_program *prog = bpf_object__next_program(obj, nullptr);
@@ -816,6 +993,7 @@ bool load_program_from_object(SharedCommState *shared,
   }
   if (!create_bpftime_maps(shared, policy_state, obj.get()))
     return false;
+  attach_kernel_maps(shared, policy_state);
   if (!relocate_program_maps(shared, path, policy_state, &spec))
     return false;
   if (!verify_program(shared, policy_state, spec))

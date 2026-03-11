@@ -6,7 +6,7 @@
 > - 每个任务做完 → 立即更新本文档（任务条目状态 + 关键数据 + 文档路径）。
 > - 每次 context 压缩后 → 完整读取本文档恢复全局状态。
 > - 用 sonnet agent 跑任务，不阻塞主对话。
-> 上次更新：2026-03-11（方案 A/B 验证完成，统一方案确立）
+> 上次更新：2026-03-11（Task #13-14 完成：plugin kernel-user map + cpu_aware policy）
 
 ---
 
@@ -165,7 +165,7 @@ else:
 | 当前 workshop paper | `docs/paper/paper.tex` | ✅ |
 | 内核 observer 源码 | `src/kernel_observer/` | ✅ 已编译 |
 | 用户态 eBPF policies | `src/ebpf-policies/` | ✅ |
-| NCCL tuner plugin | `src/nccl-policy-plugin/plugin.cpp` | 待修改 |
+| NCCL tuner plugin | `src/nccl-policy-plugin/plugin.cpp` | ✅ kernel-user map 支持已实现 |
 
 ---
 
@@ -197,8 +197,8 @@ else:
 | 10 | 内核 sched_switch eBPF 程序 | ✅ | 编译通过，零 warning。`src/kernel_observer/nccl_cpu_observer.bpf.c` |
 | 11 | 内核 observer 加载脚本 | ✅ | `src/kernel_observer/load.sh` |
 | 12 | plugin.cpp kernel-user map 改造设计 | ✅ | 约 130 行新代码。`docs/tmp/plugin-kernel-map-design.md` |
-| 13 | plugin.cpp kernel-user map 实现 | ❌ | 实现 `attach_kernel_maps()`，env var `NCCL_POLICY_KERNEL_MAPS` |
-| 14 | 用户态 cpu_aware policy 编写 | ❌ | 读取 cpu_state map + size-aware 逻辑 |
+| 13 | plugin.cpp kernel-user map 实现 | ✅ | 4 新函数 (~180 行)：`parse_kernel_map_env`, `probe_kernel_pinned_map`, `register_kernel_user_map`, `attach_kernel_maps`。编译+全量测试通过 |
+| 14 | 用户态 cpu_aware policy 编写 | ✅ | `src/ebpf-policies/cpu_aware.bpf.c`，读 state_map，CPU sat→NVLS，cpuset→Ring，default→Ring/Simple。编译通过 |
 | 15 | 端到端验证：sched_switch → map → policy → NCCL | ❌ | stress-ng 注入 → 内核检测 → policy 切换 → 性能改善 |
 
 ### Phase 2: GPU 热感知扩展
@@ -235,7 +235,7 @@ else:
 |------|------|------|:---:|
 | stress-ng 不代表生产 | 审稿质疑 | stress-ng = 多租户争用; taskset = K8s cpuset cgroup | 已准备回应 |
 | GPU throttle 信号稀疏 | 方案 B 弱化 | GPU 3 在 30s 触发 14 次已足够 | 已验证 |
-| plugin.cpp 改造阻塞 | Phase 1 延迟 | 设计已完成，约 130 行代码 | 待实现 |
+| plugin.cpp 改造阻塞 | Phase 1 延迟 | ~180 行新代码，编译+测试通过 | ✅ 已解决 |
 | 内核 eBPF 需 root | 部署受限 | 权限分离设计：admin 部署 observer，user 运行 policy | 设计已定 |
 | "只是读 map if/else" | novelty 质疑 | 综合 3+ 信号 + per-collective + 热重载 + 验证 | 已准备回应 |
 | 240 核 CPU 争用难产生 | 方案 A 弱化 | stress-ng/taskset 已证明可制造可测量差异 | ✅ 已验证 |
