@@ -39,6 +39,12 @@ docs/tmp/*-validation/
 docs/tmp/final-exp*/
 docs/tmp/test-nccl-*
 
+# Root-level LaTeX artifacts
+/paper.aux
+/paper.log
+/paper.out
+/texput.log
+
 # Misc
 /echo
 Done\ A
