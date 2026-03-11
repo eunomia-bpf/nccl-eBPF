@@ -1,5 +1,5 @@
 % NCCLPol: Verified, Composable Policy Execution for GPU Collective Communication
-% Target: Workshop paper (6 pages, ACM sigconf)
+% Target: eBPF Workshop @ SIGCOMM (up to 6 pages + refs, ACM sigconf, double-blind)
 
 \documentclass[sigconf,anonymous]{acmart}
 
@@ -294,11 +294,11 @@ different policies, which is acceptable because collective decisions
 are independent across calls.
 
 \paragraph{T4: Compatibility vs.\ capability.}
-\sysname operates within NCCL's existing plugin ABI, requiring
+Our system operates within NCCL's existing plugin ABI, requiring
 no source modifications, no custom builds, and no kernel modules.
 The action space is limited to algorithm, protocol, and channel
-count selection. Deeper interventions are outside scope, but the
-exposed knobs cover the most impactful tuning decisions.
+count selection. Deeper interventions are outside scope, but
+the exposed knobs cover the most impactful tuning decisions.
 \sysname selects among NCCL's built-in algorithms; it does not
 implement custom collective algorithms.
 
@@ -660,16 +660,16 @@ can activate synthesized schedules or tuned configurations based
 on runtime conditions.
 
 \paragraph{Alternative extension mechanisms.}
-WebAssembly provides sandboxed execution but lacks eBPF's static
-termination and memory-safety guarantees; its overhead is typically
-higher due to bounds checks that eBPF eliminates statically.
-Out-of-process services provide strong isolation but add
-microseconds of IPC latency, an order of magnitude more than
-\sysname's 52--103\ns overhead. Declarative DSLs cannot express
-stateful policies or feedback loops. Hardware isolation
-(Intel~MPK) provides memory separation without verification.
-eBPF uniquely combines static verification with near-native
-JIT performance in a single model.
+WebAssembly~\cite{wasm} provides sandboxed execution but
+lacks eBPF's static safety guarantees (termination, bounded
+memory access), and incurs higher overhead from runtime bounds
+checks. Out-of-process services add microseconds of IPC
+latency, an order of magnitude more than \sysname's
+52--103\ns overhead. Declarative DSLs cannot express stateful
+policies or feedback loops. Hardware isolation
+(Intel MPK~\cite{erim}) provides memory separation without
+verification. eBPF uniquely combines static verification with
+near-native JIT performance in a single model.
 
 % ============================================================================
 % 7. DISCUSSION

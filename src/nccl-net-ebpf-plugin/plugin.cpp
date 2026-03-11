@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -554,27 +555,111 @@ std::shared_ptr<PolicyState> load_policy(ncclDebugLogger_t log_function) {
   return policy_state;
 }
 
+// Find the real path to libnccl.so by scanning /proc/self/maps.
+// This works regardless of how libnccl was loaded or what its soname is.
+std::string find_libnccl_path_from_maps() {
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+
+  while (std::getline(maps, line)) {
+    // Each line looks like: addr-addr perms offset dev inode  pathname
+    // We look for a mapping whose pathname contains "libnccl"
+    auto slash_pos = line.rfind('/');
+    if (slash_pos == std::string::npos)
+      continue;
+    auto path = line.substr(slash_pos);
+    // Trim trailing whitespace
+    auto end = path.find_last_not_of(" \t\n\r");
+    if (end != std::string::npos)
+      path.resize(end + 1);
+    // Match libnccl.so but not libnccl-net-ebpf (ourselves)
+    auto basename_start = path.rfind('/');
+    std::string basename = (basename_start != std::string::npos)
+                               ? path.substr(basename_start + 1)
+                               : path;
+    if (basename.find("libnccl.so") == 0 ||
+        basename.find("libnccl_") == 0) {
+      // Extract the full absolute path from the original line
+      auto space_before_path = line.rfind("  ");
+      if (space_before_path == std::string::npos)
+        space_before_path = line.rfind(' ');
+      if (space_before_path != std::string::npos) {
+        auto full_path = line.substr(space_before_path + 1);
+        // Trim leading/trailing whitespace
+        auto start = full_path.find_first_not_of(" \t");
+        auto fend = full_path.find_last_not_of(" \t\n\r");
+        if (start != std::string::npos && fend != std::string::npos) {
+          full_path = full_path.substr(start, fend - start + 1);
+          // Verify it's an absolute path and not our own plugin
+          if (full_path[0] == '/' &&
+              full_path.find("nccl-net-ebpf") == std::string::npos) {
+            return full_path;
+          }
+        }
+      }
+    }
+  }
+  return {};
+}
+
 ncclNet_t *resolve_socket_backend(ncclDebugLogger_t log_function) {
   std::lock_guard<std::mutex> lock(g_backend_mu);
   if (g_backend_socket)
     return g_backend_socket;
 
+  // Strategy 1: RTLD_DEFAULT finds globally-visible symbols.
+  // Works when libnccl.so was loaded with RTLD_GLOBAL (the common case).
   g_backend_socket =
       reinterpret_cast<ncclNet_t *>(dlsym(RTLD_DEFAULT, "ncclNetSocket"));
-  if (g_backend_socket)
+  if (g_backend_socket) {
+    log_message(log_function, NCCL_NET, NCCL_LOG_INFO,
+                "resolved ncclNetSocket via RTLD_DEFAULT");
     return g_backend_socket;
-
-  void *handle = dlopen("libnccl.so.2", RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
-  if (!handle)
-    handle = dlopen("libnccl.so", RTLD_NOW | RTLD_NOLOAD | RTLD_LOCAL);
-  if (handle)
-    g_backend_socket =
-        reinterpret_cast<ncclNet_t *>(dlsym(handle, "ncclNetSocket"));
-
-  if (!g_backend_socket) {
-    log_message(log_function, NCCL_NET, NCCL_LOG_WARN,
-                "unable to resolve ncclNetSocket from libnccl.so");
   }
+
+  // Strategy 2: Get a handle to the already-loaded libnccl by soname.
+  // Works when libnccl was loaded with RTLD_LOCAL but uses standard soname.
+  {
+    const char *sonames[] = {"libnccl.so.2", "libnccl.so", nullptr};
+    for (const char **name = sonames; *name; ++name) {
+      void *handle = dlopen(*name, RTLD_NOW | RTLD_NOLOAD);
+      if (!handle)
+        continue;
+      g_backend_socket =
+          reinterpret_cast<ncclNet_t *>(dlsym(handle, "ncclNetSocket"));
+      if (g_backend_socket) {
+        log_message(log_function, NCCL_NET, NCCL_LOG_INFO,
+                    "resolved ncclNetSocket via dlopen(%s, RTLD_NOLOAD)",
+                    *name);
+        return g_backend_socket;
+      }
+    }
+  }
+
+  // Strategy 3: Scan /proc/self/maps for the actual libnccl path, then
+  // dlopen that exact path.  Handles non-standard install locations and
+  // LD_LIBRARY_PATH-based loading where the soname lookup above might miss.
+  {
+    std::string path = find_libnccl_path_from_maps();
+    if (!path.empty()) {
+      void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+      if (handle) {
+        g_backend_socket =
+            reinterpret_cast<ncclNet_t *>(dlsym(handle, "ncclNetSocket"));
+        if (g_backend_socket) {
+          log_message(log_function, NCCL_NET, NCCL_LOG_INFO,
+                      "resolved ncclNetSocket via /proc/self/maps (%s)",
+                      path.c_str());
+          return g_backend_socket;
+        }
+      }
+    }
+  }
+
+  log_message(log_function, NCCL_NET, NCCL_LOG_WARN,
+              "unable to resolve ncclNetSocket -- "
+              "ensure libnccl.so exports this symbol "
+              "(NCCL 2.x default builds with nccl* version-script do)");
   return g_backend_socket;
 }
 
