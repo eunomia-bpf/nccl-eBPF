@@ -14,6 +14,55 @@ src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
 src/nccl-net-ebpf-plugin/build/
 libllvmbpf_vm.a
 
+# C/C++ compiled objects and binaries
+*.o
+*.out
+*.exe
+*.elf
+*.ko
+*.mod
+*.mod.c
+*.symvers
+modules.order
+
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# bpftime submodule build artifacts (do not stage submodule changes)
+bpftime/build/
+bpftime/build-*/
+
+# Editor temporary files
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+# Emacs
+\#*\#
+.\#*
+*.elc
+# VS Code
+.vscode/
+*.code-workspace
+# JetBrains/CLion
+.idea/
+*.iml
+# macOS
+.DS_Store
+# ctags / cscope
+tags
+TAGS
+cscope.out
+cscope.in.out
+cscope.po.out
+
 # LaTeX build artifacts
 docs/paper/*.aux
 docs/paper/*.bbl
@@ -25,11 +74,13 @@ docs/paper/*.fdb_latexmk
 docs/paper/*.synctex.gz
 
 # Ephemeral experiment data (docs/tmp/)
+# Keep .md design documents; ignore everything else
 docs/tmp/*.log
 docs/tmp/*.py
 docs/tmp/*.sh
 docs/tmp/*.tsv
 docs/tmp/*.txt
+docs/tmp/*.csv
 docs/tmp/__pycache__/
 docs/tmp/phase0-logs/
 docs/tmp/benchmarks/
@@ -49,3 +100,7 @@ docs/tmp/test-nccl-*
 # Misc
 /echo
 Done\ A
+/check
+/conformance_check
+/run_yaml
+/tests
