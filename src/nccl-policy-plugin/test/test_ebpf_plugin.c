@@ -559,7 +559,7 @@ static int run_policy_once(struct plugin_session *session, ncclFunc_t coll_type,
 
   reset_cost_table(cost_table, cost_table_ptr);
   if (session->plugin->getCollInfo(session->plugin_context, coll_type, n_bytes,
-                                   num_pipe_ops, cost_table_ptr,
+                                   num_pipe_ops, (float **)cost_table,
                                    NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
                                    reg_buff, &n_channels) != ncclSuccess) {
     return failf("plugin getCollInfo failed for bytes=%zu coll=%d", n_bytes,
@@ -1492,7 +1492,7 @@ static int benchmark_policy(const char *plugin_path,
 
     start_ns = monotonic_time_ns();
     if (session.plugin->getCollInfo(session.plugin_context, coll_type, n_bytes,
-                                    pipe_ops, cost_table_ptr,
+                                    pipe_ops, (float **)cost_table,
                                     NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
                                     reg_buff, &n_channels) != ncclSuccess) {
       close_plugin_session(&session);
@@ -1570,7 +1570,7 @@ static int test_hot_reload_safety(const char *plugin_path,
       reset_cost_table(cost_table, cost_table_ptr);
       start_ns = monotonic_time_ns();
       if (session.plugin->getCollInfo(session.plugin_context, ncclFuncAllReduce,
-                                      1u << 20, 1, cost_table_ptr,
+                                      1u << 20, 1, (float **)cost_table,
                                       NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
                                       0, &n_channels) != ncclSuccess) {
         failed_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1634,8 +1634,10 @@ static int test_hot_reload_safety(const char *plugin_path,
       result->slow_call_count++;
   }
 
+  /* last_channels is initialised to 0; noop never sets channels, so all
+   * pre-reload decisions have channels=0, algo=-1, proto=-1. */
   for (size_t i = 0; i < decisions.size(); ++i) {
-    if (decision_matches(&decisions[i], 1, -1, -1)) {
+    if (decision_matches(&decisions[i], 0, -1, -1)) {
       result->old_policy_calls++;
       continue;
     }
@@ -1655,7 +1657,7 @@ static int test_hot_reload_safety(const char *plugin_path,
   }
 
   for (size_t i = 0; i < result->first_changed_call; ++i) {
-    if (!decision_matches(&decisions[i], 1, -1, -1)) {
+    if (!decision_matches(&decisions[i], 0, -1, -1)) {
       close_plugin_session(&session);
       return failf("hot reload was not atomic before the transition point");
     }

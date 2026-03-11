@@ -1,7 +1,11 @@
 #ifndef NCCL_POLICY_MAPS_H_
 #define NCCL_POLICY_MAPS_H_
 
+#ifdef __BPF__
+#include "bpf_compat.h"
+#else
 #include <stdint.h>
+#endif
 
 struct nccl_policy_telemetry_key {
   uint32_t coll_type;

@@ -1,7 +1,11 @@
 #ifndef NCCL_POLICY_ACTION_H_
 #define NCCL_POLICY_ACTION_H_
 
+#ifdef __BPF__
+#include "bpf_compat.h"
+#else
 #include <stdint.h>
+#endif
 
 enum nccl_policy_algo_id {
   NCCL_POLICY_ALGO_TREE = 0,

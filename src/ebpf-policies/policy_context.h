@@ -1,7 +1,11 @@
 #ifndef NCCL_POLICY_CONTEXT_H_
 #define NCCL_POLICY_CONTEXT_H_
 
+#ifdef __BPF__
+#include "bpf_compat.h"
+#else
 #include <stdint.h>
+#endif
 
 enum nccl_policy_coll_type {
   NCCL_POLICY_COLL_BROADCAST = 0,
