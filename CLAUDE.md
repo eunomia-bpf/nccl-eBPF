@@ -75,6 +75,12 @@ codex exec --dangerously-bypass-approvals-and-sandbox -C /path/to/dir "your prom
 5. **Programmable Network Device Policy** — eBPF policies for NIC selection, vNIC, device offload
 6. **Cross-vendor Portability** — Same policy IR on NCCL + RCCL (AMD)
 
+## Paper Writing Rules
+
+- **No em-dashes** (`---` in LaTeX). Use parentheses, commas, semicolons, or separate sentences instead. Exception: `---` in tables to denote missing values is OK.
+- **"safety" not "correctness"**: eBPF verifies memory safety + termination, not semantic correctness.
+- **No "in-kernel" when describing our system**: We use userspace eBPF (bpftime), not kernel eBPF.
+
 ## Paper Target
 
 Systems venues: OSDI, NSDI, EuroSys, ATC, ASPLOS. Core contribution: first system to bring verifiable, isolated policy execution (eBPF + EIM) into GPU collective communication runtimes.

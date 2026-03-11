@@ -11,6 +11,7 @@ nccl-tests/
 src/nccl-policy-plugin/build/
 src/nccl-policy-plugin/build-bpftime-migration/
 src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
+src/nccl-net-ebpf-plugin/build/
 libllvmbpf_vm.a
 
 # LaTeX build artifacts
