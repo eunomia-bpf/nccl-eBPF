@@ -202,21 +202,69 @@ uint64_t network_aware_policy(struct nccl_policy_ctx *ctx) {
 
 ---
 
-## 待调研问题（Phase 0 blocking）
+## Phase 0 调研结果 ✅
 
-1. **当前机器有没有 InfiniBand / RoCE？** → 决定场景 B vs C
-2. **有没有多节点可用？** → 决定是否只能做单节点实验
-3. **bpftime 能不能读 kernel pinned map？** → 决定技术路径
-4. **NCCL 在什么时机重新调用 tuner？** → 决定 policy 反应粒度（每次 collective call? 还是只在 communicator 创建时?）
+1. **无 InfiniBand / RoCE** — 单网卡 virtio-net 虚拟机（DataCrunch），只有 TCP → **场景 B（socket + tc eBPF）**
+2. **无多节点** — 单机 8 GPU，无集群 → 单节点实验，NCCL_P2P_DISABLE=1 强制走 net transport 模拟
+3. **bpftime 支持 kernel map 共享** — `array_map_kernel_user` / `hash_map_kernel_user` 通过 `bpf_map_get_fd_by_id` 与内核 map 双向同步
+4. **getCollInfo 每次 collective call 都调用** — 在 `enqueue.cc:2054`，热路径，policy 可实时生效
+5. **内核 6.8 + BTF + bpftool 7.4** — tc/XDP eBPF 开发环境完备
 
 ---
 
-## 风险评估
+## Phase 0 深度调研结果 ✅
+
+### tc eBPF 网络观测能力
+- tc sched_cls 在 lo ingress 可观测 NCCL socket TCP 流量
+- `bpf_tcp_sock(skb->sk)` 可获取 `srtt_us`, `snd_cwnd`, `total_retrans`, `retrans_out`
+- `skb->sk` 在 lo ingress 是否非 NULL 需实测（若 NULL 可 fallback 到 `bpf_sk_lookup_tcp`）
+- NCCL socket 使用动态端口，但单机 lo 上流量有限，可观测全部
+
+### bpftime kernel map 共享机制
+- `array_map_kernel_user`: 若内核 map 设 `BPF_F_MMAPABLE`，mmap 零拷贝读取 <10ns
+- `hash_map_kernel_user`: syscall 路径，~1-5us
+- 用户态 eBPF 通过标准 `bpf_map_lookup_elem` helper 透明访问
+- **需修改 plugin.cpp**: 当前 `create_maps_from_bpf_object()` 不支持 kernel-user map 注册
+
+### NCCL socket transport
+- 动态端口（bind port=0），通过 socket cookie 或全量观测识别
+- 8-GPU ring: 约 8-16 个 TCP 连接（默认 nSocks=1）
+- `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_SOCKET_IFNAME=lo` 强制全部走 socket over lo
+
+### tc netem 干扰注入
+- lo 上可用 netem（`sch_netem.ko.zst` 已存在）
+- 可注入 delay, jitter, loss, reorder, duplicate
+- netem 在 egress，eBPF observer 在 ingress，互不干扰
+- TCP RTT/重传会反映 netem 注入的变化
+
+### PoC 实现路径
+
+**内核侧**（新文件）:
+- `src/tc_observer/nccl_tc_observer.bpf.c`: tc sched_cls 程序，挂在 lo ingress
+- 读取 TCP metrics → 写入 `BPF_F_MMAPABLE` array map → pin 到 `/sys/fs/bpf/nccl_net_state`
+- 独立 loader 脚本（需 root）加载 tc eBPF
+
+**用户侧**（修改现有文件）:
+- `plugin.cpp`: 在 init 时 `bpf_obj_get("/sys/fs/bpf/nccl_net_state")` 获取 kernel map fd
+- 创建 `BPF_MAP_TYPE_KERNEL_USER_ARRAY` 传入 kernel_bpf_map_id
+- 新 eBPF policy `net_aware_policy.bpf.c`: 读取 net_state_map + size-aware 逻辑
+
+**实验流程**:
+1. 加载 tc eBPF observer 到 lo ingress（root）
+2. 启动 NCCL with `P2P_DISABLE=1 SHM_DISABLE=1 SOCKET_IFNAME=lo`
+3. 运行 baseline（无干扰 + 无 policy）
+4. 注入 netem delay → 观测 policy 反应
+5. 撤除 netem → 观测 policy 恢复
+
+---
+
+## 风险评估（更新后）
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
-| 无 InfiniBand | 只能用 socket transport 做 demo | tc netem 模拟足够说明架构价值 |
-| bpftime 不支持 pinned map | 跨边界不通 | 可用 mmap 共享内存替代，或给 bpftime 加 pinned map 支持 |
-| NCCL tuner 只在 init 时调用 | policy 无法动态切换 | 需确认 NCCL getCollInfo 是否每次 collective 都调用 |
-| 单节点实验不够有说服力 | Euro-Par 审稿质疑 scale | 强调架构贡献 + 在 NVLink 上展示不同传输路径切换 |
-| 内核 eBPF 需要 root 权限 | 部署受限 | 这是已知的 eBPF 限制，论文需讨论 |
+| `skb->sk` 在 lo ingress 为 NULL | tc eBPF 无法直接获取 TCP metrics | 用 `bpf_sk_lookup_tcp()` + 解析包头 fallback |
+| plugin.cpp 不支持 kernel-user map | eBPF policy 无法读取内核 map | 需修改 plugin.cpp 添加 kernel-user map 注册 |
+| socket transport 性能太低 | 实验结果不代表生产 | 论文定位为架构验证，性能优化在 IB 环境补充 |
+| 单节点实验不够有说服力 | Euro-Par 审稿质疑 scale | 强调跨边界架构贡献 + NVLink 上的算法选择实验互补 |
+| 内核 eBPF 需要 root 权限 | 部署受限 | 论文讨论：tc observer 由 cluster admin 部署，NCCL plugin 由 user 运行 |
+| netem 影响所有 lo 流量 | 非 NCCL 流量也受干扰 | 单机测试环境影响有限；可用 cgroup classid 精确控制 |
