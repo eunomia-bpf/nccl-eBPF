@@ -87,6 +87,7 @@ docs/paper/*.out
 docs/paper/*.fls
 docs/paper/*.fdb_latexmk
 docs/paper/*.synctex.gz
+docs/paper/*.tar.gz
 
 # Ephemeral experiment data (docs/tmp/)
 # Keep .md design documents; ignore everything else
