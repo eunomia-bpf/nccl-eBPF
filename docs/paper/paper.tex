@@ -459,7 +459,7 @@ CPU microbenchmarks run on a 240-core AMD EPYC~9575F; each benchmark
 performs 1\,million calls and reports P50/P99 latencies. GPU
 experiments use 8$\times$ NVIDIA B300 SXM6 GPUs (Blackwell,
 275\,GB each) connected via NVLink~5 (NV18, 1.8\,TB/s per GPU)
-with CUDA~13.0 and NCCL~2.29.7.
+with CUDA~13.0 and NCCL~2.29.7, hosted on Verda.
 
 % --------------------------------------------------------------------------
 \subsection{Overhead}
@@ -747,6 +747,14 @@ bugs at load time, supports atomic hot-reload without call loss,
 and enables a message-size-aware policy that improves 8-GPU
 NVLink AllReduce throughput by up to 27\% over NCCL's default, with
 zero NCCL modifications.
+
+% ============================================================================
+% ACKNOWLEDGMENTS
+% ============================================================================
+\begin{acks}
+We thank Verda for providing the 8$\times$~NVIDIA~B300 NVLink
+compute infrastructure used in this work.
+\end{acks}
 
 % ============================================================================
 % REFERENCES
