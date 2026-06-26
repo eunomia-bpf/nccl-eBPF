@@ -1,7 +1,7 @@
-% NCCLPol: Verified, Composable Policy Execution for GPU Collective Communication
-% Target: eBPF Workshop @ SOSP (up to 6 pages + refs, ACM sigconf, double-blind)
+% nbpf: Verified, Composable Policy Execution for GPU Collective Communication
+% Target: eBPF Workshop @ SOSP 2026 (up to 6 pages + refs, ACM sigplan, double-blind)
 
-\documentclass[sigconf,anonymous]{acmart}
+\documentclass[sigplan,10pt,anonymous]{acmart}
 
 \usepackage{booktabs}
 \usepackage{subcaption}
@@ -85,7 +85,7 @@
   },
 }
 
-\newcommand{\sysname}{NCCLbpf\xspace}
+\newcommand{\sysname}{nbpf\xspace}
 \newcommand{\us}{\,\textmu{}s\xspace}
 \newcommand{\ns}{\,ns\xspace}
 
@@ -101,15 +101,14 @@
   xleftmargin=2em,
 }
 
-% Remove ACM-specific reference formatting for draft
+% SOSP 2026 formatting requirements
+\renewcommand\footnotetextcopyrightpermission[1]{}
 \settopmatter{printfolios=true,printccs=false,printacmref=false}
+\pagestyle{plain}
 
 \begin{document}
 
 \title{\sysname: Verified, Composable Policy Execution\\for GPU Collective Communication}
-
-\author{Yusheng Zheng}
-\affiliation{\institution{University of California, Santa Cruz}\country{USA}}
 
 % ============================================================================
 % ABSTRACT
