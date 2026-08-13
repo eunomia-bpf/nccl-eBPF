@@ -145,13 +145,13 @@ Collective GPU communication performance is crucial for large-scale
 distributed training frameworks such as
 Megatron-LM~\cite{megatron}, DeepSpeed~\cite{deepspeed}, and
 PyTorch FSDP~\cite{pytorch-fsdp}, all of which depend on
-NCCL~\cite{nccl} for efficient inter-GPU data movement. The
-performance of NCCL collectives (e.g., AllReduce, AllGather)
+collective libraries like NCCL~\cite{nccl} for efficient inter-GPU data movement. The
+performance of collectives (e.g., AllReduce, AllGather)
 significantly depends on runtime decisions: algorithm selection
 (ring vs.\ tree), transport protocols (LL vs.\
 Simple~\cite{demystifying-nccl}), and parallelization channels.
-Recognizing this dependency, NCCL exposes a modular plugin
-architecture, including tuner, profiler, and net plugins, allowing
+Recognizing this dependency, such libraries expose modular plugin
+architectures.NCCL, for instance, provides tuner, profiler, and net plugins, allowing
 cloud operators and hardware vendors to tailor policies to match
 specific deployment characteristics. Major providers already
 leverage these plugins extensively in production
@@ -187,15 +187,15 @@ present \sysname, which integrates a verified, userspace eBPF
 runtime~\cite{bpftime} directly within NCCL's existing plugin
 interface, without modifying NCCL source code.
 
-The analogy is not exact, however, and where it breaks is where the
-work lies. A verifier discharges obligations about one program on one
-execution, but several of NCCL's invariants are neither. NCCL requires
-that all ranks of a communicator agree on the algorithm they select,
-or the collective hangs---a property over a \emph{set} of executions
-that no single-program verifier can express. Identifying which of a
-host's invariants fall outside the verifier, and where each is
-discharged instead, is the substance of hosting eBPF behind an
-existing library ABI.
+Bringing eBPF to distributed systems poses a challenge that kernel
+eBPF does not face. Kernel hooks are local, e.g. each CPU handles its own
+packets, its own syscalls, so a verifier that checks one execution at
+a time is enough. Distributed systems like NCCL are different: all
+ranks must select the same algorithm, or the collective hangs. A
+verifier still sees one execution; it cannot check that replicas
+agree. Our insight is simple: same code on same inputs yields same
+outputs. \sysname{} closes the gap by checking that policies read only
+inputs shared across replicas.
 
 \sysname provides three properties: (1)~load-time static
 verification guarantees safety before execution, preventing crashes
