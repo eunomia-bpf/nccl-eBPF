@@ -1,7 +1,7 @@
 % nbpf: Verified, Composable Policy Execution for GPU Collective Communication
 % Target: eBPF Workshop @ SOSP 2026 (up to 6 pages + refs, ACM sigplan, double-blind)
 
-\documentclass[sigplan,10pt,anonymous]{acmart}
+\documentclass[sigplan,10pt]{acmart}
 
 \usepackage{booktabs}
 \usepackage{subcaption}
@@ -108,7 +108,22 @@
 
 \begin{document}
 
+\acmYear{2026}\copyrightyear{2026}
+\acmConference[eBPF '26]{4th Workshop on eBPF and Kernel Extensions}{September 29--October 2, 2026}{Prague, Czech Republic}
+\acmBooktitle{4th Workshop on eBPF and Kernel Extensions (eBPF '26), September 29--October 2, 2026, Prague, Czech Republic}
+\acmDOI{10.1145/3837779.3838156}
+\acmISBN{979-8-4007-2911-9/26/09}
+
 \title{\sysname: Verified, Composable Policy Execution\\for GPU Collective Communication}
+
+\author{Yusheng Zheng}
+\affiliation{
+  \institution{University of California, Santa Cruz}
+  \city{Santa Cruz}
+  \state{CA}
+  \country{USA}
+}
+\email{yzhen165@ucsc.edu}
 
 % ============================================================================
 % ABSTRACT
@@ -320,13 +335,16 @@ bugs, analogous to the Linux kernel's eBPF model.
 \begin{figure*}[t]
   \centering
   \input{figures/architecture}
-  \caption{\sysname architecture. Policy programs are verified via
-  PREVAIL, JIT-compiled by bpftime, and execute inside the NCCL
-  process. Profiler and tuner communicate through shared typed eBPF
-  maps. The entire system loads as standard NCCL plugins.}
-  \Description{Architecture diagram showing NCCL Core, Tuner and
-  Profiler adapters, bpftime runtime with verifier/JIT/maps/helpers,
-  and eBPF policy programs communicating through shared maps.}
+  \caption{\sysname architecture. Policies attach to an unmodified NCCL
+  Core through its plugin ABI (dashed) and enter only via the verifier
+  and JIT, which serve load and hot-reload. The profiler writes latency
+  into shared maps the tuner reads.}
+  \Description{Architecture diagram. NCCL Core on the left exchanges
+  metadata, decisions, and events with tuner and profiler eBPF policies
+  across the NCCL plugin ABI. The policies run inside the bpftime
+  runtime and communicate through shared typed eBPF maps. Policy object
+  files enter from outside the process through a verifier and JIT
+  gate.}
   \label{fig:architecture}
 \end{figure*}
 
@@ -714,7 +732,10 @@ evaluation uses 8~GPUs on a single node with NVLink, and multi-node
 experiments with InfiniBand and larger rank counts are needed to
 validate the approach at production scale. A higher-level policy
 DSL compiled to BPF would lower the barrier for ML engineers who
-are not familiar with eBPF programming.
+are not familiar with eBPF programming. Beyond algorithm tuning,
+policies that enforce multi-tenant bandwidth fairness or trigger
+fallback collectives upon detecting node failures are natural
+extensions enabled by the closed-loop model.
 
 The eBPF-for-extensions pattern may generalize beyond NCCL.
 AMD's RCCL~\cite{rccl} exposes a similar plugin architecture,
