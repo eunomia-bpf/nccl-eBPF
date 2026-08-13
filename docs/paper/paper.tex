@@ -368,7 +368,7 @@ dereference; omitting one causes load-time rejection.
 \begin{lstlisting}[language=C, caption={Profiler-to-tuner closed loop.
   The profiler (top) writes latency into a shared eBPF map;
   the tuner (bottom) reads it for adaptive channel selection.
-  Null checks (lines 5, 14) are enforced by the verifier.},
+  Null checks (lines 7, 18) are enforced by the verifier.},
   label={lst:policy}, basicstyle=\ttfamily\scriptsize]
 /* --- profiler eBPF program --- */
 SEC("profiler")
@@ -404,7 +404,7 @@ int size_aware_adaptive(struct policy_context *ctx) {
 The two programs share \texttt{latency\_map} via the eBPF map
 subsystem, a capability absent from NCCL's native plugin
 architecture, where tuner and profiler have no shared state.
-Null checks on map lookups (lines~5 and~14) are enforced by the
+Null checks on map lookups (lines~7 and~18) are enforced by the
 verifier; omitting either causes load-time rejection.
 
 % ============================================================================
