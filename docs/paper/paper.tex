@@ -166,9 +166,9 @@ performance degradation. NCCL's own inspector
 plugin has caused production training crashes due to use-after-free
 and deadlock bugs~\cite{nccl-inspector-bug}, and profiler plugins
 have triggered segfaults on multi-GPU
-nodes~\cite{nccl-profiler-bug}. Moreover, NCCL plugins lack
+nodes~\cite{nccl-profiler-bug}. Moreover, NCCL plugins lack general
 structured state-sharing capabilities, making closed-loop policy
-adjustments across plugins impossible. Updating plugin logic
+adjustments across plugins ad hoc. Updating plugin logic
 requires restarting affected jobs, resulting in disruptive downtime
 and hindering rapid policy iteration in production environments.
 
@@ -189,7 +189,7 @@ interface, without modifying NCCL source code.
 \sysname provides three properties: (1)~load-time static
 verification guarantees safety before execution, preventing crashes
 and state corruption; (2)~structured, typed maps enable composable,
-cross-plugin state sharing, enabling previously impossible
+cross-plugin state sharing, enabling
 closed-loop adaptations; and (3)~atomic policy hot-reload
 capability allows operators to update policies seamlessly at
 runtime without interruption.
@@ -207,20 +207,20 @@ selection in the 4--128\,MiB range.
 This paper makes three contributions:
 
 \begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
-\item \textbf{\sysname}, the first framework to bring verified,
+\item \textbf{\sysname}, a framework that brings verified,
 composable eBPF policy execution to NCCL's plugin architecture,
 transparently enhancing safety and extensibility without modifying
 NCCL source code
 (\S\ref{sec:design}--\ref{sec:impl}).
 
 \item A structured, typed-map-based composability mechanism
-enabling previously isolated NCCL plugins to coordinate and
+enabling independently deployed NCCL plugins to coordinate and
 dynamically adapt, facilitating closed-loop policy control
 (\S\ref{sec:design}, \S\ref{sec:eval-composability}).
 
 \item An evaluation on 8$\times$ NVIDIA B300 NVLink GPUs
-demonstrating low overhead (80--130\ns per decision), verified
-runtime safety (rejecting all unsafe plugins tested), and a
+demonstrating low overhead (80--130\ns per decision),
+runtime safety (rejecting all unsafe plugins tested) through verifier, and a
 message-size-aware policy that improves AllReduce throughput by
 up to 27\% (\S\ref{sec:eval}).
 \end{enumerate}
@@ -246,8 +246,8 @@ The tuner API has evolved rapidly, from v2 (simple integer outputs)
 to v5 (in-place 2D float cost table modification) in two
 years, and major cloud providers ship custom tuner
 plugins~\cite{autoccl}. Despite this growing ecosystem, plugins
-remain independent extension points with no cross-plugin
-communication and no safety verification.
+remain independent extension points with no general cross-plugin
+state sharing and no safety verification.
 
 \paragraph{The safety gap.}
 Native plugins execute with full process privileges.
@@ -675,7 +675,7 @@ to~2; upon recovery, it ramps back to~12 within 100{,}000 calls.
 This three-phase response (baseline$\to$contention$\to$recovery)
 validates \sysname's composability model: two independently
 deployed eBPF programs cooperate through shared typed maps, a
-capability absent from NCCL's native plugin architecture.
+general shared-state path NCCL's native plugin APIs do not expose.
 
 \paragraph{Net plugin extensibility.}
 We implement an eBPF-wrapped net plugin that interposes on
