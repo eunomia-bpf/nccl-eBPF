@@ -130,7 +130,7 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. Bringing eBPF to distributed systems like NCCL is challenging since a verifier sees one program in one execution, but distributed deployments require replica consistency. In NCCL, all ranks must select the same algorithm, and a mismatch hangs the collective. \sysname{} ensures distributed consistency by checking that policies read only inputs shared across replicas, offers load-time static verification to prevent unsafe plugin execution, provides structured cross-plugin maps enabling composable policies and closed-loop adaptation, and enables atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
+NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. Bringing eBPF to distributed systems like NCCL is challenging since a verifier sees one program in one execution, but distributed deployments require consistency. In NCCL, all ranks must select the same algorithm, and a mismatch hangs the collective. \sysname{} ensures distributed consistency by checking that policies read only inputs shared across replicas, offers load-time static verification to prevent unsafe plugin execution, provides structured cross-plugin maps enabling composable policies and closed-loop adaptation, and enables atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
 \end{abstract}
 
 \maketitle
@@ -192,7 +192,7 @@ eBPF does not face. Kernel hooks are local, e.g. each CPU handles its own
 packets, its own syscalls, so a verifier that checks one execution at
 a time is enough. Distributed systems like NCCL are different because all
 ranks must select the same algorithm, or the collective hangs. A
-verifier still sees one execution, and it cannot check replica
+verifier still sees one execution, and it cannot check distributed
 consistency. Our insight is simple: same code on same inputs yields same
 outputs. \sysname{} closes the gap by checking that policies read only
 inputs shared across replicas.
@@ -296,24 +296,6 @@ hot-reload.
 % ============================================================================
 \section{Design}
 \label{sec:design}
-
-\subsection{Where Invariants Are Discharged}
-\label{sec:invariants}
-
-A verifier proves properties of one program on one execution. Several
-of the invariants NCCL depends on are neither, and each must therefore
-be discharged somewhere else. Some are \emph{runtime-valued}: the cost
-table's dimensions and a communicator's channel limit are known only
-at call time, so they are enforced by the trusted host rather than
-proved statically. One is \emph{semantic}: cells marked unavailable
-must not be overwritten, or NCCL selects a combination it cannot
-execute. And one is \emph{distributed}: the ranks of a communicator
-must be consistent, or the collective hangs. The verifier's guarantees are
-fixed; what they are worth on a given host is set by how the
-remaining invariants are discharged, whether by a trusted shim, by the host's
-own re-validation, or by restricting policies to a class that
-satisfies them by construction. The tensions below follow from this
-division of labor.
 
 \subsection{Design Tensions}
 
@@ -434,6 +416,22 @@ subsystem, a capability absent from NCCL's native plugin
 architecture, where tuner and profiler have no shared state.
 Null checks on map lookups (lines~7 and~18) are enforced by the
 verifier; omitting either causes load-time rejection.
+
+
+\subsection{Verification Boundaries}
+\label{sec:invariants}
+
+A verifier proves properties of one program on one execution, but
+NCCL depends on invariants that span multiple executions or are known
+only at runtime. Some are runtime-valued: the cost table's dimensions
+and a communicator's channel limit are known only at call time, so the
+trusted host validates policy outputs before passing them to NCCL.
+One is semantic: cells marked unavailable must not be overwritten, or
+NCCL selects a combination it cannot execute. And one is distributed:
+all ranks must select the same algorithm, or the collective hangs.
+\sysname{} ensures this last invariant via static taint analysis at
+load time, rejecting policies that depend on rank-local state.
+
 
 % ============================================================================
 % 4. IMPLEMENTATION
@@ -776,15 +774,15 @@ same across replicas. \sysname{} enforces this by checking that policies
 read only shared inputs, and the same rule applies wherever eBPF replicas
 must behave identically.
 
-Naive closed-loop adaptation breaks this rule because a policy that reads
-rank-local telemetry can choose different algorithms on different ranks,
-deadlocking the collective. The fix is to analyze the policy's computation
-graph and ensure it depends only on globally consistent inputs. At load
-time, the host can track which inputs flow into the output decision. If
-the graph depends only on rank-invariant inputs (message size, collective
-type), consistency is guaranteed. If the graph depends on rank-local
-telemetry, the host can either reject the policy or require that telemetry
-be replicated before the policy runs.
+\sysname{} uses static taint analysis at load time to track which inputs
+flow into the output decision, rejecting policies that depend on rank-local
+state. This approach generalizes to any distributed eBPF deployment. If
+the policy depends only on globally inputs, distributed consistency
+is guaranteed. If it depends on rank-local telemetry, the host can either
+reject the policy or require that telemetry be replicated first. A richer
+approach would build a full distributed computation graph, enabling
+automatic consistency repair (e.g., inserting replication where needed)
+rather than simple rejection.
 
 \paragraph{Portability.}
 AMD's RCCL~\cite{rccl} exposes a similar plugin architecture,
