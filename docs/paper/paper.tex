@@ -1,4 +1,4 @@
-% nbpf: Verified, Composable Policy Execution for GPU Collective Communication
+% NCCLbpf: Verified, Composable Policy Execution for GPU Collective Communication
 % Target: eBPF Workshop @ SOSP 2026 (up to 6 pages + refs, ACM sigplan, double-blind)
 
 \documentclass[sigplan,10pt]{acmart}
@@ -85,7 +85,7 @@
   },
 }
 
-\newcommand{\sysname}{nbpf\xspace}
+\newcommand{\sysname}{NCCLbpf\xspace}
 \newcommand{\us}{\,\textmu{}s\xspace}
 \newcommand{\ns}{\,ns\xspace}
 
@@ -129,7 +129,7 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. \sysname{} offers load-time static verification to prevent unsafe plugin execution, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range.
+NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. \sysname{} offers load-time static verification to prevent unsafe plugin execution, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
 \end{abstract}
 
 \maketitle
@@ -335,10 +335,12 @@ bugs, analogous to the Linux kernel's eBPF model.
 \begin{figure*}[t]
   \centering
   \input{figures/architecture}
-  \caption{\sysname architecture. Policies attach to an unmodified NCCL
-  Core through its plugin ABI (dashed) and enter only via the verifier
-  and JIT, which serve load and hot-reload. The profiler writes latency
-  into shared maps the tuner reads.}
+  \caption{\sysname architecture. The plugin host loads policies
+  in-process, where policies attach to an unmodified
+  NCCL through its plugin ABI (dashed) and enter via the
+  verifier and JIT for load and hot-reload. The host, runtime
+   are trusted, the policies are not. The profiler
+  writes latency into shared maps the tuner reads.}
   \Description{Architecture diagram. NCCL Core on the left exchanges
   metadata, decisions, and events with tuner and profiler eBPF policies
   across the NCCL plugin ABI. The policies run inside the bpftime
@@ -767,8 +769,8 @@ zero NCCL modifications.
 % ACKNOWLEDGMENTS
 % ============================================================================
 \begin{acks}
-We thank Verda for providing the 8$\times$~NVIDIA~B300 NVLink
-compute infrastructure used in this work.
+We thank \textbf{Verda} for helpful discussions and for providing the
+8$\times$~NVIDIA~B300 NVLink compute infrastructure used in this work.
 \end{acks}
 
 % ============================================================================
