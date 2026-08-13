@@ -19,7 +19,7 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 +------------------+     bpftime (LLVM JIT + verifier)
 ```
 
-**Tuner+Profiler Plugin** (`src/nccl-policy-plugin/`) -- Implements NCCL's Tuner v5 and Profiler v6 interfaces in a single shared library. On each `getCollInfo` call, it executes an eBPF policy program that receives a context (message size, collective type, rank count, profiler-fed telemetry) and returns a packed action (algorithm, protocol, channel count). The profiler adapter writes runtime latency data into shared eBPF maps, closing the telemetry loop.
+**Tuner+Profiler Plugin** (`src/nccl-policy-plugin/`) -- Implements NCCL's Tuner v5 and Profiler v6 interfaces in a single shared library. On each `getCollInfo` call, it executes an eBPF policy program that receives a context (message size, collective type, rank count, profiler-fed telemetry) and returns a packed action (algorithm, protocol, channel count). The profiler adapter can execute a separate eBPF program that writes runtime latency data into the tuner program's communicator-scoped telemetry map, closing the telemetry loop.
 
 **Net Plugin** (`src/nccl-net-ebpf-plugin/`) -- Wraps NCCL's built-in Socket transport (Net v11 interface). Executes eBPF hooks on init, listen, connect, accept, isend, irecv, and finalize events. Designed for transport-layer observability and policy enforcement.
 
@@ -106,6 +106,8 @@ mpirun -np 2 nccl-tests/build/all_reduce_perf_mpi -b 128M -e 128M -g 1
 | `NCCL_TUNER_PLUGIN` | Path to `libnccl-policy.so` |
 | `NCCL_POLICY_BPF_PATH` | Path to the eBPF policy `.bpf.o` file to load |
 | `NCCL_POLICY_VERIFY_MODE` | Verifier behavior: `strict` (default, reject unsafe), `warning` (log but allow), `none` (skip verification) |
+| `NCCL_POLICY_PROFILER_MODE` | Telemetry writer: `native` (default) or `ebpf` |
+| `NCCL_POLICY_PROFILER_BPF_PATH` | Path to `profiler_latency.bpf.o`; required when profiler mode is `ebpf` |
 
 ### Net Plugin
 

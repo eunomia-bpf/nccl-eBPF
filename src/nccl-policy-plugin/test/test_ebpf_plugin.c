@@ -461,6 +461,9 @@ static int open_plugin_session_for_comm(struct plugin_session *session,
   if (setenv("NCCL_POLICY_VERIFY_MODE", policy->verify_mode, 1) != 0)
     return failf("setenv failed for NCCL_POLICY_VERIFY_MODE: %s",
                  strerror(errno));
+  if (setenv("NCCL_POLICY_PROFILER_MODE", "native", 1) != 0)
+    return failf("setenv failed for NCCL_POLICY_PROFILER_MODE: %s",
+                 strerror(errno));
 
   session->handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
   if (!session->handle)
@@ -513,13 +516,22 @@ static int open_mixed_plugin_session_for_comm(struct plugin_session *session,
                                               const struct policy_case *policy,
                                               uint64_t comm_id,
                                               size_t n_ranks, size_t n_nodes,
-                                              int rank) {
+                                              int rank,
+                                              const char *profiler_mode) {
   if (open_plugin_session_for_comm(session, plugin_path, policy, comm_id,
                                    n_ranks, n_nodes) != 0)
     return -1;
   if (!session->profiler) {
     close_plugin_session(session);
     return failf("dlsym failed for ncclProfiler_v6: %s", dlerror());
+  }
+  if (setenv("NCCL_POLICY_PROFILER_MODE", profiler_mode, 1) != 0 ||
+      (strcmp(profiler_mode, "ebpf") == 0 &&
+       setenv("NCCL_POLICY_PROFILER_BPF_PATH",
+              NCCL_POLICY_TEST_PROFILER_LATENCY_BPF_PATH, 1) != 0)) {
+    close_plugin_session(session);
+    return failf("failed to configure %s profiler mode: %s", profiler_mode,
+                 strerror(errno));
   }
   if (session->profiler->init(&session->profiler_context, comm_id,
                               &session->profiler_activation_mask, "test-comm",
@@ -534,9 +546,11 @@ static int open_mixed_plugin_session_for_comm(struct plugin_session *session,
 static int open_mixed_plugin_session(struct plugin_session *session,
                                      const char *plugin_path,
                                      const struct policy_case *policy,
-                                     size_t n_ranks, size_t n_nodes, int rank) {
+                                     size_t n_ranks, size_t n_nodes, int rank,
+                                     const char *profiler_mode) {
   return open_mixed_plugin_session_for_comm(session, plugin_path, policy, 0,
-                                            n_ranks, n_nodes, rank);
+                                            n_ranks, n_nodes, rank,
+                                            profiler_mode);
 }
 
 static void close_plugin_session(struct plugin_session *session) {
@@ -1090,7 +1104,90 @@ static int test_adaptive_channels_map_state(const char *plugin_path) {
   return 0;
 }
 
-static int test_profiler_telemetry_bridge(const char *plugin_path) {
+static int test_telemetry_survives_hot_reload(const char *plugin_path) {
+  const struct policy_case policy = {
+      "adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
+      "strict"};
+  const struct nccl_policy_telemetry_key key = {
+      .coll_type = NCCL_POLICY_COLL_ALLREDUCE,
+      .n_nodes = 1,
+  };
+  const struct nccl_policy_telemetry_value seeded = {
+      .last_latency_ns = 240,
+      .avg_latency_ns = 240,
+      .p99_latency_ns = 320,
+      .last_n_bytes = 4096,
+      .samples = 5,
+      .recommended_channels = 7,
+      .applied_samples = 0,
+      .observed_channels = 2,
+  };
+  struct plugin_session session;
+  const struct nccl_policy_telemetry_value *observed = NULL;
+  struct decision_result decision = {-1, -1, -1};
+  int original_fd = -1;
+  int noop_fd = -1;
+  int reloaded_fd = -1;
+
+  if (open_plugin_session(&session, plugin_path, &policy, 8, 1) != 0)
+    return -1;
+  if (!session.debug_get_map_fd || !session.debug_reload_policy ||
+      !session.map_update_elem || !session.map_lookup_elem) {
+    close_plugin_session(&session);
+    return failf("hot-reload map persistence requires debug map helpers");
+  }
+
+  original_fd =
+      session.debug_get_map_fd(session.plugin_context, "telemetry_map");
+  if (original_fd < 0 ||
+      seed_telemetry_map(&session, original_fd, &key, &seeded) != 0) {
+    close_plugin_session(&session);
+    return failf("failed to seed telemetry before hot reload");
+  }
+  if (session.debug_reload_policy(session.plugin_context,
+                                  NCCL_POLICY_TEST_NOOP_BPF_PATH, NULL) != 0) {
+    close_plugin_session(&session);
+    return failf("failed to hot-reload noop for map persistence test");
+  }
+  noop_fd = session.debug_get_map_fd(session.plugin_context, "telemetry_map");
+  observed = lookup_telemetry_map(&session, noop_fd, &key);
+  if (noop_fd != original_fd || !observed || observed->samples != seeded.samples ||
+      observed->recommended_channels != seeded.recommended_channels) {
+    close_plugin_session(&session);
+    return failf("telemetry state changed while a mapless policy was active");
+  }
+
+  if (session.debug_reload_policy(
+          session.plugin_context, NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
+          NULL) != 0) {
+    close_plugin_session(&session);
+    return failf("failed to reload adaptive policy for map persistence test");
+  }
+  reloaded_fd =
+      session.debug_get_map_fd(session.plugin_context, "telemetry_map");
+  observed = lookup_telemetry_map(&session, reloaded_fd, &key);
+  if (reloaded_fd != original_fd || !observed ||
+      observed->last_latency_ns != seeded.last_latency_ns ||
+      observed->samples != seeded.samples ||
+      observed->recommended_channels != seeded.recommended_channels) {
+    close_plugin_session(&session);
+    return failf("reloaded policy did not rejoin the communicator telemetry map");
+  }
+  if (run_policy_once(&session, ncclFuncAllReduce, 65536, 1, 0, 1,
+                      &decision) != 0 ||
+      decision.channels != 7) {
+    close_plugin_session(&session);
+    return failf("reloaded tuner did not consume preserved telemetry");
+  }
+
+  close_plugin_session(&session);
+  printf("telemetry hot-reload persistence: PASS (fd=%d samples=%u)\n",
+         original_fd, seeded.samples);
+  return 0;
+}
+
+static int test_profiler_telemetry_bridge_mode(const char *plugin_path,
+                                               const char *profiler_mode) {
   const struct policy_case policy = {
       "adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
       "strict"};
@@ -1106,8 +1203,10 @@ static int test_profiler_telemetry_bridge(const char *plugin_path) {
   uint64_t observed_avg_latency_ns = 0;
   uint32_t observed_samples = 0;
   uint32_t observed_channels = 0;
+  uint32_t observed_profiler_channels = 0;
 
-  if (open_mixed_plugin_session(&session, plugin_path, &policy, 2, 1, 0) != 0)
+  if (open_mixed_plugin_session(&session, plugin_path, &policy, 2, 1, 0,
+                                profiler_mode) != 0)
     return -1;
 
   if (!session.debug_get_map_fd || !session.map_lookup_elem) {
@@ -1145,15 +1244,17 @@ static int test_profiler_telemetry_bridge(const char *plugin_path) {
     observed_avg_latency_ns = observed->avg_latency_ns;
     observed_samples = observed->samples;
     observed_channels = observed->recommended_channels;
+    observed_profiler_channels = observed->observed_channels;
   }
   if (!observed || observed->last_latency_ns != 520 ||
       observed->avg_latency_ns != 520 || observed->samples != 1 ||
-      observed->recommended_channels != 8) {
+      observed->recommended_channels != 8 || observed->observed_channels != 2) {
     close_plugin_session(&session);
     return failf("profiler bridge first sample mismatch: last=%" PRIu64
-                 " avg=%" PRIu64 " samples=%u channels=%u",
+                 " avg=%" PRIu64 " samples=%u recommended=%u observed=%u",
                  observed_last_latency_ns, observed_avg_latency_ns,
-                 observed_samples, observed_channels);
+                 observed_samples, observed_channels,
+                 observed_profiler_channels);
   }
 
   if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 8,
@@ -1180,13 +1281,15 @@ static int test_profiler_telemetry_bridge(const char *plugin_path) {
     observed_last_latency_ns = observed->last_latency_ns;
     observed_samples = observed->samples;
     observed_channels = observed->recommended_channels;
+    observed_profiler_channels = observed->observed_channels;
   }
   if (!observed || observed->last_latency_ns != 920 || observed->samples != 2 ||
-      observed->recommended_channels != 9) {
+      observed->recommended_channels != 9 || observed->observed_channels != 2) {
     close_plugin_session(&session);
     return failf("profiler bridge second sample mismatch: last=%" PRIu64
-                 " samples=%u channels=%u",
-                 observed_last_latency_ns, observed_samples, observed_channels);
+                 " samples=%u recommended=%u observed=%u",
+                 observed_last_latency_ns, observed_samples, observed_channels,
+                 observed_profiler_channels);
   }
 
   if (run_policy_once(&session, ncclFuncAllReduce, 1u << 20, 1, 0, 9,
@@ -1203,8 +1306,14 @@ static int test_profiler_telemetry_bridge(const char *plugin_path) {
   }
 
   close_plugin_session(&session);
-  printf("profiler telemetry bridge: PASS\n");
+  printf("profiler telemetry bridge (%s): PASS\n", profiler_mode);
   return 0;
+}
+
+static int test_profiler_telemetry_bridge(const char *plugin_path) {
+  if (test_profiler_telemetry_bridge_mode(plugin_path, "native") != 0)
+    return -1;
+  return test_profiler_telemetry_bridge_mode(plugin_path, "ebpf");
 }
 
 static int test_multi_communicator_differentiation(const char *plugin_path) {
@@ -1854,6 +1963,8 @@ int main(int argc, char **argv) {
        "valid", 1},
       {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
        "strict", "valid", 1},
+      {"profiler_latency", NCCL_POLICY_TEST_PROFILER_LATENCY_BPF_PATH,
+       "strict", "valid", 1},
       {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict",
        "valid", 1},
       {"bad_lookup", NCCL_POLICY_TEST_BAD_LOOKUP_BPF_PATH, "strict",
@@ -1905,6 +2016,11 @@ int main(int argc, char **argv) {
   }
 
   if (test_adaptive_channels_map_state(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_telemetry_survives_hot_reload(plugin_path) != 0) {
     free(samples);
     return 1;
   }

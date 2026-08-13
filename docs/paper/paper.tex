@@ -130,7 +130,7 @@
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. \sysname{} offers load-time static verification to prevent unsafe plugin execution, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
+NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, we introduce \sysname{}, a verified, high-performance extension framework embedding a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. Bring eBPF to NCCL can be challenging: NCCL requires all ranks to select the same algorithm: a mismatch hangs the collective, yet the eBPF verifier sees one program in one execution. \sysname{} offers load-time static verification to prevent unsafe plugin execution, making replicats and ensures distributed agreement by restricting policies to rank-invariant inputs, structured cross-plugin maps enabling composable policies and closed-loop adaptation, and atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes just 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware eBPF policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
 \end{abstract}
 
 \maketitle
@@ -186,6 +186,16 @@ behavior. Inspired by eBPF's verified extensibility model, we
 present \sysname, which integrates a verified, userspace eBPF
 runtime~\cite{bpftime} directly within NCCL's existing plugin
 interface, without modifying NCCL source code.
+
+The analogy is not exact, however, and where it breaks is where the
+work lies. A verifier discharges obligations about one program on one
+execution, but several of NCCL's invariants are neither. NCCL requires
+that all ranks of a communicator agree on the algorithm they select,
+or the collective hangs---a property over a \emph{set} of executions
+that no single-program verifier can express. Identifying which of a
+host's invariants fall outside the verifier, and where each is
+discharged instead, is the substance of hosting eBPF behind an
+existing library ABI.
 
 \sysname provides three properties: (1)~load-time static
 verification guarantees safety before execution, preventing crashes
@@ -287,6 +297,24 @@ hot-reload.
 % ============================================================================
 \section{Design}
 \label{sec:design}
+
+\subsection{Where Invariants Are Discharged}
+\label{sec:invariants}
+
+A verifier proves properties of one program on one execution. Several
+of the invariants NCCL depends on are neither, and each must therefore
+be discharged somewhere else. Some are \emph{runtime-valued}: the cost
+table's dimensions and a communicator's channel limit are known only
+at call time, so they are enforced by the trusted host rather than
+proved statically. One is \emph{semantic}: cells marked unavailable
+must not be overwritten, or NCCL selects a combination it cannot
+execute. And one is \emph{distributed}: the ranks of a communicator
+must agree, or the collective hangs. The verifier's guarantees are
+fixed; what they are worth on a given host is set by how the
+remaining invariants are discharged---by a trusted shim, by the host's
+own re-validation, or by restricting policies to a class that
+satisfies them by construction. The tensions below follow from this
+division of labor.
 
 \subsection{Design Tensions}
 
@@ -740,7 +768,27 @@ policies that enforce multi-tenant bandwidth fairness or trigger
 fallback collectives upon detecting node failures are natural
 extensions enabled by the closed-loop model.
 
+\paragraph{Rank agreement as a load-time check.}
+Of the invariants in \S\ref{sec:invariants}, the distributed one is
+the most interesting because it is the one no verifier can express---and
+yet it is statically checkable in a useful special case. Identical
+bytecode guarantees identical output only when a policy is a
+deterministic function of rank-invariant inputs. A load-time check on
+input provenance---rejecting policies whose output depends on
+rank-local telemetry---would therefore make agreement hold by
+construction rather than, as for the policies evaluated here, by
+accident. Such a rule is host-specific: kernel eBPF hooks are CPU-local
+and carry no agreement obligation, which is why the problem has no
+counterpart there. It also conflicts with closed-loop adaptation, which
+is telemetry-fed by definition; admitting only telemetry that is itself
+replicated across ranks would reconcile the two. We have not
+implemented this check, and leave it open.
+
 The eBPF-for-extensions pattern may generalize beyond NCCL.
+More generally, eBPF is increasingly deployed as replicas across a
+fleet, where identical bytecode is relied on to give identical
+behavior; that reliance is sound only while policy inputs are
+replica-invariant.
 AMD's RCCL~\cite{rccl} exposes a similar plugin architecture,
 suggesting that a cross-vendor port may be feasible. Other
 libraries with native-code extension points (MPI implementations,

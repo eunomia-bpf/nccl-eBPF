@@ -66,6 +66,24 @@ enum class VerifyMode {
   kNone,
 };
 
+struct BpftimeMapShape {
+  uint32_t type = 0;
+  uint32_t key_size = 0;
+  uint32_t value_size = 0;
+  uint32_t max_entries = 0;
+  uint32_t flags = 0;
+};
+
+struct SharedBpftimeMap {
+  ~SharedBpftimeMap() {
+    if (fd >= 0)
+      bpftime_close(fd);
+  }
+
+  int fd = -1;
+  BpftimeMapShape shape;
+};
+
 struct SharedCommState {
   ncclDebugLogger_t log_function = nullptr;
   uint64_t comm_id = 0;
@@ -73,15 +91,14 @@ struct SharedCommState {
   size_t n_nodes = 0;
   std::mutex reload_mu;
   std::mutex profiler_mu;
+  std::mutex telemetry_mu;
   size_t tuner_refs = 0;
   size_t profiler_refs = 0;
   uint64_t profiler_write_count = 0;
   struct LoadedPolicyState {
     ~LoadedPolicyState() {
-      for (const auto &entry : map_fds) {
-        if (entry.second >= 0)
-          bpftime_close(entry.second);
-      }
+      for (int fd : owned_map_fds)
+        bpftime_close(fd);
     }
 
     std::unique_ptr<bpftime::bpftime_prog> prog;
@@ -89,10 +106,14 @@ struct SharedCommState {
     std::string policy_source = "hardcoded-noop";
     std::string section_name = "uprobe";
     std::unordered_map<std::string, int> map_fds;
+    std::unordered_set<int> owned_map_fds;
+    std::vector<std::shared_ptr<SharedBpftimeMap>> shared_maps;
     std::map<int, bpftime::verifier::BpftimeMapDescriptor> verifier_maps;
     mutable std::mutex exec_mu;
   };
   std::shared_ptr<LoadedPolicyState> active_policy;
+  std::shared_ptr<LoadedPolicyState> active_profiler;
+  std::shared_ptr<SharedBpftimeMap> telemetry_map;
   struct CollectiveEvent;
   struct CeCollectiveEvent;
   std::unordered_set<CollectiveEvent *> open_collectives;
@@ -120,6 +141,7 @@ struct ProfilerContext {
   std::string comm_name;
   int rank = -1;
   int activation_mask = 0;
+  bool use_ebpf = false;
 };
 
 struct SharedCommState::CollectiveEvent {
@@ -127,7 +149,9 @@ struct SharedCommState::CollectiveEvent {
   SharedCommState *shared = nullptr;
   uint32_t coll_type = 0;
   size_t n_bytes = 0;
+  uint32_t channel_count = 0;
   int rank = -1;
+  bool use_ebpf = false;
   uint64_t start_ns = 0;
   uint64_t host_stop_ns = 0;
   uint64_t max_kernel_latency_ns = 0;
@@ -152,6 +176,7 @@ struct SharedCommState::CeCollectiveEvent {
   uint32_t coll_type = 0;
   size_t n_bytes = 0;
   int rank = -1;
+  bool use_ebpf = false;
   cudaStream_t stream = nullptr;
   cudaEvent_t start_event = nullptr;
   cudaEvent_t stop_event = nullptr;
@@ -443,6 +468,37 @@ std::shared_ptr<SharedCommState::LoadedPolicyState> exchange_active_policy(
       std::memory_order_acq_rel);
 }
 
+std::shared_ptr<SharedCommState::LoadedPolicyState>
+load_active_profiler(SharedCommState *shared) {
+  return std::atomic_load_explicit(&shared->active_profiler,
+                                   std::memory_order_acquire);
+}
+
+void store_active_profiler(
+    SharedCommState *shared,
+    std::shared_ptr<SharedCommState::LoadedPolicyState> profiler_state) {
+  std::atomic_store_explicit(&shared->active_profiler,
+                             std::move(profiler_state),
+                             std::memory_order_release);
+}
+
+BpftimeMapShape map_shape(const bpftime::bpf_map_attr &attr) {
+  return BpftimeMapShape{
+      .type = static_cast<uint32_t>(attr.type),
+      .key_size = attr.key_size,
+      .value_size = attr.value_size,
+      .max_entries = attr.max_ents,
+      .flags = static_cast<uint32_t>(attr.flags),
+  };
+}
+
+bool compatible_map_shape(const BpftimeMapShape &left,
+                          const BpftimeMapShape &right) {
+  return left.type == right.type && left.key_size == right.key_size &&
+         left.value_size == right.value_size &&
+         left.max_entries == right.max_entries && left.flags == right.flags;
+}
+
 bool create_bpftime_maps(SharedCommState *shared,
                          SharedCommState::LoadedPolicyState *policy_state,
                          struct bpf_object *obj) {
@@ -473,14 +529,60 @@ bool create_bpftime_maps(SharedCommState *shared,
     attr.btf_value_type_id = bpf_map__btf_value_type_id(map);
     attr.map_extra = bpf_map__map_extra(map);
 
-    fd = bpftime_maps_create(-1, runtime_name.c_str(), attr);
-    if (fd < 0) {
-      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
-                         NCCL_LOG_WARN,
-                         "failed to create bpftime map %s (runtime=%s)",
-                         logical_name ? logical_name : "unnamed_map",
-                         runtime_name.c_str());
-      return false;
+    if (logical_name && strcmp(logical_name, "telemetry_map") == 0) {
+      const BpftimeMapShape requested_shape = map_shape(attr);
+
+      if (!shared) {
+        log_plugin_message(nullptr, NCCL_TUNING, NCCL_LOG_WARN,
+                           "telemetry_map requires communicator state");
+        return false;
+      }
+      std::lock_guard<std::mutex> telemetry_lock(shared->telemetry_mu);
+      if (shared->telemetry_map) {
+        if (!compatible_map_shape(shared->telemetry_map->shape,
+                                  requested_shape)) {
+          log_plugin_message(
+              shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+              "telemetry_map ABI mismatch for %s: expected key=%u value=%u "
+              "entries=%u, got key=%u value=%u entries=%u",
+              policy_state->policy_source.c_str(),
+              shared->telemetry_map->shape.key_size,
+              shared->telemetry_map->shape.value_size,
+              shared->telemetry_map->shape.max_entries,
+              requested_shape.key_size, requested_shape.value_size,
+              requested_shape.max_entries);
+          return false;
+        }
+      } else {
+        auto shared_map = std::make_shared<SharedBpftimeMap>();
+        const std::string shared_runtime_name =
+            "comm_" + std::to_string(shared->comm_id) + "_telemetry_map";
+
+        shared_map->fd =
+            bpftime_maps_create(-1, shared_runtime_name.c_str(), attr);
+        if (shared_map->fd < 0) {
+          log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                             "failed to create shared bpftime map %s",
+                             shared_runtime_name.c_str());
+          return false;
+        }
+        shared_map->shape = requested_shape;
+        shared->telemetry_map = std::move(shared_map);
+      }
+
+      fd = shared->telemetry_map->fd;
+      policy_state->shared_maps.push_back(shared->telemetry_map);
+    } else {
+      fd = bpftime_maps_create(-1, runtime_name.c_str(), attr);
+      if (fd < 0) {
+        log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                           NCCL_LOG_WARN,
+                           "failed to create bpftime map %s (runtime=%s)",
+                           logical_name ? logical_name : "unnamed_map",
+                           runtime_name.c_str());
+        return false;
+      }
+      policy_state->owned_map_fds.insert(fd);
     }
     policy_state->map_fds.emplace(logical_name ? logical_name : "", fd);
     policy_state->verifier_maps.emplace(
@@ -605,6 +707,14 @@ int register_kernel_user_map(SharedCommState *shared,
   auto existing_it = policy_state->map_fds.find(logical_name);
   if (existing_it != policy_state->map_fds.end()) {
     int old_fd = existing_it->second;
+    if (policy_state->owned_map_fds.erase(old_fd) == 0) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "cannot replace communicator-owned map %s with a "
+                         "kernel-user map",
+                         logical_name.c_str());
+      return -1;
+    }
     policy_state->verifier_maps.erase(old_fd);
     bpftime_close(old_fd);
     policy_state->map_fds.erase(existing_it);
@@ -620,6 +730,7 @@ int register_kernel_user_map(SharedCommState *shared,
   }
 
   policy_state->map_fds.emplace(logical_name, fd);
+  policy_state->owned_map_fds.insert(fd);
   policy_state->verifier_maps.emplace(
       fd, bpftime::verifier::BpftimeMapDescriptor{
               .original_fd = fd,
@@ -1064,7 +1175,8 @@ bool warmup_program(SharedCommState *shared,
 }
 
 std::shared_ptr<SharedCommState::LoadedPolicyState>
-load_policy_state(SharedCommState *shared, const char *policy_path) {
+load_policy_state(SharedCommState *shared, const char *policy_path,
+                  bool run_warmup = true) {
   auto policy_state = std::make_shared<SharedCommState::LoadedPolicyState>();
   bool loaded = false;
 
@@ -1074,7 +1186,7 @@ load_policy_state(SharedCommState *shared, const char *policy_path) {
     loaded = load_hardcoded_program(shared, policy_state.get());
   }
   if (!loaded || !policy_state->prog ||
-      !warmup_program(shared, policy_state.get())) {
+      (run_warmup && !warmup_program(shared, policy_state.get()))) {
     return nullptr;
   }
   return policy_state;
@@ -1094,6 +1206,29 @@ bool ensure_policy_loaded(SharedCommState *shared, const char *policy_path) {
   if (!policy_state)
     return false;
   store_active_policy(shared, std::move(policy_state));
+  return true;
+}
+
+bool ensure_profiler_loaded(SharedCommState *shared, const char *profiler_path) {
+  if (!shared || !profiler_path || profiler_path[0] == '\0')
+    return false;
+  if (load_active_profiler(shared))
+    return true;
+
+  std::lock_guard<std::mutex> lock(shared->reload_mu);
+  if (load_active_profiler(shared))
+    return true;
+
+  auto profiler_state = load_policy_state(shared, profiler_path, false);
+  if (!profiler_state)
+    return false;
+  if (profiler_state->section_name.rfind("profiler", 0) != 0) {
+    log_plugin_message(shared->log_function, NCCL_PROFILE, NCCL_LOG_WARN,
+                       "profiler program %s uses section %s, expected profiler",
+                       profiler_path, profiler_state->section_name.c_str());
+    return false;
+  }
+  store_active_profiler(shared, std::move(profiler_state));
   return true;
 }
 
@@ -1176,7 +1311,7 @@ int get_map_fd(const SharedCommState::LoadedPolicyState *policy_state,
 
 bool lookup_telemetry_snapshot(SharedCommState *shared, uint32_t coll_type,
                                nccl_policy_telemetry_value *value) {
-  auto policy_state = load_active_policy(shared);
+  auto policy_state = shared ? load_active_policy(shared) : nullptr;
   const nccl_policy_telemetry_value *current = nullptr;
   const nccl_policy_telemetry_key key = {
       .coll_type = coll_type,
@@ -1185,10 +1320,10 @@ bool lookup_telemetry_snapshot(SharedCommState *shared, uint32_t coll_type,
   int map_fd = policy_state ? get_map_fd(policy_state.get(), "telemetry_map")
                             : -1;
 
-  if (!shared || !value || !policy_state || map_fd < 0)
+  if (!shared || !value || map_fd < 0)
     return false;
 
-  std::lock_guard<std::mutex> lock(policy_state->exec_mu);
+  std::lock_guard<std::mutex> lock(shared->telemetry_mu);
   current = reinterpret_cast<const nccl_policy_telemetry_value *>(
       bpftime_map_lookup_elem(map_fd, &key));
   if (!current)
@@ -1198,23 +1333,24 @@ bool lookup_telemetry_snapshot(SharedCommState *shared, uint32_t coll_type,
 }
 
 bool record_real_telemetry(SharedCommState *shared, uint32_t coll_type,
-                           size_t n_bytes, uint64_t latency_ns, int rank,
-                           const char *source_tag) {
-  auto policy_state = load_active_policy(shared);
+                           size_t n_bytes, uint64_t latency_ns,
+                           uint32_t channel_count, uint32_t *sample_count) {
   nccl_policy_telemetry_value next = {};
   const nccl_policy_telemetry_value *current = nullptr;
   const nccl_policy_telemetry_key key = {
       .coll_type = coll_type,
       .n_nodes = static_cast<uint32_t>(shared ? shared->n_nodes : 0),
   };
-  int map_fd = policy_state ? get_map_fd(policy_state.get(), "telemetry_map")
-                            : -1;
+  int map_fd = -1;
 
-  if (!shared || !policy_state || map_fd < 0 || latency_ns == 0)
+  if (!shared || latency_ns == 0)
     return false;
 
   {
-    std::lock_guard<std::mutex> lock(policy_state->exec_mu);
+    std::lock_guard<std::mutex> lock(shared->telemetry_mu);
+    map_fd = shared->telemetry_map ? shared->telemetry_map->fd : -1;
+    if (map_fd < 0)
+      return false;
     current = reinterpret_cast<const nccl_policy_telemetry_value *>(
         bpftime_map_lookup_elem(map_fd, &key));
     if (current)
@@ -1228,19 +1364,91 @@ bool record_real_telemetry(SharedCommState *shared, uint32_t coll_type,
                 : latency_ns;
     next.p99_latency_ns = update_p99_estimate(next.p99_latency_ns, latency_ns);
     next.last_n_bytes = n_bytes;
+    next.observed_channels = channel_count;
     if (next.samples != UINT32_MAX)
       next.samples += 1;
-    bpftime_map_update_elem(map_fd, &key, &next, BPF_ANY);
+    if (bpftime_map_update_elem(map_fd, &key, &next, BPF_ANY) != 0)
+      return false;
   }
+
+  if (sample_count)
+    *sample_count = next.samples;
+  return true;
+}
+
+bool record_ebpf_telemetry(SharedCommState *shared, uint32_t coll_type,
+                           size_t n_bytes, uint64_t latency_ns,
+                           uint32_t channel_count, uint32_t *sample_count) {
+  auto profiler_state = shared ? load_active_profiler(shared) : nullptr;
+  struct nccl_profiler_ctx profiler_ctx = {};
+  const nccl_policy_telemetry_value *current = nullptr;
+  const nccl_policy_telemetry_key key = {
+      .coll_type = coll_type,
+      .n_nodes = static_cast<uint32_t>(shared ? shared->n_nodes : 0),
+  };
+  uint64_t result = 0;
+  int err = 0;
+
+  if (!shared || !profiler_state || !profiler_state->prog ||
+      !shared->telemetry_map || latency_ns == 0)
+    return false;
+
+  profiler_ctx.n_bytes = n_bytes;
+  profiler_ctx.latency_ns = latency_ns;
+  profiler_ctx.coll_type = coll_type;
+  profiler_ctx.n_nodes = static_cast<uint32_t>(shared->n_nodes);
+  profiler_ctx.channel_count = channel_count;
+
+  {
+    std::lock_guard<std::mutex> lock(shared->telemetry_mu);
+    err = profiler_state->prog->bpftime_prog_exec(
+        &profiler_ctx, sizeof(profiler_ctx), &result);
+    if (err >= 0 && sample_count) {
+      current = reinterpret_cast<const nccl_policy_telemetry_value *>(
+          bpftime_map_lookup_elem(shared->telemetry_map->fd, &key));
+      if (current)
+        *sample_count = current->samples;
+    }
+  }
+
+  return err >= 0;
+}
+
+bool record_profiler_telemetry(SharedCommState *shared, uint32_t coll_type,
+                               size_t n_bytes, uint64_t latency_ns,
+                               uint32_t channel_count, bool use_ebpf, int rank,
+                               const char *source_tag) {
+  uint32_t sample_count = 0;
+  bool recorded = false;
+  bool recorded_by_ebpf = false;
+
+  if (use_ebpf) {
+    recorded = record_ebpf_telemetry(shared, coll_type, n_bytes, latency_ns,
+                                     channel_count, &sample_count);
+    recorded_by_ebpf = recorded;
+    if (!recorded) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_PROFILE,
+                         NCCL_LOG_WARN,
+                         "PROFILER/Plugin: eBPF telemetry execution failed; "
+                         "falling back to native update");
+    }
+  }
+  if (!recorded) {
+    recorded = record_real_telemetry(shared, coll_type, n_bytes, latency_ns,
+                                     channel_count, &sample_count);
+  }
+  if (!recorded)
+    return false;
 
   shared->profiler_write_count++;
   if (shared->profiler_write_count <= 8 ||
       shared->profiler_write_count % 1000 == 0) {
     log_plugin_message(shared->log_function, NCCL_PROFILE, NCCL_LOG_INFO,
-                       "PROFILER/Plugin: %s rank=%d coll=%u bytes=%zu "
-                       "latency_ns=%" PRIu64 " samples=%u",
-                       source_tag ? source_tag : "telemetry", rank, coll_type,
-                       n_bytes, latency_ns, next.samples);
+                       "PROFILER/Plugin: %s/%s rank=%d coll=%u bytes=%zu "
+                       "latency_ns=%" PRIu64 " channels=%u samples=%u",
+                       source_tag ? source_tag : "telemetry",
+                       recorded_by_ebpf ? "ebpf" : "native", rank, coll_type,
+                       n_bytes, latency_ns, channel_count, sample_count);
   }
   return true;
 }
@@ -1270,8 +1478,9 @@ void maybe_finalize_collective(SharedCommState::CollectiveEvent *event,
                  : 0);
   shared->open_collectives.erase(event);
   if (latency_ns != 0) {
-    (void)record_real_telemetry(shared, event->coll_type, event->n_bytes,
-                                latency_ns, event->rank, "kernel");
+    (void)record_profiler_telemetry(
+        shared, event->coll_type, event->n_bytes, latency_ns,
+        event->channel_count, event->use_ebpf, event->rank, "kernel");
   }
   delete event;
 }
@@ -1328,8 +1537,9 @@ void drain_completed_ce_events(SharedCommState *shared, bool synchronize) {
       latency_ns = event->host_stop_ns - event->start_ns;
     }
     if (latency_ns != 0) {
-      (void)record_real_telemetry(shared, event->coll_type, event->n_bytes,
-                                  latency_ns, event->rank, "ce");
+      (void)record_profiler_telemetry(shared, event->coll_type, event->n_bytes,
+                                      latency_ns, 0, event->use_ebpf,
+                                      event->rank, "ce");
     }
     destroy_ce_event(event);
   }
@@ -1468,9 +1678,15 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
 
   {
     const uint64_t start_ns = monotonic_time_ns();
-    std::lock_guard<std::mutex> exec_lock(policy_state->exec_mu);
-    err = policy_state->prog->bpftime_prog_exec(&policy_ctx, sizeof(policy_ctx),
-                                                &action);
+    if (get_map_fd(policy_state.get(), "telemetry_map") >= 0) {
+      std::lock_guard<std::mutex> lock(ctx->shared->telemetry_mu);
+      err = policy_state->prog->bpftime_prog_exec(
+          &policy_ctx, sizeof(policy_ctx), &action);
+    } else {
+      std::lock_guard<std::mutex> lock(policy_state->exec_mu);
+      err = policy_state->prog->bpftime_prog_exec(
+          &policy_ctx, sizeof(policy_ctx), &action);
+    }
     exec_latency_ns = monotonic_time_ns() - start_ns;
   }
 
@@ -1612,6 +1828,8 @@ ncclResult_t profilerInitImpl(void **context, uint64_t comm_id,
                               int n_nodes, int nranks, int rank,
                               ncclDebugLogger_t log_function) {
   auto *ctx = new (std::nothrow) ProfilerContext();
+  const char *profiler_mode = getenv("NCCL_POLICY_PROFILER_MODE");
+  const bool use_ebpf = profiler_mode && strcmp(profiler_mode, "ebpf") == 0;
 
   if (!ctx)
     return ncclSystemError;
@@ -1622,10 +1840,29 @@ ncclResult_t profilerInitImpl(void **context, uint64_t comm_id,
                                           log_function, false);
   ctx->comm_name = comm_name ? comm_name : "";
   ctx->rank = rank;
+  ctx->use_ebpf = use_ebpf;
   ctx->activation_mask = ncclProfileColl | ncclProfileKernelCh |
                          ncclProfileCeColl;
 
   if (!ensure_policy_loaded(ctx->shared.get(), getenv("NCCL_POLICY_BPF_PATH"))) {
+    release_shared_comm_state(ctx->shared, false);
+    delete ctx;
+    release_bpftime_runtime();
+    return ncclInternalError;
+  }
+
+  if (profiler_mode && profiler_mode[0] != '\0' && !use_ebpf &&
+      strcmp(profiler_mode, "native") != 0) {
+    log_plugin_message(ctx->shared->log_function, NCCL_PROFILE, NCCL_LOG_WARN,
+                       "unknown NCCL_POLICY_PROFILER_MODE=%s; using native",
+                       profiler_mode);
+  }
+  if (use_ebpf &&
+      !ensure_profiler_loaded(ctx->shared.get(),
+                              getenv("NCCL_POLICY_PROFILER_BPF_PATH"))) {
+    log_plugin_message(ctx->shared->log_function, NCCL_PROFILE, NCCL_LOG_WARN,
+                       "eBPF profiler mode requires a valid "
+                       "NCCL_POLICY_PROFILER_BPF_PATH");
     release_shared_comm_state(ctx->shared, false);
     delete ctx;
     release_bpftime_runtime();
@@ -1638,8 +1875,9 @@ ncclResult_t profilerInitImpl(void **context, uint64_t comm_id,
   log_plugin_message(
       ctx->shared->log_function, NCCL_PROFILE, NCCL_LOG_INFO,
       "PROFILER/Plugin: init commName=%s commHash=%" PRIu64 " nranks=%d "
-      "rank=%d mask=0x%x",
-      ctx->comm_name.c_str(), comm_id, nranks, rank, ctx->activation_mask);
+      "rank=%d mask=0x%x telemetry=%s",
+      ctx->comm_name.c_str(), comm_id, nranks, rank, ctx->activation_mask,
+      use_ebpf ? "ebpf" : "native");
   *context = ctx;
   return ncclSuccess;
 }
@@ -1673,7 +1911,12 @@ ncclResult_t profilerStartEventImpl(void *context, void **e_handle,
     coll_event->shared = ctx->shared.get();
     coll_event->coll_type = coll_type;
     coll_event->n_bytes = n_bytes;
+    coll_event->channel_count =
+        e_descr->coll.nChannels > 0
+            ? static_cast<uint32_t>(e_descr->coll.nChannels)
+            : 0;
     coll_event->rank = e_descr->rank;
+    coll_event->use_ebpf = ctx->use_ebpf;
     coll_event->start_ns = monotonic_time_ns();
     coll_event->expected_kernel_events = e_descr->coll.nChannels;
     {
@@ -1716,6 +1959,7 @@ ncclResult_t profilerStartEventImpl(void *context, void **e_handle,
     ce_event->coll_type = coll_type;
     ce_event->n_bytes = n_bytes;
     ce_event->rank = e_descr->rank;
+    ce_event->use_ebpf = ctx->use_ebpf;
     ce_event->stream = reinterpret_cast<cudaStream_t>(e_descr->ceColl.stream);
     ce_event->start_ns = monotonic_time_ns();
     if (cudaEventCreate(&ce_event->start_event) != cudaSuccess ||
@@ -1773,10 +2017,11 @@ ncclResult_t profilerStopEventImpl(void *e_handle) {
       drain_completed_ce_events(event->shared, false);
     } else {
       if (event->host_stop_ns > event->start_ns) {
-        (void)record_real_telemetry(event->shared, event->coll_type,
-                                    event->n_bytes,
-                                    event->host_stop_ns - event->start_ns,
-                                    event->rank, "ce-fallback");
+        (void)record_profiler_telemetry(
+            event->shared, event->coll_type, event->n_bytes,
+            event->host_stop_ns - event->start_ns, 0, event->use_ebpf,
+            event->rank,
+            "ce-fallback");
       }
       destroy_ce_event(event);
     }
@@ -1921,6 +2166,10 @@ int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name) {
 
   if (!ctx || !policy_state || !map_name)
     return -1;
+  if (strcmp(map_name, "telemetry_map") == 0) {
+    std::lock_guard<std::mutex> lock(ctx->shared->telemetry_mu);
+    return ctx->shared->telemetry_map ? ctx->shared->telemetry_map->fd : -1;
+  }
   map_it = policy_state->map_fds.find(map_name);
   if (map_it == policy_state->map_fds.end())
     return -1;

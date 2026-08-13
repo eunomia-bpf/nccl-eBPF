@@ -111,6 +111,8 @@ add_policy_object(lookup_only_policy lookup_only LOOKUP_ONLY_BPF_O)
 add_policy_object(lookup_update_policy lookup_update LOOKUP_UPDATE_BPF_O)
 add_policy_object(adaptive_channels_policy adaptive_channels
                   ADAPTIVE_CHANNELS_BPF_O)
+add_policy_object(profiler_latency_policy profiler_latency
+                  PROFILER_LATENCY_BPF_O)
 add_policy_object(slo_enforcer_policy slo_enforcer SLO_ENFORCER_BPF_O)
 add_policy_object(bad_lookup_policy bad_lookup BAD_LOOKUP_BPF_O)
 add_policy_object(bad_oob_access_policy bad_oob_access BAD_OOB_ACCESS_BPF_O)
@@ -131,6 +133,7 @@ set(POLICY_OBJECTS
     ${LOOKUP_ONLY_BPF_O}
     ${LOOKUP_UPDATE_BPF_O}
     ${ADAPTIVE_CHANNELS_BPF_O}
+    ${PROFILER_LATENCY_BPF_O}
     ${SLO_ENFORCER_BPF_O}
     ${BAD_LOOKUP_BPF_O}
     ${BAD_OOB_ACCESS_BPF_O}

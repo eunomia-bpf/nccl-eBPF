@@ -15,9 +15,9 @@ Combined NCCL Tuner v5 and Profiler v6 plugin that executes eBPF policy programs
 
 3. The eBPF program returns a packed 64-bit action word encoding: algorithm (RING/TREE), protocol (LL/LL128/SIMPLE), channel count, and aggressiveness. The plugin unpacks this and applies the requested overrides to NCCL's cost table.
 
-4. The Profiler v6 adapter captures collective start/stop events and writes latency measurements into shared eBPF maps, making telemetry available to the policy on subsequent calls.
+4. The Profiler v6 adapter captures collective start/stop events. In `ebpf` mode it passes the measurement to a separately verified and JIT-compiled `SEC("profiler")` program; in `native` mode it uses the original C++ writer. Both update the same communicator-scoped `telemetry_map`, making telemetry available to the tuner policy on subsequent calls.
 
-5. Hot-reload: the plugin supports swapping the active eBPF program at runtime (via `ncclPolicyPluginDebugReloadPolicy`) without stopping NCCL.
+5. Hot-reload: the plugin supports swapping the active tuner eBPF program at runtime (via `ncclPolicyPluginDebugReloadPolicy`) without stopping NCCL. The shared telemetry map is owned by the communicator, so its state survives tuner reloads.
 
 ## Build
 
@@ -40,6 +40,8 @@ Produces:
 | `NCCL_TUNER_PLUGIN` | Set to the path of `libnccl-policy.so` to activate |
 | `NCCL_POLICY_BPF_PATH` | Path to the `.bpf.o` policy file to load |
 | `NCCL_POLICY_VERIFY_MODE` | `strict` (default): reject unsafe programs; `warning`: log and allow; `none`: skip verification |
+| `NCCL_POLICY_PROFILER_MODE` | `native` (default) or `ebpf` telemetry updates |
+| `NCCL_POLICY_PROFILER_BPF_PATH` | Path to `profiler_latency.bpf.o`; required in `ebpf` mode |
 
 ## Exported Symbols
 

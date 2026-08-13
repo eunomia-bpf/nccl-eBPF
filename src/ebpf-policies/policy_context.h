@@ -31,4 +31,15 @@ struct nccl_policy_ctx {
   uint32_t reserved;
 };
 
+/* Profiler input ABI. The host populates this after measuring a collective and
+ * invokes a separately loaded SEC("profiler") program. */
+struct nccl_profiler_ctx {
+  uint64_t n_bytes;
+  uint64_t latency_ns;
+  uint32_t coll_type;
+  uint32_t n_nodes;
+  uint32_t channel_count;
+  uint32_t reserved;
+};
+
 #endif
