@@ -127,10 +127,39 @@
 \email{yzhen165@ucsc.edu}
 
 % ============================================================================
+% CCS CODES AND KEYWORDS
+% ============================================================================
+\begin{CCSXML}
+<ccs2012>
+<concept>
+<concept_id>10011007.10011006.10011008.10011009.10011012</concept_id>
+<concept_desc>Software and its engineering~Runtime environments</concept_desc>
+<concept_significance>500</concept_significance>
+</concept>
+<concept>
+<concept_id>10010520.10010521.10010537.10010540</concept_id>
+<concept_desc>Computer systems organization~Peer-to-peer architectures</concept_desc>
+<concept_significance>300</concept_significance>
+</concept>
+<concept>
+<concept_id>10011007.10011074.10011099.10011102.10011103</concept_id>
+<concept_desc>Software and its engineering~Software verification and validation</concept_desc>
+<concept_significance>500</concept_significance>
+</concept>
+</ccs2012>
+\end{CCSXML}
+
+\ccsdesc[500]{Software and its engineering~Runtime environments}
+\ccsdesc[300]{Computer systems organization~Peer-to-peer architectures}
+\ccsdesc[500]{Software and its engineering~Software verification and validation}
+
+\keywords{eBPF, GPU, collective communication, NCCL, verification, distributed systems}
+
+% ============================================================================
 % ABSTRACT
 % ============================================================================
 \begin{abstract}
-NCCL is the de facto standard for collective GPU communication in large-scale distributed training, relying heavily on plugins to customize runtime behavior. However, these plugins execute as unverified native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, \sysname{} is a verified, high-performance extension framework that embeds a userspace eBPF runtime directly into NCCL's existing plugin interfaces, without modifying NCCL itself. Bringing eBPF to distributed systems like NCCL is challenging since a verifier sees one program in one execution, but distributed deployments require consistency. In NCCL, all ranks must select the same algorithm, and a mismatch hangs the collective. \sysname{} ensures distributed consistency by checking that policies read only inputs shared across replicas, offers load-time static verification to prevent unsafe plugin execution, provides structured cross-plugin maps enabling composable policies and closed-loop adaptation, and enables atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations on 8$\times$ NVIDIA B300 GPUs connected via NVLink demonstrate that \sysname{} imposes 80--130\ns overhead per tuner decision (less than 0.03\% of collective latency), prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
+NCCL is the de facto standard for collective GPU communication in large-scale training, relying on plugins to customize runtime behavior. However, these plugins execute as native code within NCCL's address space, risking job crashes, silent state corruption, and downtime from restarts during policy updates. Inspired by kernel extensibility models, this paper proposes \sysname{}, an extension framework for NCCL with eBPF. Bringing eBPF to distributed systems like NCCL is challenging since a verifier sees one program in one execution, but distributed deployments require consistency. In NCCL, all ranks must select the same algorithm, and a mismatch hangs the collective. \sysname{} ensures distributed consistency by checking that policies read only inputs shared across replicas, offers load-time static verification to prevent unsafe plugin execution, provides structured cross-plugin maps enabling composable policies and closed-loop adaptation, and enables atomic policy hot-reloads eliminating downtime previously required for policy updates. Evaluations demonstrate that \sysname{} imposes 80--130\ns overhead per tuner decision, prevents all tested unsafe plugin behaviors at load-time, and enables a message-size-aware policy that improves AllReduce throughput by up to 27\% over NCCL's default in the 4--128\,MiB range. \sysname{} is available at \url{https://github.com/eunomia-bpf/nccl-eBPF}.
 \end{abstract}
 
 \maketitle
