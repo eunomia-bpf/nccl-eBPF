@@ -102,8 +102,9 @@
 }
 
 % SOSP 2026 formatting requirements
-\renewcommand\footnotetextcopyrightpermission[1]{}
-\settopmatter{printfolios=true,printccs=false,printacmref=false}
+% ACM camera-ready: copyright notice must appear (do not suppress it),
+% and page numbers must be off.
+\settopmatter{printfolios=false,printccs=false,printacmref=false}
 \pagestyle{plain}
 
 \begin{document}
