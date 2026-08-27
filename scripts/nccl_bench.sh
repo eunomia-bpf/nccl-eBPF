@@ -76,7 +76,6 @@ apply_arm() {
     local spec
 
     reset_arm_environment
-    ARM_KIND="$arm"
     ARM_POLICY=""
     ARM_ALGO=""
     ARM_PROTO=""
@@ -85,7 +84,6 @@ apply_arm() {
         baseline)
             ;;
         noop|policy:*)
-            ARM_KIND=policy
             ARM_POLICY="${arm#policy:}"
             [[ "$arm" == noop ]] && ARM_POLICY=noop
             if [[ ! "$ARM_POLICY" =~ ^[A-Za-z0-9_.-]+$ ]]; then
@@ -101,7 +99,6 @@ apply_arm() {
             fi
             ;;
         algo:*)
-            ARM_KIND=envforce
             spec="${arm#algo:}"
             ARM_ALGO="${spec%%/*}"
             if [[ "$spec" == */* ]]; then

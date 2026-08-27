@@ -31,7 +31,7 @@ export NCCL_PROTO=Simple
 export NCCL_MAX_NCHANNELS=99
 export NCCL_BENCH_SOURCE_ONLY=1
 export PLUGIN_DIR="$TEST_TMP_DIR"
-# shellcheck source=nccl_bench.sh
+# shellcheck disable=SC1091
 source "$TEST_SCRIPT_DIR/nccl_bench.sh"
 
 apply_arm baseline
@@ -40,14 +40,14 @@ assert_unset NCCL_TUNER_PLUGIN NCCL_POLICY_BPF_PATH NCCL_POLICY_VERIFY_MODE \
     NCCL_POLICY_PROFILER_BPF_PATH NCCL_ALGO NCCL_PROTO NCCL_MAX_NCHANNELS
 [[ "$LD_LIBRARY_PATH" == /original/lib ]] || fail "baseline did not restore LD_LIBRARY_PATH"
 
-NCCL_LIB_DIR=/alternate/lib
+export NCCL_LIB_DIR=/alternate/lib
 apply_arm algo:Ring/LL128
 [[ "$NCCL_ALGO" == Ring ]] || fail "algorithm arm was not applied"
 [[ "$NCCL_PROTO" == LL128 ]] || fail "protocol arm was not applied"
 [[ "$LD_LIBRARY_PATH" == /alternate/lib:/original/lib ]] ||
     fail "alternate library path was not prepended exactly once"
 
-NCCL_LIB_DIR=""
+export NCCL_LIB_DIR=""
 apply_arm baseline
 assert_unset NCCL_ALGO NCCL_PROTO
 [[ "$LD_LIBRARY_PATH" == /original/lib ]] || fail "arm state leaked into baseline"
