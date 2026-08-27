@@ -1,7 +1,11 @@
 #ifndef NCCL_NET_EBPF_CTX_H_
 #define NCCL_NET_EBPF_CTX_H_
 
+#ifdef __BPF__
+#include "../ebpf-policies/bpf_compat.h"
+#else
 #include <stdint.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

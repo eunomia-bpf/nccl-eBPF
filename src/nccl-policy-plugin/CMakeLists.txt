@@ -2,19 +2,23 @@ cmake_minimum_required(VERSION 3.20)
 
 project(nccl_policy_plugin LANGUAGES C CXX)
 
+include(CTest)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(CUDAToolkit REQUIRED)
-find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h REQUIRED)
-find_path(LIBELF_INCLUDE_DIR NAMES gelf.h REQUIRED)
-find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-15 llvm-config REQUIRED)
-
 set(BPFTIME_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../bpftime)
 set(BPFTIME_BUILD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../build-bpftime CACHE PATH
     "Path to the prebuilt bpftime build directory")
+
+find_package(CUDAToolkit REQUIRED)
+find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h
+          PATHS ${BPFTIME_BUILD_DIR}/libbpf
+          NO_DEFAULT_PATH REQUIRED)
+find_path(LIBELF_INCLUDE_DIR NAMES gelf.h REQUIRED)
+find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-15 llvm-config REQUIRED)
 
 function(require_file file_path)
   if(NOT EXISTS "${file_path}")
@@ -237,3 +241,8 @@ target_link_libraries(test_native_crash PRIVATE
     dl
     rt)
 set_target_properties(test_native_crash PROPERTIES LINKER_LANGUAGE CXX)
+
+if(BUILD_TESTING)
+  add_test(NAME nccl_policy_ebpf_plugin COMMAND test_ebpf_plugin)
+  add_test(NAME nccl_policy_native_crash COMMAND test_native_crash)
+endif()
