@@ -29,6 +29,14 @@ struct nccl_policy_ctx {
   uint32_t n_nodes;
   uint32_t current_channels;
   uint32_t reserved;
+  /* NVL topology supplied by the NCCL tuner v5 initialization ABI. These
+   * fields are zero when the caller does not provide topology information.
+   * Keep new fields appended so policies built against the original prefix
+   * retain the same offsets. */
+  uint32_t n_nvl_domains;
+  uint32_t min_ranks_per_nvl_domain;
+  uint32_t max_ranks_per_nvl_domain;
+  uint32_t reserved2;
 };
 
 /* Profiler input ABI. The host populates this after measuring a collective and

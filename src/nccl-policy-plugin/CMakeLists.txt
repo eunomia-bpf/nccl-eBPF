@@ -125,6 +125,18 @@ add_policy_object(bad_infinite_loop_policy bad_infinite_loop
 add_policy_object(bad_write_ctx_policy bad_write_ctx BAD_WRITE_CTX_BPF_O)
 add_policy_object(bad_div_zero_policy bad_div_zero BAD_DIV_ZERO_BPF_O)
 add_policy_object(cpu_aware_policy cpu_aware CPU_AWARE_BPF_O)
+add_policy_object(size_aware_v3_policy size_aware_v3 SIZE_AWARE_V3_BPF_O)
+add_policy_object(size_aware_v4_policy size_aware_v4 SIZE_AWARE_V4_BPF_O)
+add_policy_object(size_aware_v5_policy size_aware_v5 SIZE_AWARE_V5_BPF_O)
+add_policy_object(ring_simple_all_policy ring_simple_all RING_SIMPLE_ALL_BPF_O)
+add_policy_object(nvlink_ring_mid_policy nvlink_ring_mid NVLINK_RING_MID_BPF_O)
+add_policy_object(nvlink_ring_mid_v2_policy nvlink_ring_mid_v2
+                  NVLINK_RING_MID_V2_BPF_O)
+add_policy_object(bad_channels_policy bad_channels BAD_CHANNELS_BPF_O)
+add_policy_object(adaptive_channels_v2_policy adaptive_channels_v2
+                  ADAPTIVE_CHANNELS_V2_BPF_O)
+add_policy_object(nvl72_size_aware_policy nvl72_size_aware
+                  NVL72_SIZE_AWARE_BPF_O)
 
 set(POLICY_OBJECTS
     ${NOOP_BPF_O}
@@ -142,7 +154,16 @@ set(POLICY_OBJECTS
     ${BAD_INFINITE_LOOP_BPF_O}
     ${BAD_WRITE_CTX_BPF_O}
     ${BAD_DIV_ZERO_BPF_O}
-    ${CPU_AWARE_BPF_O})
+    ${CPU_AWARE_BPF_O}
+    ${SIZE_AWARE_V3_BPF_O}
+    ${SIZE_AWARE_V4_BPF_O}
+    ${SIZE_AWARE_V5_BPF_O}
+    ${RING_SIMPLE_ALL_BPF_O}
+    ${NVLINK_RING_MID_BPF_O}
+    ${NVLINK_RING_MID_V2_BPF_O}
+    ${BAD_CHANNELS_BPF_O}
+    ${ADAPTIVE_CHANNELS_V2_BPF_O}
+    ${NVL72_SIZE_AWARE_BPF_O})
 
 add_custom_target(ebpf_policies ALL DEPENDS ${POLICY_OBJECTS})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in

@@ -449,11 +449,10 @@ static void decode_action(uint64_t action, struct decision_result *decision) {
   decision->proto = (int)nccl_policy_action_proto(action);
 }
 
-static int open_plugin_session_for_comm(struct plugin_session *session,
-                                        const char *plugin_path,
-                                        const struct policy_case *policy,
-                                        uint64_t comm_id, size_t n_ranks,
-                                        size_t n_nodes) {
+static int open_plugin_session_for_comm_with_nvl(
+    struct plugin_session *session, const char *plugin_path,
+    const struct policy_case *policy, uint64_t comm_id, size_t n_ranks,
+    size_t n_nodes, ncclNvlDomainInfo_v5_t *nvl_domain_info) {
   memset(session, 0, sizeof(*session));
 
   if (setenv("NCCL_POLICY_BPF_PATH", policy->path, 1) != 0)
@@ -480,7 +479,7 @@ static int open_plugin_session_for_comm(struct plugin_session *session,
 
   if (session->plugin->init(&session->plugin_context, comm_id, n_ranks,
                             n_nodes,
-                            no_op_logger, NULL, NULL) != ncclSuccess) {
+                            no_op_logger, nvl_domain_info, NULL) != ncclSuccess) {
     dlclose(session->handle);
     memset(session, 0, sizeof(*session));
     return failf("plugin init failed for %s (verify=%s)", policy->name,
@@ -501,6 +500,15 @@ static int open_plugin_session_for_comm(struct plugin_session *session,
   session->map_lookup_elem = (bpftime_map_lookup_elem_fn)dlsym(
       session->handle, "bpftime_map_lookup_elem");
   return 0;
+}
+
+static int open_plugin_session_for_comm(struct plugin_session *session,
+                                        const char *plugin_path,
+                                        const struct policy_case *policy,
+                                        uint64_t comm_id, size_t n_ranks,
+                                        size_t n_nodes) {
+  return open_plugin_session_for_comm_with_nvl(
+      session, plugin_path, policy, comm_id, n_ranks, n_nodes, NULL);
 }
 
 static int open_plugin_session(struct plugin_session *session,
@@ -892,6 +900,80 @@ static int test_size_aware_policies(const char *plugin_path) {
 
   close_plugin_session(&session);
   printf("size_aware correctness: PASS\n");
+  return 0;
+}
+
+static int test_nvl72_size_aware_policy(const char *plugin_path) {
+  const struct policy_case policy = {
+      "nvl72_size_aware", NCCL_POLICY_TEST_NVL72_SIZE_AWARE_BPF_PATH,
+      "strict"};
+  struct nvl_case {
+    const char *label;
+    size_t n_ranks;
+    int n_domains;
+    int min_ranks;
+    int max_ranks;
+    ncclFunc_t coll_type;
+    size_t n_bytes;
+    int provide_nvl_info;
+    int expected_algo;
+    int expected_proto;
+  } cases[] = {
+      {"r3", 3, 1, 3, 3, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r4-window-low", 4, 1, 4, 4, ncclFuncAllReduce, 4u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r4-window-high", 4, 1, 4, 4, ncclFuncAllReduce, 32u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r4-below-window", 4, 1, 4, 4, ncclFuncAllReduce, (4u << 20) - 1, 1,
+       -1, -1},
+      {"r4-above-window", 4, 1, 4, 4, ncclFuncAllReduce, (32u << 20) + 1, 1,
+       -1, -1},
+      {"r5", 5, 1, 5, 5, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r7", 7, 1, 7, 7, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r8-ll128", 8, 1, 8, 8, ncclFuncAllReduce, 16u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r8-simple-low", 8, 1, 8, 8, ncclFuncAllReduce, 64u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
+      {"r8-simple-high", 8, 1, 8, 8, ncclFuncAllReduce, 192u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
+      {"r8-gap", 8, 1, 8, 8, ncclFuncAllReduce, 48u << 20, 1, -1, -1},
+      {"r8-above-window", 8, 1, 8, 8, ncclFuncAllReduce,
+       (192u << 20) + 1, 1, -1, -1},
+      {"r9", 9, 1, 9, 9, ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+      {"multiple-domains", 8, 2, 4, 4, ncclFuncAllReduce, 16u << 20, 1, -1,
+       -1},
+      {"non-allreduce", 4, 1, 4, 4, ncclFuncAllGather, 16u << 20, 1, -1,
+       -1},
+      {"nonuniform-domains", 8, 1, 4, 8, ncclFuncAllReduce, 16u << 20, 1,
+       -1, -1},
+      {"null-nvl-info", 4, 0, 0, 0, ncclFuncAllReduce, 16u << 20, 0, -1,
+       -1},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    ncclNvlDomainInfo_v5_t nvl_info = {};
+    struct plugin_session session;
+    struct decision_result decision = {-1, -1, -1};
+    nvl_info.nNvlDomains = cases[i].n_domains;
+    nvl_info.minRanksPerNvlDomain = cases[i].min_ranks;
+    nvl_info.maxRanksPerNvlDomain = cases[i].max_ranks;
+
+    if (open_plugin_session_for_comm_with_nvl(
+            &session, plugin_path, &policy, i + 100, cases[i].n_ranks, 1,
+            cases[i].provide_nvl_info ? &nvl_info : NULL) != 0)
+      return -1;
+    if (run_policy_once(&session, cases[i].coll_type, cases[i].n_bytes, 1, 0,
+                        1, &decision) != 0 ||
+        expect_choice(policy.name, cases[i].label, &decision,
+                      cases[i].expected_algo, cases[i].expected_proto, 0) !=
+            0) {
+      close_plugin_session(&session);
+      return -1;
+    }
+    close_plugin_session(&session);
+  }
+
+  printf("nvl72_size_aware topology propagation: PASS\n");
   return 0;
 }
 
@@ -2011,6 +2093,11 @@ int main(int argc, char **argv) {
   }
 
   if (test_size_aware_policies(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_nvl72_size_aware_policy(plugin_path) != 0) {
     free(samples);
     return 1;
   }

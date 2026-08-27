@@ -128,6 +128,9 @@ struct TunerContext {
   uint64_t last_latency_ns = 0;
   uint64_t rolling_p99_ns = 0;
   int last_channels = 0;
+  uint32_t n_nvl_domains = 0;
+  uint32_t min_ranks_per_nvl_domain = 0;
+  uint32_t max_ranks_per_nvl_domain = 0;
   struct SyntheticTelemetryState {
     bool enabled = false;
     uint64_t last_latency_ns = 0;
@@ -1596,12 +1599,19 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
                             size_t n_nodes, ncclDebugLogger_t log_function,
                             ncclNvlDomainInfo_v5_t *nvl_domain_info,
                             ncclTunerConstants_v5_t *constants) {
-  (void)nvl_domain_info;
   (void)constants;
 
   auto *ctx = new (std::nothrow) TunerContext();
   if (!ctx)
     return ncclSystemError;
+  if (nvl_domain_info) {
+    ctx->n_nvl_domains =
+        static_cast<uint32_t>(nvl_domain_info->nNvlDomains);
+    ctx->min_ranks_per_nvl_domain =
+        static_cast<uint32_t>(nvl_domain_info->minRanksPerNvlDomain);
+    ctx->max_ranks_per_nvl_domain =
+        static_cast<uint32_t>(nvl_domain_info->maxRanksPerNvlDomain);
+  }
 
   acquire_bpftime_runtime();
   ctx->shared =
@@ -1675,6 +1685,9 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_ctx.n_ranks = static_cast<uint32_t>(ctx->shared->n_ranks);
   policy_ctx.n_nodes = static_cast<uint32_t>(ctx->shared->n_nodes);
   policy_ctx.current_channels = static_cast<uint32_t>(current_channels);
+  policy_ctx.n_nvl_domains = ctx->n_nvl_domains;
+  policy_ctx.min_ranks_per_nvl_domain = ctx->min_ranks_per_nvl_domain;
+  policy_ctx.max_ranks_per_nvl_domain = ctx->max_ranks_per_nvl_domain;
 
   {
     const uint64_t start_ns = monotonic_time_ns();
