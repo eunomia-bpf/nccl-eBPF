@@ -11,7 +11,10 @@ static inline uint64_t force(uint32_t algo, uint32_t proto) {
 
 SEC("uprobe")
 uint64_t nvl72_size_aware_policy(struct nccl_policy_ctx *ctx) {
-  if (!ctx || ctx->n_nvl_domains != 1 ||
+  if (!ctx || ctx->reserved < NCCL_POLICY_CTX_ABI_V2_SIZE)
+    return 0;
+
+  if (ctx->n_nvl_domains != 1 ||
       ctx->coll_type != NCCL_POLICY_COLL_ALLREDUCE)
     return 0;
 

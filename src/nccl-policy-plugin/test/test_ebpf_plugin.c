@@ -946,6 +946,16 @@ static int test_nvl72_size_aware_policy(const char *plugin_path) {
        -1},
       {"nonuniform-domains", 8, 1, 4, 8, ncclFuncAllReduce, 16u << 20, 1,
        -1, -1},
+      {"invalid-negative-domain", 4, -1, 4, 4, ncclFuncAllReduce, 16u << 20,
+       1, -1, -1},
+      {"invalid-zero-domain-size", 4, 1, 0, 4, ncclFuncAllReduce, 16u << 20,
+       1, -1, -1},
+      {"invalid-rank-coverage", 8, 3, 2, 2, ncclFuncAllReduce, 16u << 20, 1,
+       -1, -1},
+#if SIZE_MAX > UINT32_MAX
+      {"rank-count-truncation", (size_t)UINT32_MAX + 5, 1, 4, 4,
+       ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+#endif
       {"null-nvl-info", 4, 0, 0, 0, ncclFuncAllReduce, 16u << 20, 0, -1,
        -1},
   };

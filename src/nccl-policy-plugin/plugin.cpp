@@ -139,6 +139,33 @@ struct TunerContext {
   } synthetic_telemetry;
 };
 
+bool snapshot_nvl_domain_info(TunerContext *ctx, size_t n_ranks,
+                              const ncclNvlDomainInfo_v5_t *info) {
+  if (!ctx || !info || n_ranks == 0 || n_ranks > UINT32_MAX)
+    return false;
+
+  const int n_domains = info->nNvlDomains;
+  const int min_ranks = info->minRanksPerNvlDomain;
+  const int max_ranks = info->maxRanksPerNvlDomain;
+  if (n_domains <= 0 || min_ranks <= 0 || max_ranks < min_ranks)
+    return false;
+
+  const uint64_t rank_count = static_cast<uint64_t>(n_ranks);
+  const uint64_t domain_count = static_cast<uint64_t>(n_domains);
+  const uint64_t min_rank_count = static_cast<uint64_t>(min_ranks);
+  const uint64_t max_rank_count = static_cast<uint64_t>(max_ranks);
+  if (domain_count > rank_count || max_rank_count > rank_count ||
+      domain_count * min_rank_count > rank_count ||
+      domain_count * max_rank_count < rank_count) {
+    return false;
+  }
+
+  ctx->n_nvl_domains = static_cast<uint32_t>(n_domains);
+  ctx->min_ranks_per_nvl_domain = static_cast<uint32_t>(min_ranks);
+  ctx->max_ranks_per_nvl_domain = static_cast<uint32_t>(max_ranks);
+  return true;
+}
+
 struct ProfilerContext {
   std::shared_ptr<SharedCommState> shared;
   std::string comm_name;
@@ -1604,14 +1631,7 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
   auto *ctx = new (std::nothrow) TunerContext();
   if (!ctx)
     return ncclSystemError;
-  if (nvl_domain_info) {
-    ctx->n_nvl_domains =
-        static_cast<uint32_t>(nvl_domain_info->nNvlDomains);
-    ctx->min_ranks_per_nvl_domain =
-        static_cast<uint32_t>(nvl_domain_info->minRanksPerNvlDomain);
-    ctx->max_ranks_per_nvl_domain =
-        static_cast<uint32_t>(nvl_domain_info->maxRanksPerNvlDomain);
-  }
+  (void)snapshot_nvl_domain_info(ctx, n_ranks, nvl_domain_info);
 
   acquire_bpftime_runtime();
   ctx->shared =
@@ -1685,6 +1705,7 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_ctx.n_ranks = static_cast<uint32_t>(ctx->shared->n_ranks);
   policy_ctx.n_nodes = static_cast<uint32_t>(ctx->shared->n_nodes);
   policy_ctx.current_channels = static_cast<uint32_t>(current_channels);
+  policy_ctx.reserved = sizeof(policy_ctx);
   policy_ctx.n_nvl_domains = ctx->n_nvl_domains;
   policy_ctx.min_ranks_per_nvl_domain = ctx->min_ranks_per_nvl_domain;
   policy_ctx.max_ranks_per_nvl_domain = ctx->max_ranks_per_nvl_domain;
