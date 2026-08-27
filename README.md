@@ -76,6 +76,21 @@ cmake --build src/nccl-net-ebpf-plugin/build -j$(nproc)
 
 This produces `src/nccl-net-ebpf-plugin/build/libnccl-net-ebpf.so` and compiles `net_trace.bpf.o`.
 
+### 6. Check benchmark arm configuration
+
+`scripts/nccl_bench.sh` provides generic baseline, policy, and environment-forced
+nccl-tests arms without assuming a cluster topology or transport configuration.
+Use `selftest` to inspect the generated command before running it:
+
+```bash
+NPROC=8 HOSTLIST="host-a:4,host-b:4" ARM=policy:nvl72_size_aware \
+  scripts/nccl_bench.sh selftest
+```
+
+The caller must export any topology-, interface-, or transport-specific NCCL
+settings. Run `scripts/test_nccl_bench.sh` for the hardware-free arm isolation
+test.
+
 ## Usage
 
 ### Run with the tuner+profiler plugin

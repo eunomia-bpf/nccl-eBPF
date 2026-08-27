@@ -13,6 +13,7 @@ src/nccl-policy-plugin/build/
 src/nccl-policy-plugin/build-bpftime-migration/
 src/nccl-policy-plugin/build-bpftime-migration-prebuilt/
 src/nccl-net-ebpf-plugin/build/
+scripts/results/
 
 # C/C++ compiled objects and binaries
 *.o
