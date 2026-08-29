@@ -1649,6 +1649,14 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
       ctx->shared->log_function, NCCL_TUNING, NCCL_LOG_INFO,
       "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
       n_nodes, load_active_policy(ctx->shared.get())->policy_source.c_str());
+  const char *mpi_rank = getenv("OMPI_COMM_WORLD_RANK");
+  if (!mpi_rank || mpi_rank[0] == '\0')
+    mpi_rank = getenv("PMIX_RANK");
+  fprintf(stderr,
+          "[nccl-policy-plugin] READY tuner=v5 rank=%s policy=%s\n",
+          mpi_rank && mpi_rank[0] != '\0' ? mpi_rank : "unknown",
+          load_active_policy(ctx->shared.get())->policy_source.c_str());
+  fflush(stderr);
   *context = ctx;
   return ncclSuccess;
 }
@@ -1702,8 +1710,12 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_ctx.coll_type = policy_coll_type;
   policy_ctx.num_pipe_ops = static_cast<uint32_t>(num_pipe_ops);
   policy_ctx.reg_buff = static_cast<uint32_t>(reg_buff);
-  policy_ctx.n_ranks = static_cast<uint32_t>(ctx->shared->n_ranks);
-  policy_ctx.n_nodes = static_cast<uint32_t>(ctx->shared->n_nodes);
+  policy_ctx.n_ranks = ctx->shared->n_ranks <= UINT32_MAX
+                           ? static_cast<uint32_t>(ctx->shared->n_ranks)
+                           : 0;
+  policy_ctx.n_nodes = ctx->shared->n_nodes <= UINT32_MAX
+                           ? static_cast<uint32_t>(ctx->shared->n_nodes)
+                           : 0;
   policy_ctx.current_channels = static_cast<uint32_t>(current_channels);
   policy_ctx.reserved = sizeof(policy_ctx);
   policy_ctx.n_nvl_domains = ctx->n_nvl_domains;
@@ -2191,6 +2203,11 @@ extern int ncclPolicyPluginDebugReloadPolicy(void *context,
 extern int ncclPolicyPluginDebugSetSyntheticTelemetry(
     void *context, const SyntheticTelemetryConfig *config)
     __attribute__((visibility("default")));
+extern int ncclPolicyPluginDebugExecutePolicy(void *context,
+                                               void *policy_context,
+                                               size_t context_size,
+                                               uint64_t *action)
+    __attribute__((visibility("default")));
 
 int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name) {
   auto *ctx = reinterpret_cast<TunerContext *>(context);
@@ -2218,5 +2235,22 @@ int ncclPolicyPluginDebugReloadPolicy(void *context, const char *policy_path,
 int ncclPolicyPluginDebugSetSyntheticTelemetry(
     void *context, const SyntheticTelemetryConfig *config) {
   return pluginSetSyntheticTelemetryImpl(context, config);
+}
+
+int ncclPolicyPluginDebugExecutePolicy(void *context, void *policy_context,
+                                       size_t context_size,
+                                       uint64_t *action) {
+  auto *ctx = reinterpret_cast<TunerContext *>(context);
+  auto policy_state =
+      (ctx && ctx->shared) ? load_active_policy(ctx->shared.get()) : nullptr;
+
+  if (!policy_state || !policy_state->prog || !policy_context ||
+      context_size == 0 || !action) {
+    return -1;
+  }
+
+  std::lock_guard<std::mutex> lock(policy_state->exec_mu);
+  return policy_state->prog->bpftime_prog_exec(policy_context, context_size,
+                                                action);
 }
 }

@@ -1,4 +1,6 @@
-/* Size-aware AllReduce policy for small groups contained in one NVL domain. */
+/* Size-aware AllReduce policy for a single-node communicator contained in one
+ * NVL domain. The pinned NCCL tuner v5 ABI does not expose a distinct MNNVL
+ * fabric signal, so multi-node communicators must retain NCCL's defaults. */
 #include "bpf_compat.h"
 #include "policy_action.h"
 #include "policy_context.h"
@@ -16,7 +18,7 @@ uint64_t nvl72_size_aware_policy(struct nccl_policy_ctx *ctx) {
   if (!ctx || ctx->reserved < NCCL_POLICY_CTX_ABI_V2_SIZE)
     return 0;
 
-  if (ctx->n_nvl_domains != 1 ||
+  if (ctx->n_nodes != 1 || ctx->n_nvl_domains != 1 ||
       ctx->coll_type != NCCL_POLICY_COLL_ALLREDUCE)
     return 0;
 

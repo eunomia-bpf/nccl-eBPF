@@ -107,6 +107,10 @@ struct synthetic_telemetry_config {
 };
 typedef int (*plugin_debug_set_synthetic_telemetry_fn)(
     void *context, const struct synthetic_telemetry_config *config);
+typedef int (*plugin_debug_execute_policy_fn)(void *context,
+                                              void *policy_context,
+                                              size_t context_size,
+                                              uint64_t *action);
 typedef long (*bpftime_map_update_elem_fn)(int fd, const void *key,
                                            const void *value, uint64_t flags);
 typedef const void *(*bpftime_map_lookup_elem_fn)(int fd, const void *key);
@@ -121,6 +125,7 @@ struct plugin_session {
   plugin_debug_get_map_fd_fn debug_get_map_fd;
   plugin_debug_reload_policy_fn debug_reload_policy;
   plugin_debug_set_synthetic_telemetry_fn debug_set_synthetic_telemetry;
+  plugin_debug_execute_policy_fn debug_execute_policy;
   bpftime_map_update_elem_fn map_update_elem;
   bpftime_map_lookup_elem_fn map_lookup_elem;
 };
@@ -495,6 +500,8 @@ static int open_plugin_session_for_comm_with_nvl(
   session->debug_set_synthetic_telemetry =
       (plugin_debug_set_synthetic_telemetry_fn)dlsym(
           session->handle, "ncclPolicyPluginDebugSetSyntheticTelemetry");
+  session->debug_execute_policy = (plugin_debug_execute_policy_fn)dlsym(
+      session->handle, "ncclPolicyPluginDebugExecutePolicy");
   session->map_update_elem = (bpftime_map_update_elem_fn)dlsym(
       session->handle, "bpftime_map_update_elem");
   session->map_lookup_elem = (bpftime_map_lookup_elem_fn)dlsym(
@@ -910,6 +917,7 @@ static int test_nvl72_size_aware_policy(const char *plugin_path) {
   struct nvl_case {
     const char *label;
     size_t n_ranks;
+    size_t n_nodes;
     int n_domains;
     int min_ranks;
     int max_ranks;
@@ -919,44 +927,52 @@ static int test_nvl72_size_aware_policy(const char *plugin_path) {
     int expected_algo;
     int expected_proto;
   } cases[] = {
-      {"r3", 3, 1, 3, 3, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
-      {"r4-window-low", 4, 1, 4, 4, ncclFuncAllReduce, 4u << 20, 1,
+      {"r3", 3, 1, 1, 3, 3, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r4-window-low", 4, 1, 1, 4, 4, ncclFuncAllReduce, 4u << 20, 1,
        NCCL_ALGO_RING, NCCL_PROTO_LL128},
-      {"r4-window-high", 4, 1, 4, 4, ncclFuncAllReduce, 32u << 20, 1,
+      {"r4-window-high", 4, 1, 1, 4, 4, ncclFuncAllReduce, 32u << 20, 1,
        NCCL_ALGO_RING, NCCL_PROTO_LL128},
-      {"r4-below-window", 4, 1, 4, 4, ncclFuncAllReduce, (4u << 20) - 1, 1,
+      {"r4-below-window", 4, 1, 1, 4, 4, ncclFuncAllReduce,
+       (4u << 20) - 1, 1,
        -1, -1},
-      {"r4-above-window", 4, 1, 4, 4, ncclFuncAllReduce, (32u << 20) + 1, 1,
+      {"r4-above-window", 4, 1, 1, 4, 4, ncclFuncAllReduce,
+       (32u << 20) + 1, 1,
        -1, -1},
-      {"r5", 5, 1, 5, 5, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
-      {"r7", 7, 1, 7, 7, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
-      {"r8-ll128", 8, 1, 8, 8, ncclFuncAllReduce, 16u << 20, 1,
+      {"r5", 5, 1, 1, 5, 5, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r7", 7, 1, 1, 7, 7, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r8-ll128", 8, 1, 1, 8, 8, ncclFuncAllReduce, 16u << 20, 1,
        NCCL_ALGO_RING, NCCL_PROTO_LL128},
-      {"r8-simple-low", 8, 1, 8, 8, ncclFuncAllReduce, 64u << 20, 1,
+      {"r8-simple-low", 8, 1, 1, 8, 8, ncclFuncAllReduce, 64u << 20, 1,
        NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
-      {"r8-simple-high", 8, 1, 8, 8, ncclFuncAllReduce, 192u << 20, 1,
+      {"r8-simple-high", 8, 1, 1, 8, 8, ncclFuncAllReduce, 192u << 20, 1,
        NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
-      {"r8-gap", 8, 1, 8, 8, ncclFuncAllReduce, 48u << 20, 1, -1, -1},
-      {"r8-above-window", 8, 1, 8, 8, ncclFuncAllReduce,
+      {"r8-gap", 8, 1, 1, 8, 8, ncclFuncAllReduce, 48u << 20, 1, -1, -1},
+      {"r8-above-window", 8, 1, 1, 8, 8, ncclFuncAllReduce,
        (192u << 20) + 1, 1, -1, -1},
-      {"r9", 9, 1, 9, 9, ncclFuncAllReduce, 16u << 20, 1, -1, -1},
-      {"multiple-domains", 8, 2, 4, 4, ncclFuncAllReduce, 16u << 20, 1, -1,
-       -1},
-      {"non-allreduce", 4, 1, 4, 4, ncclFuncAllGather, 16u << 20, 1, -1,
-       -1},
-      {"nonuniform-domains", 8, 1, 4, 8, ncclFuncAllReduce, 16u << 20, 1,
+      {"r9", 9, 1, 1, 9, 9, ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+      {"multiple-domains", 8, 1, 2, 4, 4, ncclFuncAllReduce, 16u << 20, 1,
        -1, -1},
-      {"invalid-negative-domain", 4, -1, 4, 4, ncclFuncAllReduce, 16u << 20,
+      {"multi-node-two-domains", 8, 2, 2, 4, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"multi-node-single-domain", 8, 2, 1, 8, 8, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"non-allreduce", 4, 1, 1, 4, 4, ncclFuncAllGather, 16u << 20, 1, -1,
+       -1},
+      {"nonuniform-domains", 8, 1, 1, 4, 8, ncclFuncAllReduce, 16u << 20,
        1, -1, -1},
-      {"invalid-zero-domain-size", 4, 1, 0, 4, ncclFuncAllReduce, 16u << 20,
-       1, -1, -1},
-      {"invalid-rank-coverage", 8, 3, 2, 2, ncclFuncAllReduce, 16u << 20, 1,
-       -1, -1},
+      {"invalid-negative-domain", 4, 1, -1, 4, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"invalid-zero-domain-size", 4, 1, 1, 0, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"invalid-rank-coverage", 8, 1, 3, 2, 2, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
 #if SIZE_MAX > UINT32_MAX
-      {"rank-count-truncation", (size_t)UINT32_MAX + 5, 1, 4, 4,
+      {"rank-count-truncation", (size_t)UINT32_MAX + 5, 1, 1, 4, 4,
+       ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+      {"node-count-truncation", 4, (size_t)UINT32_MAX + 2, 1, 4, 4,
        ncclFuncAllReduce, 16u << 20, 1, -1, -1},
 #endif
-      {"null-nvl-info", 4, 0, 0, 0, ncclFuncAllReduce, 16u << 20, 0, -1,
+      {"null-nvl-info", 4, 1, 0, 0, 0, ncclFuncAllReduce, 16u << 20, 0, -1,
        -1},
   };
 
@@ -969,7 +985,8 @@ static int test_nvl72_size_aware_policy(const char *plugin_path) {
     nvl_info.maxRanksPerNvlDomain = cases[i].max_ranks;
 
     if (open_plugin_session_for_comm_with_nvl(
-            &session, plugin_path, &policy, i + 100, cases[i].n_ranks, 1,
+            &session, plugin_path, &policy, i + 100, cases[i].n_ranks,
+            cases[i].n_nodes,
             cases[i].provide_nvl_info ? &nvl_info : NULL) != 0)
       return -1;
     if (run_policy_once(&session, cases[i].coll_type, cases[i].n_bytes, 1, 0,
@@ -983,7 +1000,43 @@ static int test_nvl72_size_aware_policy(const char *plugin_path) {
     close_plugin_session(&session);
   }
 
-  printf("nvl72_size_aware topology propagation: PASS\n");
+  struct legacy_nccl_policy_ctx_v1 {
+    uint64_t n_bytes;
+    uint64_t last_latency_ns;
+    uint64_t avg_latency_ns;
+    uint64_t rolling_p99_ns;
+    uint64_t call_count;
+    uint32_t coll_type;
+    uint32_t num_pipe_ops;
+    uint32_t reg_buff;
+    uint32_t n_ranks;
+    uint32_t n_nodes;
+    uint32_t current_channels;
+    uint32_t reserved;
+  } legacy_ctx = {};
+  static_assert(sizeof(legacy_ctx) == NCCL_POLICY_CTX_ABI_V1_SIZE,
+                "legacy policy context must be exactly 72 bytes");
+
+  struct plugin_session legacy_session;
+  uint64_t legacy_action = UINT64_MAX;
+  legacy_ctx.n_bytes = 16u << 20;
+  legacy_ctx.coll_type = NCCL_POLICY_COLL_ALLREDUCE;
+  legacy_ctx.n_ranks = 8;
+  legacy_ctx.n_nodes = 1;
+  if (open_plugin_session_for_comm_with_nvl(
+          &legacy_session, plugin_path, &policy, 200, 8, 1, NULL) != 0)
+    return -1;
+  if (!legacy_session.debug_execute_policy ||
+      legacy_session.debug_execute_policy(
+          legacy_session.plugin_context, &legacy_ctx, sizeof(legacy_ctx),
+          &legacy_action) != 0 ||
+      legacy_action != 0) {
+    close_plugin_session(&legacy_session);
+    return failf("nvl72_size_aware did not reject a 72-byte legacy context");
+  }
+  close_plugin_session(&legacy_session);
+
+  printf("nvl72_size_aware single-node and legacy ABI guards: PASS\n");
   return 0;
 }
 

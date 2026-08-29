@@ -4,7 +4,7 @@
 # Commands:
 #   run       run the configured arm and write its combined output to a log
 #   sweep     run each whitespace-separated ARMS entry REPS times
-#   selftest  print the mpirun command without executing it
+#   selftest  preflight artifacts and print the mpirun command without running
 #
 # Required/commonly used environment:
 #   TEST_BIN    nccl-tests MPI binary (default: ~/nccl-tests/build/all_reduce_perf_mpi)
@@ -40,7 +40,7 @@ MSG_MAX="${MSG_MAX:-8G}"
 FACTOR="${FACTOR:-2}"
 ITERS="${ITERS:-20}"
 WARMUP="${WARMUP:-5}"
-CHECK="${CHECK:-0}"
+CHECK="${CHECK:-1}"
 
 if [[ -v LD_LIBRARY_PATH ]]; then
     NCCL_BENCH_BASE_LD_LIBRARY_PATH_SET=1
@@ -55,6 +55,16 @@ restore_ld_library_path() {
         export LD_LIBRARY_PATH="$NCCL_BENCH_BASE_LD_LIBRARY_PATH"
     else
         unset LD_LIBRARY_PATH
+    fi
+}
+
+require_artifact() {
+    local label=$1
+    local path=$2
+
+    if [[ ! -f "$path" || ! -r "$path" ]]; then
+        echo "ERROR: $label is not a readable file: $path" >&2
+        return 1
     fi
 }
 
@@ -93,10 +103,8 @@ apply_arm() {
             export NCCL_TUNER_PLUGIN="$PLUGIN_DIR/libnccl-policy.so"
             export NCCL_POLICY_BPF_PATH="$PLUGIN_DIR/ebpf-policies/${ARM_POLICY}.bpf.o"
             export NCCL_POLICY_VERIFY_MODE="${POLICY_VERIFY_MODE:-strict}"
-            if [[ ! -f "$NCCL_POLICY_BPF_PATH" ]]; then
-                echo "ERROR: policy object not found: $NCCL_POLICY_BPF_PATH" >&2
-                return 1
-            fi
+            require_artifact "policy plugin" "$NCCL_TUNER_PLUGIN" || return 1
+            require_artifact "policy object" "$NCCL_POLICY_BPF_PATH" || return 1
             ;;
         algo:*)
             spec="${arm#algo:}"
@@ -124,12 +132,12 @@ apply_arm() {
         native|ebpf)
             export NCCL_PROFILER_PLUGIN="$PLUGIN_DIR/libnccl-policy.so"
             export NCCL_POLICY_PROFILER_MODE="$PROFILER"
+            require_artifact "profiler plugin" "$NCCL_PROFILER_PLUGIN" ||
+                return 1
             if [[ "$PROFILER" == ebpf ]]; then
                 export NCCL_POLICY_PROFILER_BPF_PATH="$PLUGIN_DIR/ebpf-policies/profiler_latency.bpf.o"
-                if [[ ! -f "$NCCL_POLICY_PROFILER_BPF_PATH" ]]; then
-                    echo "ERROR: profiler policy not found: $NCCL_POLICY_PROFILER_BPF_PATH" >&2
-                    return 1
-                fi
+                require_artifact "profiler policy" \
+                    "$NCCL_POLICY_PROFILER_BPF_PATH" || return 1
             fi
             ;;
         *)
@@ -147,6 +155,31 @@ apply_arm() {
             export LD_LIBRARY_PATH="$NCCL_LIB_DIR"
         fi
     fi
+}
+
+# Open MPI sets OMPI_COMM_WORLD_RANK in each process. The plugin emits one READY
+# marker only after its tuner v5 object has loaded, verified, JIT-compiled, and
+# completed warmup. Require a marker for every requested rank before a run can
+# receive a policy-labelled log filename.
+verify_policy_load() {
+    local log=$1
+    local policy_path=$2
+    local requested_ranks=$3
+    local rank
+    local marker
+
+    if [[ ! "$requested_ranks" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: NPROC must be a positive integer: $requested_ranks" >&2
+        return 1
+    fi
+
+    for ((rank = 0; rank < 10#$requested_ranks; rank++)); do
+        marker="[nccl-policy-plugin] READY tuner=v5 rank=$rank policy=$policy_path"
+        if ! grep -Fq -- "$marker" "$log"; then
+            echo "ERROR: tuner policy load was not proven for MPI rank $rank" >&2
+            return 1
+        fi
+    done
 }
 
 # Append Open MPI -x pairs to the named array. compgen's prefix argument avoids
@@ -172,10 +205,16 @@ run_once() {
     local mode="${1:-run}"
     local repetition="${2:-1}"
     local arm_tag="${ARM//:/-}"
+    local log
+    local pending_log
     local -a exports=()
     local -a command=(mpirun -np "$NPROC")
 
     arm_tag="${arm_tag//\//-}"
+    if [[ ! "$NPROC" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: NPROC must be a positive integer: $NPROC" >&2
+        return 1
+    fi
     apply_arm "$ARM"
     propagate_flags exports
     [[ -n "$HOSTLIST" ]] && command+=(-H "$HOSTLIST")
@@ -188,9 +227,24 @@ run_once() {
     fi
 
     mkdir -p "$RESULTS_DIR"
-    local log="$RESULTS_DIR/${arm_tag}-r${repetition}.log"
-    echo "[nccl_bench] $ARM repetition $repetition -> $log"
-    "${command[@]}" >"$log" 2>&1
+    log="$RESULTS_DIR/${arm_tag}-r${repetition}.log"
+    if [[ -n "$ARM_POLICY" ]]; then
+        pending_log="$(mktemp "$RESULTS_DIR/.unverified-r${repetition}.XXXXXX.log")"
+        echo "[nccl_bench] starting unverified tuner arm repetition $repetition"
+        if ! "${command[@]}" >"$pending_log" 2>&1; then
+            echo "ERROR: nccl-tests failed; unverified output: $pending_log" >&2
+            return 1
+        fi
+        if ! verify_policy_load "$pending_log" "$NCCL_POLICY_BPF_PATH" "$NPROC"; then
+            echo "ERROR: refusing policy label; unverified output: $pending_log" >&2
+            return 1
+        fi
+        mv "$pending_log" "$log"
+        echo "[nccl_bench] validated $ARM repetition $repetition -> $log"
+    else
+        echo "[nccl_bench] $ARM repetition $repetition -> $log"
+        "${command[@]}" >"$log" 2>&1
+    fi
 }
 
 run_sweep() {
