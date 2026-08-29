@@ -14,6 +14,7 @@ set(BPFTIME_BUILD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../build-bpftime CACHE PATH
     "Path to the prebuilt bpftime build directory")
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Boost REQUIRED)
 find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h
           PATHS ${BPFTIME_BUILD_DIR}/libbpf
           NO_DEFAULT_PATH REQUIRED)
@@ -188,6 +189,7 @@ add_dependencies(nccl-policy ebpf_policies)
 target_include_directories(nccl-policy PRIVATE
     ${NCCL_PUBLIC_INCLUDE_DIRS}
     ${POLICY_SOURCE_DIR}
+    ${Boost_INCLUDE_DIRS}
     ${LIBBPF_INCLUDE_DIR}
     ${LIBELF_INCLUDE_DIR}
     ${BPFTIME_SOURCE_DIR}/runtime/include
