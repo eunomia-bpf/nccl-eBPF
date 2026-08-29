@@ -1649,14 +1649,17 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
       ctx->shared->log_function, NCCL_TUNING, NCCL_LOG_INFO,
       "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
       n_nodes, load_active_policy(ctx->shared.get())->policy_source.c_str());
-  const char *mpi_rank = getenv("OMPI_COMM_WORLD_RANK");
-  if (!mpi_rank || mpi_rank[0] == '\0')
-    mpi_rank = getenv("PMIX_RANK");
-  fprintf(stderr,
-          "[nccl-policy-plugin] READY tuner=v5 rank=%s policy=%s\n",
-          mpi_rank && mpi_rank[0] != '\0' ? mpi_rank : "unknown",
-          load_active_policy(ctx->shared.get())->policy_source.c_str());
-  fflush(stderr);
+  const char *ready_marker = getenv("NCCL_POLICY_BENCHMARK_READY");
+  if (ready_marker && strcmp(ready_marker, "1") == 0) {
+    const char *mpi_rank = getenv("OMPI_COMM_WORLD_RANK");
+    if (!mpi_rank || mpi_rank[0] == '\0')
+      mpi_rank = getenv("PMIX_RANK");
+    fprintf(stderr,
+            "[nccl-policy-plugin] READY tuner=v5 rank=%s policy=%s\n",
+            mpi_rank && mpi_rank[0] != '\0' ? mpi_rank : "unknown",
+            load_active_policy(ctx->shared.get())->policy_source.c_str());
+    fflush(stderr);
+  }
   *context = ctx;
   return ncclSuccess;
 }

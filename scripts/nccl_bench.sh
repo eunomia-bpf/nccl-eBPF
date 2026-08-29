@@ -72,6 +72,7 @@ reset_arm_environment() {
     unset NCCL_TUNER_PLUGIN
     unset NCCL_POLICY_BPF_PATH
     unset NCCL_POLICY_VERIFY_MODE
+    unset NCCL_POLICY_BENCHMARK_READY
     unset NCCL_PROFILER_PLUGIN
     unset NCCL_POLICY_PROFILER_MODE
     unset NCCL_POLICY_PROFILER_BPF_PATH
@@ -105,6 +106,7 @@ apply_arm() {
             export NCCL_POLICY_VERIFY_MODE="${POLICY_VERIFY_MODE:-strict}"
             require_artifact "policy plugin" "$NCCL_TUNER_PLUGIN" || return 1
             require_artifact "policy object" "$NCCL_POLICY_BPF_PATH" || return 1
+            export NCCL_POLICY_BENCHMARK_READY=1
             ;;
         algo:*)
             spec="${arm#algo:}"

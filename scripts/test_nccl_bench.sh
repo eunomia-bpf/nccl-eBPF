@@ -28,6 +28,7 @@ export LD_LIBRARY_PATH=/original/lib
 export NCCL_TUNER_PLUGIN=/stale/plugin.so
 export NCCL_POLICY_BPF_PATH=/stale/policy.bpf.o
 export NCCL_POLICY_VERIFY_MODE=none
+export NCCL_POLICY_BENCHMARK_READY=1
 export NCCL_PROFILER_PLUGIN=/stale/profiler.so
 export NCCL_POLICY_PROFILER_MODE=ebpf
 export NCCL_POLICY_PROFILER_BPF_PATH=/stale/profiler.bpf.o
@@ -43,14 +44,17 @@ source "$TEST_SCRIPT_DIR/nccl_bench.sh"
 
 apply_arm baseline
 assert_unset NCCL_TUNER_PLUGIN NCCL_POLICY_BPF_PATH NCCL_POLICY_VERIFY_MODE \
+    NCCL_POLICY_BENCHMARK_READY \
     NCCL_PROFILER_PLUGIN NCCL_POLICY_PROFILER_MODE \
     NCCL_POLICY_PROFILER_BPF_PATH NCCL_ALGO NCCL_PROTO NCCL_MAX_NCHANNELS
 [[ "$LD_LIBRARY_PATH" == /original/lib ]] || fail "baseline did not restore LD_LIBRARY_PATH"
 
 export NCCL_LIB_DIR=/alternate/lib
+export NCCL_POLICY_BENCHMARK_READY=1
 apply_arm algo:Ring/LL128
 [[ "$NCCL_ALGO" == Ring ]] || fail "algorithm arm was not applied"
 [[ "$NCCL_PROTO" == LL128 ]] || fail "protocol arm was not applied"
+assert_unset NCCL_POLICY_BENCHMARK_READY
 [[ "$LD_LIBRARY_PATH" == /alternate/lib:/original/lib ]] ||
     fail "alternate library path was not prepended exactly once"
 
@@ -64,11 +68,14 @@ apply_arm noop
     fail "policy plugin was not selected"
 [[ "$NCCL_POLICY_BPF_PATH" == "$TEST_TMP_DIR/ebpf-policies/noop.bpf.o" ]] ||
     fail "policy object was not selected"
+[[ "$NCCL_POLICY_BENCHMARK_READY" == 1 ]] ||
+    fail "policy marker opt-in was not enabled"
 
 mv "$TEST_TMP_DIR/libnccl-policy.so" "$TEST_TMP_DIR/libnccl-policy.so.missing"
 if apply_arm noop 2>/dev/null; then
     fail "policy arm accepted a missing plugin library"
 fi
+assert_unset NCCL_POLICY_BENCHMARK_READY
 mv "$TEST_TMP_DIR/libnccl-policy.so.missing" "$TEST_TMP_DIR/libnccl-policy.so"
 apply_arm noop
 
@@ -116,8 +123,17 @@ propagate_flags flags
 joined=" ${flags[*]} "
 [[ "$joined" == *" -x NCCL_TEST_PROPAGATION "* ]] ||
     fail "NCCL-prefixed variable was not propagated"
+[[ "$joined" == *" -x NCCL_POLICY_BENCHMARK_READY "* ]] ||
+    fail "policy marker opt-in was not propagated"
 [[ "$joined" == *" -x LD_LIBRARY_PATH "* ]] ||
     fail "LD_LIBRARY_PATH was not propagated explicitly"
+
+apply_arm baseline
+flags=()
+propagate_flags flags
+joined=" ${flags[*]} "
+[[ "$joined" != *" -x NCCL_POLICY_BENCHMARK_READY "* ]] ||
+    fail "baseline propagated the policy marker opt-in"
 
 unset NCCL_TEST_PROPAGATION
 echo "nccl_bench arm isolation: PASS"

@@ -578,6 +578,78 @@ static void close_plugin_session(struct plugin_session *session) {
   memset(session, 0, sizeof(*session));
 }
 
+static int test_benchmark_ready_marker_opt_in(const char *plugin_path) {
+  const struct policy_case policy = {
+      "noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"};
+  const char *marker_name = "NCCL_POLICY_BENCHMARK_READY";
+  const char *rank_name = "OMPI_COMM_WORLD_RANK";
+  const char *original_marker = getenv(marker_name);
+  const char *original_rank = getenv(rank_name);
+  const bool had_original_marker = original_marker != NULL;
+  const bool had_original_rank = original_rank != NULL;
+  const std::string saved_marker = original_marker ? original_marker : "";
+  const std::string saved_rank = original_rank ? original_rank : "";
+  const std::string marker_prefix =
+      "[nccl-policy-plugin] READY tuner=v5 rank=";
+  const std::string expected_marker =
+      marker_prefix + "7 policy=" + policy.path;
+  struct plugin_session session;
+  std::string captured;
+  int init_rc = -1;
+
+  auto restore_environment = [&]() {
+    if (had_original_marker)
+      setenv(marker_name, saved_marker.c_str(), 1);
+    else
+      unsetenv(marker_name);
+    if (had_original_rank)
+      setenv(rank_name, saved_rank.c_str(), 1);
+    else
+      unsetenv(rank_name);
+  };
+  auto fail_test = [&](const char *message) {
+    restore_environment();
+    return failf("%s", message);
+  };
+
+  if (unsetenv(marker_name) != 0 || setenv(rank_name, "7", 1) != 0)
+    return fail_test("failed to configure READY marker test environment");
+  if (capture_stderr(
+          [&]() {
+            init_rc = open_plugin_session_for_comm(&session, plugin_path,
+                                                   &policy, 700, 8, 1);
+            if (init_rc == 0)
+              close_plugin_session(&session);
+          },
+          &captured) != 0)
+    return fail_test("failed to capture default plugin stderr");
+  if (init_rc != 0)
+    return fail_test("plugin initialization failed with READY marker disabled");
+  if (captured.find(marker_prefix) != std::string::npos)
+    return fail_test("plugin emitted READY marker without benchmark opt-in");
+
+  if (setenv(marker_name, "1", 1) != 0)
+    return fail_test("failed to enable READY marker test environment");
+  init_rc = -1;
+  if (capture_stderr(
+          [&]() {
+            init_rc = open_plugin_session_for_comm(&session, plugin_path,
+                                                   &policy, 701, 8, 1);
+            if (init_rc == 0)
+              close_plugin_session(&session);
+          },
+          &captured) != 0)
+    return fail_test("failed to capture opted-in plugin stderr");
+  if (init_rc != 0)
+    return fail_test("plugin initialization failed with READY marker enabled");
+  if (captured.find(expected_marker) == std::string::npos)
+    return fail_test("opted-in plugin did not emit the per-rank READY marker");
+
+  restore_environment();
+  printf("benchmark READY marker opt-in: PASS\n");
+  return 0;
+}
+
 static int run_policy_once(struct plugin_session *session, ncclFunc_t coll_type,
                            size_t n_bytes, int num_pipe_ops, int reg_buff,
                            int initial_channels,
@@ -2146,6 +2218,11 @@ int main(int argc, char **argv) {
 
   if (!samples)
     return failf("failed to allocate benchmark samples");
+
+  if (test_benchmark_ready_marker_opt_in(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
 
   if (test_verifier_matrix(plugin_path, verifier_policies,
                            sizeof(verifier_policies) /
