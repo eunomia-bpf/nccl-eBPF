@@ -3,6 +3,17 @@
 
 \documentclass[sigplan,10pt]{acmart}
 
+% Format-checker compliance: acmart's sigplan layout places the running head
+% outside the 9in text block (includeheadfoot=false), and the venue checker
+% counts that head as body text. Pull head + body inside the 229mm budget.
+\setlength{\headsep}{10pt}
+\addtolength{\topmargin}{4pt}      % keep the body's top edge at ACM's 1in
+\addtolength{\textheight}{-24pt}   % trim two lines per column off the bottom
+
+% Long \texttt{} identifiers cannot hyphenate and were protruding into the
+% right margin; let TeX stretch interword glue as a last resort instead.
+\setlength{\emergencystretch}{3em}
+
 \usepackage{booktabs}
 \usepackage{subcaption}
 \usepackage{xspace}
@@ -102,9 +113,9 @@
 }
 
 % SOSP 2026 formatting requirements
-% ACM camera-ready: copyright notice must appear (do not suppress it),
-% and page numbers must be off.
-\settopmatter{printfolios=false,printccs=false,printacmref=false}
+% ACM camera-ready: copyright notice, CCS Concepts, and ACM Reference Format
+% must appear, while page numbers remain off.
+\settopmatter{printfolios=false,printccs=true,printacmref=true}
 \pagestyle{plain}
 
 \begin{document}
@@ -115,7 +126,11 @@
 \acmDOI{10.1145/3837779.3838156}
 \acmISBN{979-8-4007-2911-9/26/09}
 
-\title{\sysname: Verified, Composable Policy Execution\\for GPU Collective Communication}
+% The optional short title keeps the running head to a single line; the \\ in
+% the full title would otherwise carry into the head and overflow \headheight.
+\title[\sysname: Verified, Composable Policy Execution for GPU Collective
+Communication]{\sysname: Verified, Composable Policy Execution\\for GPU
+Collective Communication}
 
 \author{Yusheng Zheng}
 \affiliation{
@@ -374,12 +389,10 @@ bugs, analogous to the Linux kernel's eBPF model.
 \begin{figure*}[t]
   \centering
   \input{figures/architecture}
-  \caption{\sysname architecture. The plugin host loads policies
-  in-process, where policies attach to an unmodified
-  NCCL through its plugin ABI (dashed) and enter via the
-  verifier and JIT for load and hot-reload. The host, runtime
-   are trusted, the policies are not. The profiler
-  writes latency into shared maps the tuner reads.}
+  \caption{\sysname architecture. Policies attach to unmodified NCCL
+  through its plugin ABI (dashed) and enter the in-process host via the
+  verifier and JIT. Host and runtime are trusted; policies are not. The
+  profiler writes latency into maps the tuner reads.}
   \Description{Architecture diagram. NCCL Core on the left exchanges
   metadata, decisions, and events with tuner and profiler eBPF policies
   across the NCCL plugin ABI. The policies run inside the bpftime
@@ -404,10 +417,9 @@ decisions. The verifier ensures policies only read input fields and
 write output fields. Map lookups require null checks before
 dereference, and omitting one causes load-time rejection.
 
-\begin{lstlisting}[language=C, caption={Profiler-to-tuner closed loop.
-  The profiler (top) writes latency into a shared eBPF map;
-  the tuner (bottom) reads it for adaptive channel selection.
-  Null checks (lines 7, 18) are enforced by the verifier.},
+\begin{lstlisting}[language=C, caption={Profiler-to-tuner closed loop. The
+  profiler (top) writes latency into a shared map the tuner (bottom)
+  reads; the verifier enforces the null checks (lines 7, 18).},
   label={lst:policy}, basicstyle=\ttfamily\scriptsize]
 /* --- profiler eBPF program --- */
 SEC("profiler")
@@ -539,9 +551,8 @@ with CUDA~13.0 and NCCL~2.29.7, hosted on Verda.
 \begin{table}[t]
 \centering
 \caption{CPU microbenchmark (1M calls each). eBPF policies add
-80--130\ns over native code. The overhead decomposes into plugin
-framework base (+80\ns, of which eBPF JIT dispatch is 33\ns),
-map lookup (+30\ns each), and map update (+10\ns each).}
+80--130\ns over native code: framework base (+80\ns), map lookup
+(+30\ns each), and map update (+10\ns each).}
 \label{tab:overhead}
 \small
 \begin{tabular}{lrrr}
@@ -616,8 +627,8 @@ uninterrupted.
 \begin{tikzpicture}
 \begin{axis}[
   nccl axis,
-  width=0.92\columnwidth,
-  height=5.5cm,
+  width=0.86\columnwidth,
+  height=5.1cm,
   xlabel={Message Size},
   ylabel={Bus Bandwidth (GB/s)},
   xmode=log, log basis x=2,
@@ -650,11 +661,9 @@ uninterrupted.
 \legend{NCCL default (NVLS), message-size-aware, one-channel}
 \end{axis}
 \end{tikzpicture}
-\caption{8-GPU AllReduce on NVLink. The message-size-aware policy selects
-Ring/LL128 for 4--32\,MiB and Ring/Simple for 64--192\,MiB,
-improving throughput by up to 27\% over NCCL's default NVLS
-algorithm. A one-channel policy shows that a verified program can still
-degrade throughput.}
+\caption{8-GPU AllReduce on NVLink. The message-size-aware policy improves
+throughput by up to 27\% over NCCL's default NVLS; a one-channel policy
+shows that a verified program can still degrade throughput.}
 \label{fig:nvlink-policy}
 \end{figure}
 
@@ -667,7 +676,7 @@ is superior at 256\,MiB and above (Table~\ref{tab:sweep}).
 \begin{table}[t]
 \centering
 \caption{Algorithm sweep of 8-GPU AllReduce bus bandwidth (GB/s).
-Ring outperforms NVLS by 5--27\% in the 4--128\,MiB range.}
+Ring beats NVLS by 5--27\% for 4--128\,MiB.}
 \label{tab:sweep}
 \small
 \begin{tabular}{lrrr}
