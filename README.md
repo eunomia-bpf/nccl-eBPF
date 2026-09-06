@@ -29,6 +29,9 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 - `adaptive_channels.bpf.c` -- Dynamic channel count adjustment using telemetry maps
 - `slo_enforcer.bpf.c` -- SLO-driven policy using config maps and telemetry feedback
 - `ring_simple_all.bpf.c` -- Forces RING/SIMPLE for all sizes
+- `nvl72_size_aware.bpf.c` -- Single-node, one-NVL-domain AllReduce overrides
+  for exact 4-rank and 8-rank communicators; it deliberately leaves all
+  multi-node communicators unchanged
 - `bad_*.bpf.c` -- Intentionally unsafe programs for verifier testing (div-by-zero, OOB access, stack overflow, infinite loop, etc.)
 
 ## Prerequisites
@@ -36,11 +39,15 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 - NVIDIA GPU with CUDA toolkit
 - clang/LLVM (for BPF compilation, tested with LLVM 15+)
 - cmake (>= 3.20), pkg-config
-- libelf-dev, zlib1g-dev
+- libelf-dev, zlib1g-dev, libzstd-dev, libboost-dev
 - Pre-built bpftime (at `build-bpftime/`; see the [bpftime repository](https://github.com/eunomia-bpf/bpftime) for build instructions)
 - MPI implementation (for running nccl-tests)
 
 ## Build
+
+On Ubuntu, `make install` installs the host build dependencies used by the
+Makefile, including CMake and LLVM 15. CUDA, NCCL, bpftime, MPI, and nccl-tests
+remain separate prerequisites.
 
 ### 1. Initialize submodules
 
@@ -60,6 +67,10 @@ Follow the instructions in the [bpftime repository](https://github.com/eunomia-b
 
 ### 4. Build the tuner+profiler plugin
 
+Once NCCL and bpftime are available, `make build` configures and builds both
+plugins using the build directories shown below. The equivalent individual
+commands are:
+
 ```bash
 cmake -S src/nccl-policy-plugin -B src/nccl-policy-plugin/build
 cmake --build src/nccl-policy-plugin/build -j$(nproc)
@@ -76,6 +87,37 @@ cmake --build src/nccl-net-ebpf-plugin/build -j$(nproc)
 
 This produces `src/nccl-net-ebpf-plugin/build/libnccl-net-ebpf.so` and compiles `net_trace.bpf.o`.
 
+Run the hardware-free CTest and benchmark-runner regressions with:
+
+```bash
+make test
+```
+
+### 6. Check benchmark arm configuration
+
+`scripts/nccl_bench.sh` provides generic baseline, policy, and environment-forced
+nccl-tests arms without assuming a cluster topology or transport configuration.
+Use `selftest` to inspect the generated command before running it:
+
+```bash
+NPROC=8 ARM=policy:nvl72_size_aware \
+  scripts/nccl_bench.sh selftest
+```
+
+`nvl72_size_aware` is intentionally limited to a single-node communicator in
+one NVL domain. With the pinned NCCL tuner v5 implementation,
+`nNvlDomains` tracks `nNodes`; the ABI has no separate MNNVL capability signal.
+The policy therefore returns no override whenever `nNodes > 1`, including for
+multi-host jobs. Other runner arms may still use `HOSTLIST` supplied by the
+caller.
+
+Policy and noop arms preflight the plugin and BPF objects. Completed output is
+given a policy-labelled filename only after the log contains a successful
+tuner-policy initialization marker for every Open MPI rank. The runner enables
+nccl-tests data checking (`CHECK=1`) by default; set `CHECK=0` explicitly to
+disable it. Run `scripts/test_nccl_bench.sh` for the hardware-free arm and
+load-marker regression tests.
+
 ## Usage
 
 ### Run with the tuner+profiler plugin
@@ -83,7 +125,7 @@ This produces `src/nccl-net-ebpf-plugin/build/libnccl-net-ebpf.so` and compiles 
 ```bash
 LD_LIBRARY_PATH=nccl/build/lib \
 NCCL_TUNER_PLUGIN=src/nccl-policy-plugin/build/libnccl-policy.so \
-NCCL_POLICY_BPF_PATH=src/ebpf-policies/size_aware_v5.bpf.o \
+NCCL_POLICY_BPF_PATH=src/nccl-policy-plugin/build/ebpf-policies/size_aware_v5.bpf.o \
 mpirun -np 2 nccl-tests/build/all_reduce_perf_mpi -b 1M -e 128M -g 1
 ```
 

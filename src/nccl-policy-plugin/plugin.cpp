@@ -128,6 +128,9 @@ struct TunerContext {
   uint64_t last_latency_ns = 0;
   uint64_t rolling_p99_ns = 0;
   int last_channels = 0;
+  uint32_t n_nvl_domains = 0;
+  uint32_t min_ranks_per_nvl_domain = 0;
+  uint32_t max_ranks_per_nvl_domain = 0;
   struct SyntheticTelemetryState {
     bool enabled = false;
     uint64_t last_latency_ns = 0;
@@ -135,6 +138,33 @@ struct TunerContext {
     uint64_t rolling_p99_ns = 0;
   } synthetic_telemetry;
 };
+
+bool snapshot_nvl_domain_info(TunerContext *ctx, size_t n_ranks,
+                              const ncclNvlDomainInfo_v5_t *info) {
+  if (!ctx || !info || n_ranks == 0 || n_ranks > UINT32_MAX)
+    return false;
+
+  const int n_domains = info->nNvlDomains;
+  const int min_ranks = info->minRanksPerNvlDomain;
+  const int max_ranks = info->maxRanksPerNvlDomain;
+  if (n_domains <= 0 || min_ranks <= 0 || max_ranks < min_ranks)
+    return false;
+
+  const uint64_t rank_count = static_cast<uint64_t>(n_ranks);
+  const uint64_t domain_count = static_cast<uint64_t>(n_domains);
+  const uint64_t min_rank_count = static_cast<uint64_t>(min_ranks);
+  const uint64_t max_rank_count = static_cast<uint64_t>(max_ranks);
+  if (domain_count > rank_count || max_rank_count > rank_count ||
+      domain_count * min_rank_count > rank_count ||
+      domain_count * max_rank_count < rank_count) {
+    return false;
+  }
+
+  ctx->n_nvl_domains = static_cast<uint32_t>(n_domains);
+  ctx->min_ranks_per_nvl_domain = static_cast<uint32_t>(min_ranks);
+  ctx->max_ranks_per_nvl_domain = static_cast<uint32_t>(max_ranks);
+  return true;
+}
 
 struct ProfilerContext {
   std::shared_ptr<SharedCommState> shared;
@@ -1596,12 +1626,12 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
                             size_t n_nodes, ncclDebugLogger_t log_function,
                             ncclNvlDomainInfo_v5_t *nvl_domain_info,
                             ncclTunerConstants_v5_t *constants) {
-  (void)nvl_domain_info;
   (void)constants;
 
   auto *ctx = new (std::nothrow) TunerContext();
   if (!ctx)
     return ncclSystemError;
+  (void)snapshot_nvl_domain_info(ctx, n_ranks, nvl_domain_info);
 
   acquire_bpftime_runtime();
   ctx->shared =
@@ -1619,6 +1649,17 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
       ctx->shared->log_function, NCCL_TUNING, NCCL_LOG_INFO,
       "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
       n_nodes, load_active_policy(ctx->shared.get())->policy_source.c_str());
+  const char *ready_marker = getenv("NCCL_POLICY_BENCHMARK_READY");
+  if (ready_marker && strcmp(ready_marker, "1") == 0) {
+    const char *mpi_rank = getenv("OMPI_COMM_WORLD_RANK");
+    if (!mpi_rank || mpi_rank[0] == '\0')
+      mpi_rank = getenv("PMIX_RANK");
+    fprintf(stderr,
+            "[nccl-policy-plugin] READY tuner=v5 rank=%s policy=%s\n",
+            mpi_rank && mpi_rank[0] != '\0' ? mpi_rank : "unknown",
+            load_active_policy(ctx->shared.get())->policy_source.c_str());
+    fflush(stderr);
+  }
   *context = ctx;
   return ncclSuccess;
 }
@@ -1672,9 +1713,17 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_ctx.coll_type = policy_coll_type;
   policy_ctx.num_pipe_ops = static_cast<uint32_t>(num_pipe_ops);
   policy_ctx.reg_buff = static_cast<uint32_t>(reg_buff);
-  policy_ctx.n_ranks = static_cast<uint32_t>(ctx->shared->n_ranks);
-  policy_ctx.n_nodes = static_cast<uint32_t>(ctx->shared->n_nodes);
+  policy_ctx.n_ranks = ctx->shared->n_ranks <= UINT32_MAX
+                           ? static_cast<uint32_t>(ctx->shared->n_ranks)
+                           : 0;
+  policy_ctx.n_nodes = ctx->shared->n_nodes <= UINT32_MAX
+                           ? static_cast<uint32_t>(ctx->shared->n_nodes)
+                           : 0;
   policy_ctx.current_channels = static_cast<uint32_t>(current_channels);
+  policy_ctx.reserved = sizeof(policy_ctx);
+  policy_ctx.n_nvl_domains = ctx->n_nvl_domains;
+  policy_ctx.min_ranks_per_nvl_domain = ctx->min_ranks_per_nvl_domain;
+  policy_ctx.max_ranks_per_nvl_domain = ctx->max_ranks_per_nvl_domain;
 
   {
     const uint64_t start_ns = monotonic_time_ns();
@@ -2157,6 +2206,11 @@ extern int ncclPolicyPluginDebugReloadPolicy(void *context,
 extern int ncclPolicyPluginDebugSetSyntheticTelemetry(
     void *context, const SyntheticTelemetryConfig *config)
     __attribute__((visibility("default")));
+extern int ncclPolicyPluginDebugExecutePolicy(void *context,
+                                               void *policy_context,
+                                               size_t context_size,
+                                               uint64_t *action)
+    __attribute__((visibility("default")));
 
 int ncclPolicyPluginDebugGetMapFd(void *context, const char *map_name) {
   auto *ctx = reinterpret_cast<TunerContext *>(context);
@@ -2184,5 +2238,22 @@ int ncclPolicyPluginDebugReloadPolicy(void *context, const char *policy_path,
 int ncclPolicyPluginDebugSetSyntheticTelemetry(
     void *context, const SyntheticTelemetryConfig *config) {
   return pluginSetSyntheticTelemetryImpl(context, config);
+}
+
+int ncclPolicyPluginDebugExecutePolicy(void *context, void *policy_context,
+                                       size_t context_size,
+                                       uint64_t *action) {
+  auto *ctx = reinterpret_cast<TunerContext *>(context);
+  auto policy_state =
+      (ctx && ctx->shared) ? load_active_policy(ctx->shared.get()) : nullptr;
+
+  if (!policy_state || !policy_state->prog || !policy_context ||
+      context_size == 0 || !action) {
+    return -1;
+  }
+
+  std::lock_guard<std::mutex> lock(policy_state->exec_mu);
+  return policy_state->prog->bpftime_prog_exec(policy_context, context_size,
+                                                action);
 }
 }

@@ -107,6 +107,10 @@ struct synthetic_telemetry_config {
 };
 typedef int (*plugin_debug_set_synthetic_telemetry_fn)(
     void *context, const struct synthetic_telemetry_config *config);
+typedef int (*plugin_debug_execute_policy_fn)(void *context,
+                                              void *policy_context,
+                                              size_t context_size,
+                                              uint64_t *action);
 typedef long (*bpftime_map_update_elem_fn)(int fd, const void *key,
                                            const void *value, uint64_t flags);
 typedef const void *(*bpftime_map_lookup_elem_fn)(int fd, const void *key);
@@ -121,6 +125,7 @@ struct plugin_session {
   plugin_debug_get_map_fd_fn debug_get_map_fd;
   plugin_debug_reload_policy_fn debug_reload_policy;
   plugin_debug_set_synthetic_telemetry_fn debug_set_synthetic_telemetry;
+  plugin_debug_execute_policy_fn debug_execute_policy;
   bpftime_map_update_elem_fn map_update_elem;
   bpftime_map_lookup_elem_fn map_lookup_elem;
 };
@@ -449,11 +454,10 @@ static void decode_action(uint64_t action, struct decision_result *decision) {
   decision->proto = (int)nccl_policy_action_proto(action);
 }
 
-static int open_plugin_session_for_comm(struct plugin_session *session,
-                                        const char *plugin_path,
-                                        const struct policy_case *policy,
-                                        uint64_t comm_id, size_t n_ranks,
-                                        size_t n_nodes) {
+static int open_plugin_session_for_comm_with_nvl(
+    struct plugin_session *session, const char *plugin_path,
+    const struct policy_case *policy, uint64_t comm_id, size_t n_ranks,
+    size_t n_nodes, ncclNvlDomainInfo_v5_t *nvl_domain_info) {
   memset(session, 0, sizeof(*session));
 
   if (setenv("NCCL_POLICY_BPF_PATH", policy->path, 1) != 0)
@@ -480,7 +484,7 @@ static int open_plugin_session_for_comm(struct plugin_session *session,
 
   if (session->plugin->init(&session->plugin_context, comm_id, n_ranks,
                             n_nodes,
-                            no_op_logger, NULL, NULL) != ncclSuccess) {
+                            no_op_logger, nvl_domain_info, NULL) != ncclSuccess) {
     dlclose(session->handle);
     memset(session, 0, sizeof(*session));
     return failf("plugin init failed for %s (verify=%s)", policy->name,
@@ -496,11 +500,22 @@ static int open_plugin_session_for_comm(struct plugin_session *session,
   session->debug_set_synthetic_telemetry =
       (plugin_debug_set_synthetic_telemetry_fn)dlsym(
           session->handle, "ncclPolicyPluginDebugSetSyntheticTelemetry");
+  session->debug_execute_policy = (plugin_debug_execute_policy_fn)dlsym(
+      session->handle, "ncclPolicyPluginDebugExecutePolicy");
   session->map_update_elem = (bpftime_map_update_elem_fn)dlsym(
       session->handle, "bpftime_map_update_elem");
   session->map_lookup_elem = (bpftime_map_lookup_elem_fn)dlsym(
       session->handle, "bpftime_map_lookup_elem");
   return 0;
+}
+
+static int open_plugin_session_for_comm(struct plugin_session *session,
+                                        const char *plugin_path,
+                                        const struct policy_case *policy,
+                                        uint64_t comm_id, size_t n_ranks,
+                                        size_t n_nodes) {
+  return open_plugin_session_for_comm_with_nvl(
+      session, plugin_path, policy, comm_id, n_ranks, n_nodes, NULL);
 }
 
 static int open_plugin_session(struct plugin_session *session,
@@ -561,6 +576,78 @@ static void close_plugin_session(struct plugin_session *session) {
   if (session->handle)
     dlclose(session->handle);
   memset(session, 0, sizeof(*session));
+}
+
+static int test_benchmark_ready_marker_opt_in(const char *plugin_path) {
+  const struct policy_case policy = {
+      "noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"};
+  const char *marker_name = "NCCL_POLICY_BENCHMARK_READY";
+  const char *rank_name = "OMPI_COMM_WORLD_RANK";
+  const char *original_marker = getenv(marker_name);
+  const char *original_rank = getenv(rank_name);
+  const bool had_original_marker = original_marker != NULL;
+  const bool had_original_rank = original_rank != NULL;
+  const std::string saved_marker = original_marker ? original_marker : "";
+  const std::string saved_rank = original_rank ? original_rank : "";
+  const std::string marker_prefix =
+      "[nccl-policy-plugin] READY tuner=v5 rank=";
+  const std::string expected_marker =
+      marker_prefix + "7 policy=" + policy.path;
+  struct plugin_session session;
+  std::string captured;
+  int init_rc = -1;
+
+  auto restore_environment = [&]() {
+    if (had_original_marker)
+      setenv(marker_name, saved_marker.c_str(), 1);
+    else
+      unsetenv(marker_name);
+    if (had_original_rank)
+      setenv(rank_name, saved_rank.c_str(), 1);
+    else
+      unsetenv(rank_name);
+  };
+  auto fail_test = [&](const char *message) {
+    restore_environment();
+    return failf("%s", message);
+  };
+
+  if (unsetenv(marker_name) != 0 || setenv(rank_name, "7", 1) != 0)
+    return fail_test("failed to configure READY marker test environment");
+  if (capture_stderr(
+          [&]() {
+            init_rc = open_plugin_session_for_comm(&session, plugin_path,
+                                                   &policy, 700, 8, 1);
+            if (init_rc == 0)
+              close_plugin_session(&session);
+          },
+          &captured) != 0)
+    return fail_test("failed to capture default plugin stderr");
+  if (init_rc != 0)
+    return fail_test("plugin initialization failed with READY marker disabled");
+  if (captured.find(marker_prefix) != std::string::npos)
+    return fail_test("plugin emitted READY marker without benchmark opt-in");
+
+  if (setenv(marker_name, "1", 1) != 0)
+    return fail_test("failed to enable READY marker test environment");
+  init_rc = -1;
+  if (capture_stderr(
+          [&]() {
+            init_rc = open_plugin_session_for_comm(&session, plugin_path,
+                                                   &policy, 701, 8, 1);
+            if (init_rc == 0)
+              close_plugin_session(&session);
+          },
+          &captured) != 0)
+    return fail_test("failed to capture opted-in plugin stderr");
+  if (init_rc != 0)
+    return fail_test("plugin initialization failed with READY marker enabled");
+  if (captured.find(expected_marker) == std::string::npos)
+    return fail_test("opted-in plugin did not emit the per-rank READY marker");
+
+  restore_environment();
+  printf("benchmark READY marker opt-in: PASS\n");
+  return 0;
 }
 
 static int run_policy_once(struct plugin_session *session, ncclFunc_t coll_type,
@@ -892,6 +979,136 @@ static int test_size_aware_policies(const char *plugin_path) {
 
   close_plugin_session(&session);
   printf("size_aware correctness: PASS\n");
+  return 0;
+}
+
+static int test_nvl72_size_aware_policy(const char *plugin_path) {
+  const struct policy_case policy = {
+      "nvl72_size_aware", NCCL_POLICY_TEST_NVL72_SIZE_AWARE_BPF_PATH,
+      "strict"};
+  struct nvl_case {
+    const char *label;
+    size_t n_ranks;
+    size_t n_nodes;
+    int n_domains;
+    int min_ranks;
+    int max_ranks;
+    ncclFunc_t coll_type;
+    size_t n_bytes;
+    int provide_nvl_info;
+    int expected_algo;
+    int expected_proto;
+  } cases[] = {
+      {"r3", 3, 1, 1, 3, 3, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r4-window-low", 4, 1, 1, 4, 4, ncclFuncAllReduce, 4u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r4-window-high", 4, 1, 1, 4, 4, ncclFuncAllReduce, 32u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r4-below-window", 4, 1, 1, 4, 4, ncclFuncAllReduce,
+       (4u << 20) - 1, 1,
+       -1, -1},
+      {"r4-above-window", 4, 1, 1, 4, 4, ncclFuncAllReduce,
+       (32u << 20) + 1, 1,
+       -1, -1},
+      {"r5", 5, 1, 1, 5, 5, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r7", 7, 1, 1, 7, 7, ncclFuncAllReduce, 4u << 20, 1, -1, -1},
+      {"r8-ll128", 8, 1, 1, 8, 8, ncclFuncAllReduce, 16u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_LL128},
+      {"r8-simple-low", 8, 1, 1, 8, 8, ncclFuncAllReduce, 64u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
+      {"r8-simple-high", 8, 1, 1, 8, 8, ncclFuncAllReduce, 192u << 20, 1,
+       NCCL_ALGO_RING, NCCL_PROTO_SIMPLE},
+      {"r8-gap", 8, 1, 1, 8, 8, ncclFuncAllReduce, 48u << 20, 1, -1, -1},
+      {"r8-above-window", 8, 1, 1, 8, 8, ncclFuncAllReduce,
+       (192u << 20) + 1, 1, -1, -1},
+      {"r9", 9, 1, 1, 9, 9, ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+      {"multiple-domains", 8, 1, 2, 4, 4, ncclFuncAllReduce, 16u << 20, 1,
+       -1, -1},
+      {"multi-node-two-domains", 8, 2, 2, 4, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"multi-node-single-domain", 8, 2, 1, 8, 8, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"non-allreduce", 4, 1, 1, 4, 4, ncclFuncAllGather, 16u << 20, 1, -1,
+       -1},
+      {"nonuniform-domains", 8, 1, 1, 4, 8, ncclFuncAllReduce, 16u << 20,
+       1, -1, -1},
+      {"invalid-negative-domain", 4, 1, -1, 4, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"invalid-zero-domain-size", 4, 1, 1, 0, 4, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+      {"invalid-rank-coverage", 8, 1, 3, 2, 2, ncclFuncAllReduce,
+       16u << 20, 1, -1, -1},
+#if SIZE_MAX > UINT32_MAX
+      {"rank-count-truncation", (size_t)UINT32_MAX + 5, 1, 1, 4, 4,
+       ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+      {"node-count-truncation", 4, (size_t)UINT32_MAX + 2, 1, 4, 4,
+       ncclFuncAllReduce, 16u << 20, 1, -1, -1},
+#endif
+      {"null-nvl-info", 4, 1, 0, 0, 0, ncclFuncAllReduce, 16u << 20, 0, -1,
+       -1},
+  };
+
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+    ncclNvlDomainInfo_v5_t nvl_info = {};
+    struct plugin_session session;
+    struct decision_result decision = {-1, -1, -1};
+    nvl_info.nNvlDomains = cases[i].n_domains;
+    nvl_info.minRanksPerNvlDomain = cases[i].min_ranks;
+    nvl_info.maxRanksPerNvlDomain = cases[i].max_ranks;
+
+    if (open_plugin_session_for_comm_with_nvl(
+            &session, plugin_path, &policy, i + 100, cases[i].n_ranks,
+            cases[i].n_nodes,
+            cases[i].provide_nvl_info ? &nvl_info : NULL) != 0)
+      return -1;
+    if (run_policy_once(&session, cases[i].coll_type, cases[i].n_bytes, 1, 0,
+                        1, &decision) != 0 ||
+        expect_choice(policy.name, cases[i].label, &decision,
+                      cases[i].expected_algo, cases[i].expected_proto, 0) !=
+            0) {
+      close_plugin_session(&session);
+      return -1;
+    }
+    close_plugin_session(&session);
+  }
+
+  struct legacy_nccl_policy_ctx_v1 {
+    uint64_t n_bytes;
+    uint64_t last_latency_ns;
+    uint64_t avg_latency_ns;
+    uint64_t rolling_p99_ns;
+    uint64_t call_count;
+    uint32_t coll_type;
+    uint32_t num_pipe_ops;
+    uint32_t reg_buff;
+    uint32_t n_ranks;
+    uint32_t n_nodes;
+    uint32_t current_channels;
+    uint32_t reserved;
+  } legacy_ctx = {};
+  static_assert(sizeof(legacy_ctx) == NCCL_POLICY_CTX_ABI_V1_SIZE,
+                "legacy policy context must be exactly 72 bytes");
+
+  struct plugin_session legacy_session;
+  uint64_t legacy_action = UINT64_MAX;
+  legacy_ctx.n_bytes = 16u << 20;
+  legacy_ctx.coll_type = NCCL_POLICY_COLL_ALLREDUCE;
+  legacy_ctx.n_ranks = 8;
+  legacy_ctx.n_nodes = 1;
+  if (open_plugin_session_for_comm_with_nvl(
+          &legacy_session, plugin_path, &policy, 200, 8, 1, NULL) != 0)
+    return -1;
+  if (!legacy_session.debug_execute_policy ||
+      legacy_session.debug_execute_policy(
+          legacy_session.plugin_context, &legacy_ctx, sizeof(legacy_ctx),
+          &legacy_action) != 0 ||
+      legacy_action != 0) {
+    close_plugin_session(&legacy_session);
+    return failf("nvl72_size_aware did not reject a 72-byte legacy context");
+  }
+  close_plugin_session(&legacy_session);
+
+  printf("nvl72_size_aware single-node and legacy ABI guards: PASS\n");
   return 0;
 }
 
@@ -2002,6 +2219,11 @@ int main(int argc, char **argv) {
   if (!samples)
     return failf("failed to allocate benchmark samples");
 
+  if (test_benchmark_ready_marker_opt_in(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
   if (test_verifier_matrix(plugin_path, verifier_policies,
                            sizeof(verifier_policies) /
                                sizeof(verifier_policies[0]),
@@ -2011,6 +2233,11 @@ int main(int argc, char **argv) {
   }
 
   if (test_size_aware_policies(plugin_path) != 0) {
+    free(samples);
+    return 1;
+  }
+
+  if (test_nvl72_size_aware_policy(plugin_path) != 0) {
     free(samples);
     return 1;
   }

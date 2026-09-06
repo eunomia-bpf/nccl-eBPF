@@ -7,14 +7,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(CUDAToolkit REQUIRED)
-find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h REQUIRED)
-find_path(LIBELF_INCLUDE_DIR NAMES gelf.h REQUIRED)
-find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-15 llvm-config REQUIRED)
-
 set(BPFTIME_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../bpftime)
 set(BPFTIME_BUILD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../build-bpftime CACHE PATH
     "Path to the prebuilt bpftime build directory")
+
+find_package(CUDAToolkit REQUIRED)
+find_package(Boost REQUIRED)
+find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h
+          PATHS ${BPFTIME_BUILD_DIR}/libbpf
+          NO_DEFAULT_PATH REQUIRED)
+find_path(LIBELF_INCLUDE_DIR NAMES gelf.h REQUIRED)
+find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-15 llvm-config REQUIRED)
 
 function(require_file file_path)
   if(NOT EXISTS "${file_path}")
@@ -111,6 +114,7 @@ target_include_directories(nccl-net-ebpf PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}
     ${BPF_COMPAT_DIR}
+    ${Boost_INCLUDE_DIRS}
     ${LIBBPF_INCLUDE_DIR}
     ${LIBELF_INCLUDE_DIR}
     ${BPFTIME_SOURCE_DIR}/runtime/include
