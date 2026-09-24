@@ -81,6 +81,16 @@ steady-state comparison used repetitions 4 and 5 (see
 arms under the same hardware allocation; results from another topology need
 not reproduce the paper's bandwidth numbers.
 
+For the paper's 128 MiB AllGather stability comparison, use
+`nccl-tests/build/all_gather_perf` with `-b 128M -e 128M -g 8 -n 50 -w 20`.
+Launch the no-plugin and `nvlink_ring_mid_v2` configurations independently
+20 times each, as recorded in
+[`stability-allgather-summary.md`](../tmp/stability-allgather-summary.md).
+The algorithm sweep uses the same eight-GPU AllReduce setup with
+`NCCL_ALGO=Ring` as the environment-forced comparison. The verifier,
+hot-reload, CPU-overhead, and injected-contention cases run in the
+`test_ebpf_plugin` CTest executable; they do not require a GPU.
+
 For later MPI or multi-host experiments, use `scripts/nccl_bench.sh` and set
 `HOSTLIST` when needed. Its `selftest` mode prints the resolved command without
 starting a benchmark, and its policy arms require a successful plugin-ready
@@ -96,6 +106,7 @@ uses one GPU per MPI rank and is not the paper's original `-g 8` command.
 | B300 AllReduce and algorithm sweep | [`experiment-results-b300.md`](../tmp/experiment-results-b300.md), [`policy-v2-results.md`](../tmp/policy-v2-results.md), [`protocol-sweep-results.md`](../tmp/protocol-sweep-results.md) |
 | Profiler and tuner interaction | [`profiler-adapter-results.md`](../tmp/profiler-adapter-results.md), [`composability-v2-experiment.md`](../tmp/composability-v2-experiment.md) |
 | AllGather stability | [`stability-allgather-summary.md`](../tmp/stability-allgather-summary.md) |
+| Net plugin | [`src/nccl-net-ebpf-plugin/README.md`](../../src/nccl-net-ebpf-plugin/README.md), [`net-plugin-experiment.md`](../tmp/net-plugin-experiment.md) |
 
 These are the tracked experimental summaries and captured output. Some notes
 refer to raw logs under ignored `docs/tmp/` paths that were not committed;
