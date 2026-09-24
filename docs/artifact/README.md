@@ -53,26 +53,39 @@ scripts/test_nccl_bench.sh
 ## Repeat a GPU benchmark
 
 The paper's GPU evaluation used eight NVIDIA B300 GPUs with NVLink, NCCL
-2.29.7, and nccl-tests. Use the source-built NCCL from the pinned submodule,
-the built policy plugin, and a matching nccl-tests binary. For example:
+2.29.7, and nccl-tests 2.18.0. Its AllReduce runs used one nccl-tests process
+with `-g 8`. Use the source-built NCCL from the pinned submodule and the built
+policy plugin. The recorded command shape for the five independent launches
+per arm was `-b 1M -e 8G -f 2 -g 8 -n 50 -w 10`:
 
 ```sh
-export NCCL_LIB_DIR="$PWD/nccl/build/lib"
-export TEST_BIN="$PWD/nccl-tests/build/all_reduce_perf_mpi"
-export NPROC=8
-export MSG_MIN=4M MSG_MAX=128M ITERS=50 WARMUP=10 CHECK=1
+export LD_LIBRARY_PATH="$PWD/nccl/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TEST_BIN="$PWD/nccl-tests/build/all_reduce_perf"
+export NCCL_TUNER_PLUGIN="$PWD/src/nccl-policy-plugin/build/libnccl-policy.so"
+export NCCL_POLICY_BPF_PATH="$PWD/src/nccl-policy-plugin/build/ebpf-policies/nvlink_ring_mid_v2.bpf.o"
+mkdir -p scripts/results/paper-b300
 
-ARM=baseline scripts/nccl_bench.sh run
-ARM=noop scripts/nccl_bench.sh run
-ARM=policy:nvlink_ring_mid_v2 scripts/nccl_bench.sh run
+for rep in 1 2 3 4 5; do
+  env -u NCCL_TUNER_PLUGIN -u NCCL_POLICY_BPF_PATH \
+    "$TEST_BIN" -b 1M -e 8G -f 2 -g 8 -n 50 -w 10 \
+    > "scripts/results/paper-b300/baseline-r${rep}.log" 2>&1
+  "$TEST_BIN" -b 1M -e 8G -f 2 -g 8 -n 50 -w 10 \
+    > "scripts/results/paper-b300/policy-r${rep}.log" 2>&1
+done
 ```
 
-Set `HOSTLIST` for a multi-host Open MPI run. `scripts/nccl_bench.sh selftest`
-prints the resolved command and checks required policy files without starting
-the benchmark. The runner requires a successful plugin-ready marker from each
-MPI rank before it labels a result as a policy run. Run baseline and policy
+Inspect the plugin initialization lines and nccl-tests `#wrong` column in each
+log. The recorded `nvlink_ring_mid_v2` run had cold-start variability; its
+steady-state comparison used repetitions 4 and 5 (see
+[`policy-v2-results.md`](../tmp/policy-v2-results.md)). Run baseline and policy
 arms under the same hardware allocation; results from another topology need
 not reproduce the paper's bandwidth numbers.
+
+For later MPI or multi-host experiments, use `scripts/nccl_bench.sh` and set
+`HOSTLIST` when needed. Its `selftest` mode prints the resolved command without
+starting a benchmark, and its policy arms require a successful plugin-ready
+marker from each MPI rank before labeling a result as a policy run. This runner
+uses one GPU per MPI rank and is not the paper's original `-g 8` command.
 
 ## Evidence retained in this repository
 
