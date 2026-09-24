@@ -25,7 +25,7 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 
 **Tuner+Profiler Plugin** (`src/nccl-policy-plugin/`) -- Implements NCCL's Tuner v5 and Profiler v6 interfaces in a single shared library. On each `getCollInfo` call, it executes an eBPF policy program that receives a context (message size, collective type, rank count, profiler-fed telemetry) and returns a packed action (algorithm, protocol, channel count). The profiler adapter can execute a separate eBPF program that writes runtime latency data into the tuner program's communicator-scoped telemetry map, closing the telemetry loop.
 
-**Net Plugin** (`src/nccl-net-ebpf-plugin/`) -- Wraps NCCL's built-in Socket transport (Net v11 interface). Executes eBPF hooks on init, listen, connect, accept, isend, irecv, and finalize events. Designed for transport-layer observability and policy enforcement.
+**Net Plugin** (`src/nccl-net-ebpf-plugin/`) -- Prototype wrapping NCCL's built-in Socket transport (Net v11 interface). Executes eBPF hooks on init, listen, connect, accept, isend, irecv, and finalize events. The current program records transport statistics; it does not enforce transport decisions.
 
 **eBPF Policies** (`src/ebpf-policies/`) -- Verified eBPF programs compiled with `clang -target bpf`. Includes:
 - `noop.bpf.c` -- Passthrough (no override), used for overhead measurement
@@ -38,6 +38,22 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
   multi-node communicators unchanged
 - `bad_*.bpf.c` -- Intentionally unsafe programs for verifier testing (div-by-zero, OOB access, stack overflow, infinite loop, etc.)
 
+### NCCL source compatibility
+
+The tuner and profiler implementation uses NCCL's existing plugin ABIs. It
+does not require changes to NCCL source or a custom NCCL build. The net plugin
+is a narrower prototype: it forwards to NCCL's **internal** Socket backend by
+looking up `ncclNetSocket` at runtime. With the pinned NCCL source and its
+default hidden-symbol build, that symbol is not exported, so this particular
+Socket wrapper cannot be run against an unmodified build. The recorded net
+plugin experiment used a one-line NCCL visibility change; see
+[`docs/tmp/net-plugin-experiment.md`](docs/tmp/net-plugin-experiment.md).
+Exporting the symbol is not required for the tuner/profiler, nor is it a
+change to the eBPF policy programs. A net plugin that implements its own
+transport or wraps a separately exported backend could avoid changing NCCL,
+but that is not the implementation measured here and has not been validated
+by this artifact.
+
 ## Prerequisites
 
 - NVIDIA GPU with CUDA toolkit
@@ -46,12 +62,19 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 - libelf-dev, zlib1g-dev, libzstd-dev, libboost-dev
 - Pre-built bpftime (at `build-bpftime/`; see the [bpftime repository](https://github.com/eunomia-bpf/bpftime) for build instructions)
 - MPI implementation (for running nccl-tests)
+- [NVIDIA nccl-tests](https://github.com/NVIDIA/nccl-tests), installed and
+  built separately; it is not included or pinned as a submodule here. The
+  paper's GPU measurements used nccl-tests 2.18.0.
 
 ## Build
 
 On Ubuntu, `make install` installs the host build dependencies used by the
 Makefile, including CMake and LLVM 15. CUDA, NCCL, bpftime, MPI, and nccl-tests
 remain separate prerequisites.
+The example benchmark paths below assume a separately built `nccl-tests/`
+checkout next to `nccl/`; see the upstream build instructions for CUDA,
+`NCCL_HOME`, and optional `MPI=1` settings. A missing `nccl-tests/` directory
+is an unmet external prerequisite, not a missing paper source file.
 
 ### 1. Initialize submodules
 
@@ -64,6 +87,23 @@ git submodule update --init --recursive
 ```bash
 make -C nccl -j$(nproc) src.build BUILDDIR=$(pwd)/nccl/build
 ```
+
+### Prepare nccl-tests for GPU benchmarks
+
+NVIDIA maintains `nccl-tests` separately from NCCL. To obtain the version
+used for the paper and produce the single-process binaries referenced below:
+
+```bash
+git clone --branch v2.18.0 --depth 1 https://github.com/NVIDIA/nccl-tests.git nccl-tests
+make -C nccl-tests -j$(nproc) NCCL_HOME="$PWD/nccl/build"
+```
+
+MPI examples additionally need MPI-enabled binaries. Build those from the
+same checkout with `MPI=1 NAME_SUFFIX=_mpi` and an `MPI_HOME` appropriate for
+your installation, as described in the
+[upstream build instructions](https://github.com/NVIDIA/nccl-tests#build).
+The `nccl-tests/` checkout is a separate local dependency, not part of this
+repository; avoid adding it to a paper-artifact commit.
 
 ### 3. Build bpftime
 
@@ -83,6 +123,12 @@ cmake --build src/nccl-policy-plugin/build -j$(nproc)
 This produces `src/nccl-policy-plugin/build/libnccl-policy.so` and compiles all eBPF policy objects into `src/nccl-policy-plugin/build/ebpf-policies/`.
 
 ### 5. Build the net plugin
+
+Building the library alone does not make its Socket backend available. Check
+whether your NCCL library exports `ncclNetSocket` before attempting the net
+plugin example below. The pinned NCCL source does not export it in a default
+build; the experiment documented a visibility change. The tuner/profiler build
+and GPU policy benchmarks do not need this symbol.
 
 ```bash
 cmake -S src/nccl-net-ebpf-plugin -B src/nccl-net-ebpf-plugin/build

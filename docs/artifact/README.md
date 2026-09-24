@@ -35,6 +35,10 @@ sudo apt-get install -y --no-install-recommends make unzip zip \
 The top-level [README](../../README.md) gives the full prerequisites and build
 instructions. The repository pins the NCCL, bpftime, libbpf, and bpftool
 submodule revisions. CUDA and a compatible GPU are required for the full build.
+`nccl-tests` is an external prerequisite, not a submodule or bundled artifact;
+the paper used version 2.18.0. Obtain and build it separately as described in
+the top-level README. The benchmark commands below assume its binaries are at
+`nccl-tests/build/`.
 
 ```sh
 git submodule update --init --recursive
@@ -43,12 +47,24 @@ make test
 ```
 
 `make test` builds both NCCL plugins, runs the CTest policy/verifier/hot-reload
-tests, and runs the hardware-free benchmark-driver regression. The driver test
+tests, and runs the hardware-free benchmark-driver regression. It does not
+exercise the net plugin's Socket forwarding path. The driver test
 can also run on a host without CUDA:
 
 ```sh
 scripts/test_nccl_bench.sh
 ```
+
+The tuner/profiler plugin uses existing NCCL interfaces without modifying
+NCCL source. The net plugin prototype is different: it wraps NCCL's internal
+Socket backend through `ncclNetSocket`, which the pinned NCCL source does not
+export in its default build. Its recorded experiment used an NCCL symbol-
+visibility change. The net plugin is therefore **not** demonstrated to run
+unchanged on the pinned NCCL build; it is not needed for the paper's B300
+tuner-policy results. See the [net plugin notes](../../src/nccl-net-ebpf-plugin/README.md)
+and [experiment record](../tmp/net-plugin-experiment.md). A future independent
+Net v11 transport could avoid this internal-symbol dependency, but has not
+been implemented or measured here.
 
 ## Repeat a GPU benchmark
 
@@ -102,8 +118,10 @@ uses one GPU per MPI rank and is not the paper's original `-g 8` command.
 | Topic | Files |
 |---|---|
 | Verifier and hot reload | [`phase3-safety-results.md`](../tmp/phase3-safety-results.md), [`eval-improvement-results.md`](../tmp/eval-improvement-results.md) |
-| CPU policy overhead | [`benchmark-results.md`](../tmp/benchmark-results.md), [`phase4-results.md`](../tmp/phase4-results.md) |
-| B300 AllReduce and algorithm sweep | [`experiment-results-b300.md`](../tmp/experiment-results-b300.md), [`policy-v2-results.md`](../tmp/policy-v2-results.md), [`protocol-sweep-results.md`](../tmp/protocol-sweep-results.md) |
+| Paper's B300 CPU policy overhead | [`eval-plan-b300.md`](../eval-plan-b300.md) (summarized measurements; referenced raw logs are not tracked) |
+| Earlier RTX 5090 CPU/integration experiments (not the paper's B300 CPU table) | [`benchmark-results.md`](../tmp/benchmark-results.md), [`phase4-results.md`](../tmp/phase4-results.md) |
+| B300 AllReduce and algorithm sweep | [`experiment-results-b300.md`](../tmp/experiment-results-b300.md), [`policy-v2-results.md`](../tmp/policy-v2-results.md), [`eval-plan-b300.md`](../eval-plan-b300.md) |
+| B300 protocol-only sweep (different from the algorithm sweep) | [`protocol-sweep-results.md`](../tmp/protocol-sweep-results.md) |
 | Profiler and tuner interaction | [`profiler-adapter-results.md`](../tmp/profiler-adapter-results.md), [`composability-v2-experiment.md`](../tmp/composability-v2-experiment.md) |
 | AllGather stability | [`stability-allgather-summary.md`](../tmp/stability-allgather-summary.md) |
 | Net plugin | [`src/nccl-net-ebpf-plugin/README.md`](../../src/nccl-net-ebpf-plugin/README.md), [`net-plugin-experiment.md`](../tmp/net-plugin-experiment.md) |

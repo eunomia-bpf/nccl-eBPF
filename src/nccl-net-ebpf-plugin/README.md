@@ -6,9 +6,31 @@ NCCL Net v11 plugin that wraps the built-in Socket transport and executes eBPF h
 
 The plugin resolves NCCL's internal `ncclNetSocket` symbol at runtime and delegates all transport operations to it. Before or after each operation, it invokes an eBPF program with a `nccl_net_ebpf_ctx` struct containing the hook type, device index, message size, tag, communicator ID, and timestamp.
 
+### Compatibility limit
+
+The Net v11 plugin interface itself does not require an NCCL source change,
+but this implementation depends on the *internal* `ncclNetSocket` object being
+exported from `libnccl.so`. The pinned NCCL source is built with hidden symbols
+and does not mark that object for export. The recorded Socket-wrapper
+experiment used a one-line visibility change to NCCL and a rebuild (see
+[`docs/tmp/net-plugin-experiment.md`](../../docs/tmp/net-plugin-experiment.md)).
+Without an exported symbol, all three runtime lookup strategies in
+`plugin.cpp` fail and the wrapper cannot forward to the built-in backend.
+Before trying this plugin, check the exact NCCL library you will load:
+
+```sh
+nm -D nccl/build/lib/libnccl.so | grep -w ncclNetSocket
+```
+
+An empty result means this wrapper is not usable with that library. A
+different Net v11 implementation could use its own transport or a separately
+exported backend without changing NCCL, but that alternative is not included
+or benchmarked here. This constraint does not apply to the tuner/profiler
+plugin.
+
 Hooks are fired on: `init`, `listen`, `connect`, `accept`, `isend`, `irecv`, and `finalize`.
 
-The default eBPF program (`net_trace.bpf.c`) maintains per-hook statistics (call count, total bytes, last tag) in a shared BPF array map. Custom programs can implement transport-layer policies such as rate limiting, anomaly detection, or selective logging.
+The default eBPF program (`net_trace.bpf.c`) maintains per-hook statistics (call count, total bytes, last tag) in a shared BPF array map. The current wrapper executes hooks for observation; it does not consume a BPF return value to alter or reject transport operations. Rate limiting or admission policy would require additional implementation and validation.
 
 ## Build
 
