@@ -3,6 +3,9 @@ name: Build and public docker image
 on:
   push:
     branches: "master"
+    paths:
+      - "dockerfile"
+      - ".github/workflows/docker.yml"
 
 jobs:
   build-and-push-image:

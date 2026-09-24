@@ -4,6 +4,10 @@ NCCLbpf brings verified eBPF policy execution to [NCCL](https://github.com/NVIDI
 
 This is a research prototype targeting the eBPF Workshop at SOSP 2026.
 
+The paper artifact entry point, including frozen submission files, build
+checks, benchmark commands, and an evidence index, is
+[`docs/artifact/README.md`](docs/artifact/README.md).
+
 ## Architecture
 
 NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:

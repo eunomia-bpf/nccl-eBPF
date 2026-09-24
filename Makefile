@@ -1,7 +1,7 @@
 POLICY_BUILD_DIR ?= src/nccl-policy-plugin/build
 NET_BUILD_DIR ?= src/nccl-net-ebpf-plugin/build
 
-.PHONY: build test clean install
+.PHONY: build test artifact-check artifact-arxiv clean install
 
 build:
 	cmake -S src/nccl-policy-plugin -B $(POLICY_BUILD_DIR)
@@ -12,6 +12,12 @@ build:
 test: build
 	ctest --test-dir $(POLICY_BUILD_DIR) --output-on-failure
 	scripts/test_nccl_bench.sh
+
+artifact-check: artifact-arxiv
+	scripts/check_paper_artifact.sh
+
+artifact-arxiv:
+	scripts/build_paper_arxiv.sh
 
 clean:
 	@if [ -d "$(POLICY_BUILD_DIR)" ]; then \
