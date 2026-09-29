@@ -2,7 +2,9 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <cuda_runtime_api.h>
+#include <dlfcn.h>
 #include <fcntl.h>
+#include <future>
 #include <gelf.h>
 #include <inttypes.h>
 #include <linux/bpf.h>
@@ -33,6 +35,8 @@
 #include "bpftime_shm.hpp"
 #include "nccl_tuner.h"
 #include "nccl_profiler.h"
+#include "distributed_map.h"
+#include "rank_merge_verifier.h"
 #include "rank_agreement_verifier.h"
 
 #include "../ebpf-policies/policy_action.h"
@@ -85,6 +89,12 @@ struct SharedBpftimeMap {
   BpftimeMapShape shape;
 };
 
+struct DistExchangeOutcome {
+  bool ok = false;
+  ncclbpf::AgreedSnapshot snapshot;
+  std::string error;
+};
+
 struct SharedCommState {
   ncclDebugLogger_t log_function = nullptr;
   uint64_t comm_id = 0;
@@ -93,6 +103,13 @@ struct SharedCommState {
   std::mutex reload_mu;
   std::mutex profiler_mu;
   std::mutex telemetry_mu;
+  std::mutex dist_mu;
+  int rank = -1;
+  bool rank_conflict = false;
+  uint64_t dist_call_count = 0;
+  uint64_t dist_activation_call = 0;
+  bool dist_call_running = false;
+  std::future<DistExchangeOutcome> dist_pending;
   size_t tuner_refs = 0;
   size_t profiler_refs = 0;
   uint64_t profiler_write_count = 0;
@@ -103,10 +120,14 @@ struct SharedCommState {
     }
 
     std::unique_ptr<bpftime::bpftime_prog> prog;
+    std::unique_ptr<bpftime::bpftime_prog> merge_prog;
+    uint64_t policy_version = 0;
+    bool distributed = false;
     bool loaded_from_file = false;
     std::string policy_source = "hardcoded-noop";
     std::string section_name = "uprobe";
     std::unordered_map<std::string, int> map_fds;
+    std::unordered_map<std::string, BpftimeMapShape> map_shapes;
     std::unordered_set<int> owned_map_fds;
     std::vector<std::shared_ptr<SharedBpftimeMap>> shared_maps;
     std::map<int, bpftime::verifier::BpftimeMapDescriptor> verifier_maps;
@@ -119,6 +140,16 @@ struct SharedCommState {
   struct CeCollectiveEvent;
   std::unordered_set<CollectiveEvent *> open_collectives;
   std::unordered_set<CeCollectiveEvent *> pending_ce_events;
+};
+
+struct DistCallGuard {
+  SharedCommState *shared = nullptr;
+  ~DistCallGuard() {
+    if (!shared)
+      return;
+    std::lock_guard<std::mutex> lock(shared->dist_mu);
+    shared->dist_call_running = false;
+  }
 };
 
 struct TunerContext {
@@ -523,6 +554,42 @@ BpftimeMapShape map_shape(const bpftime::bpf_map_attr &attr) {
   };
 }
 
+uint64_t policy_file_version(const char *path) {
+  if (!path)
+    return 0;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return 0;
+  uint64_t value = 1469598103934665603ULL;
+  unsigned char bytes[8192];
+  ssize_t count = 0;
+  while ((count = read(fd, bytes, sizeof(bytes))) > 0)
+    for (ssize_t i = 0; i < count; ++i)
+      value = (value ^ bytes[i]) * 1099511628211ULL;
+  close(fd);
+  return count < 0 ? 0 : value;
+}
+
+uint64_t agreed_policy_version(const char *path) {
+  const uint64_t policy_hash = policy_file_version(path);
+  static const uint64_t runtime_hash = []() {
+    Dl_info info = {};
+    if (dladdr(reinterpret_cast<void *>(&agreed_policy_version), &info) == 0 ||
+        !info.dli_fname)
+      return uint64_t{0};
+    return policy_file_version(info.dli_fname);
+  }();
+  if (!policy_hash || !runtime_hash)
+    return 0;
+  return (policy_hash ^ runtime_hash) * 1099511628211ULL;
+}
+
+bool valid_distributed_map_shape(const BpftimeMapShape &shape,
+                                 uint32_t max_entries) {
+  return shape.type == BPF_MAP_TYPE_ARRAY && shape.key_size == 4 &&
+         shape.value_size == 8 && shape.max_entries == max_entries;
+}
+
 bool compatible_map_shape(const BpftimeMapShape &left,
                           const BpftimeMapShape &right) {
   return left.type == right.type && left.key_size == right.key_size &&
@@ -616,6 +683,8 @@ bool create_bpftime_maps(SharedCommState *shared,
       policy_state->owned_map_fds.insert(fd);
     }
     policy_state->map_fds.emplace(logical_name ? logical_name : "", fd);
+    policy_state->map_shapes.emplace(logical_name ? logical_name : "",
+                                     map_shape(attr));
     policy_state->verifier_maps.emplace(
         fd, bpftime::verifier::BpftimeMapDescriptor{
                 .original_fd = fd,
@@ -816,8 +885,15 @@ void attach_kernel_maps(SharedCommState *shared,
 }
 
 bool extract_program_spec(SharedCommState *shared, struct bpf_object *obj,
-                          ProgramSpec *spec) {
+                          ProgramSpec *spec,
+                          const char *required_section = nullptr) {
   struct bpf_program *prog = bpf_object__next_program(obj, nullptr);
+  if (required_section) {
+    while (prog && (!bpf_program__section_name(prog) ||
+                    strcmp(bpf_program__section_name(prog),
+                           required_section) != 0))
+      prog = bpf_object__next_program(obj, prog);
+  }
   const struct bpf_insn *insns = nullptr;
   size_t insn_cnt = 0;
 
@@ -1126,6 +1202,9 @@ bool load_program_from_object(SharedCommState *shared,
   }
 
   policy_state->policy_source = path;
+  policy_state->policy_version = agreed_policy_version(path);
+  if (policy_state->policy_version == 0)
+    return false;
 
   if (!extract_program_spec(shared, obj.get(), &spec)) {
     log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
@@ -1135,6 +1214,45 @@ bool load_program_from_object(SharedCommState *shared,
   }
   if (!create_bpftime_maps(shared, policy_state, obj.get()))
     return false;
+  const bool any_dist_map =
+      policy_state->map_fds.count("local_latency") ||
+      policy_state->map_fds.count("rank_slots") ||
+      policy_state->map_fds.count("agreed_map");
+  if (any_dist_map) {
+    const char *dist_opt_in = getenv("NCCL_POLICY_EXPERIMENTAL_DIST_MAP");
+    if (!dist_opt_in || strcmp(dist_opt_in, "1") != 0) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "distributed map requires explicit experimental opt-in");
+      return false;
+    }
+    const auto local = policy_state->map_shapes.find("local_latency");
+    const auto ranks = policy_state->map_shapes.find("rank_slots");
+    const auto agreed = policy_state->map_shapes.find("agreed_map");
+    if (local == policy_state->map_shapes.end() ||
+        ranks == policy_state->map_shapes.end() ||
+        agreed == policy_state->map_shapes.end() ||
+        !valid_distributed_map_shape(local->second, 1) ||
+        !valid_distributed_map_shape(ranks->second, 8) ||
+        !valid_distributed_map_shape(agreed->second, 1) ||
+        !shared || shared->n_nodes != 1 ||
+        shared->n_ranks == 0 || shared->n_ranks > 8) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "distributed map requires one host and matching "
+                         "local_latency/rank_slots/agreed_map array schemas");
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> dist_lock(shared->dist_mu);
+      if (shared->rank_conflict) {
+        log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                           "multiple local ranks share one communicator state");
+        return false;
+      }
+    }
+    policy_state->distributed = true;
+  }
   attach_kernel_maps(shared, policy_state);
   if (!relocate_program_maps(shared, path, policy_state, &spec))
     return false;
@@ -1175,6 +1293,49 @@ bool load_program_from_object(SharedCommState *shared,
     log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
                        NCCL_LOG_WARN, "failed to JIT-load policy %s", path);
     return false;
+  }
+
+  if (policy_state->distributed) {
+    ProgramSpec merge_spec;
+    if (!extract_program_spec(shared, obj.get(), &merge_spec, "dist_merge") ||
+        !relocate_program_maps(shared, path, policy_state, &merge_spec) ||
+        !verify_program(shared, policy_state, merge_spec)) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "distributed policy has no verified dist_merge section");
+      return false;
+    }
+    std::unordered_set<int> rank_slots_fds{
+        policy_state->map_fds.at("rank_slots")};
+    std::unordered_set<int> agreed_fds{
+        policy_state->map_fds.at("agreed_map")};
+    std::string merge_error;
+    if (!rank_merge_verifier::check(merge_spec.insns, rank_slots_fds,
+                                    agreed_fds, &merge_error)) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "distributed merge rejected %s: %s", path,
+                         merge_error.c_str());
+      return false;
+    }
+    auto merge_config = bpftime::construct_agent_config_from_env();
+    merge_config.set_vm_name("llvm");
+    policy_state->merge_prog = std::make_unique<bpftime::bpftime_prog>(
+        merge_spec.insns.data(), merge_spec.insns.size(),
+        merge_spec.name.c_str(), std::move(merge_config));
+    if (!policy_state->merge_prog ||
+        !register_helpers(policy_state->merge_prog.get()) ||
+        policy_state->merge_prog->bpftime_prog_load(true) < 0) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "failed to JIT-load distributed merge for %s", path);
+      return false;
+    }
+    uint32_t key = 0;
+    uint64_t version_zero = 0;
+    if (bpftime_map_update_elem(policy_state->map_fds.at("agreed_map"),
+                                &key, &version_zero, BPF_ANY) != 0)
+      return false;
   }
 
   policy_state->loaded_from_file = true;
@@ -1482,6 +1643,16 @@ bool record_profiler_telemetry(SharedCommState *shared, uint32_t coll_type,
     recorded = record_real_telemetry(shared, coll_type, n_bytes, latency_ns,
                                      channel_count, &sample_count);
   }
+  auto active_policy = load_active_policy(shared);
+  if (active_policy && active_policy->distributed) {
+    const uint32_t zero = 0;
+    std::lock_guard<std::mutex> exec_lock(active_policy->exec_mu);
+    if (bpftime_map_update_elem(
+            active_policy->map_fds.at("local_latency"), &zero,
+            &latency_ns, BPF_ANY) != 0)
+      return false;
+    recorded = true;
+  }
   if (!recorded)
     return false;
 
@@ -1679,6 +1850,127 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
   return ncclSuccess;
 }
 
+constexpr uint64_t kDistExchangeCalls = 1024;
+
+bool activate_distributed_snapshot(
+    SharedCommState *shared,
+    SharedCommState::LoadedPolicyState *policy_state,
+    uint64_t call_number, std::unique_lock<std::mutex> *dist_lock) {
+  if (shared->dist_activation_call == 0 ||
+      call_number < shared->dist_activation_call)
+    return true;
+  if (call_number != shared->dist_activation_call ||
+      !shared->dist_pending.valid())
+    return false;
+
+  std::future<DistExchangeOutcome> pending =
+      std::move(shared->dist_pending);
+  shared->dist_activation_call = 0;
+  dist_lock->unlock();
+  DistExchangeOutcome outcome;
+  try {
+    outcome = pending.get();
+  } catch (...) {
+    log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                       "distributed exchange worker failed");
+    return false;
+  }
+  if (!outcome.ok ||
+      outcome.snapshot.policy_version != policy_state->policy_version ||
+      outcome.snapshot.activation_call != call_number ||
+      outcome.snapshot.rank_writes.size() != shared->n_ranks) {
+    log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                       "distributed exchange failed at call %" PRIu64 ": %s",
+                       call_number, outcome.error.c_str());
+    return false;
+  }
+
+  std::lock_guard<std::mutex> exec_lock(policy_state->exec_mu);
+  const int rank_slots_fd = policy_state->map_fds.at("rank_slots");
+  uint64_t expected_max = 0;
+  for (size_t rank = 0; rank < shared->n_ranks; ++rank) {
+    const auto &entry = outcome.snapshot.rank_writes[rank];
+    if (entry.rank != rank || entry.write.map != "local_latency" ||
+        entry.write.key.size() != sizeof(uint32_t) ||
+        entry.write.value.size() != sizeof(uint64_t))
+      return false;
+    uint32_t key = static_cast<uint32_t>(rank);
+    uint64_t value = 0;
+    memcpy(&value, entry.write.value.data(), sizeof(value));
+    expected_max = std::max(expected_max, value);
+    if (bpftime_map_update_elem(rank_slots_fd, &key, &value, BPF_ANY) != 0)
+      return false;
+  }
+  nccl_dist_merge_ctx merge_ctx = {
+      .n_ranks = static_cast<uint32_t>(shared->n_ranks),
+      .reserved = 0,
+  };
+  uint64_t merge_result = 0;
+  if (!policy_state->merge_prog ||
+      policy_state->merge_prog->bpftime_prog_exec(
+          &merge_ctx, sizeof(merge_ctx), &merge_result) < 0 ||
+      merge_result != 0)
+    return false;
+  const uint32_t zero = 0;
+  const auto *agreed = static_cast<const uint64_t *>(
+      bpftime_map_lookup_elem(policy_state->map_fds.at("agreed_map"), &zero));
+  if (!agreed || *agreed != expected_max)
+    return false;
+
+  log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_INFO,
+                     "activated distributed policy version %" PRIu64
+                     " round %" PRIu64 " at call %" PRIu64,
+                     outcome.snapshot.policy_version,
+                     outcome.snapshot.round, call_number);
+  return true;
+}
+
+bool start_distributed_exchange(
+    SharedCommState *shared,
+    SharedCommState::LoadedPolicyState *policy_state,
+    uint64_t call_number) {
+  if (shared->rank < 0 ||
+      static_cast<size_t>(shared->rank) >= shared->n_ranks ||
+      shared->dist_pending.valid() ||
+      call_number > UINT64_MAX - kDistExchangeCalls)
+    return false;
+
+  const uint32_t zero = 0;
+  uint64_t latency = 0;
+  {
+    std::lock_guard<std::mutex> exec_lock(policy_state->exec_mu);
+    const void *value = bpftime_map_lookup_elem(
+        policy_state->map_fds.at("local_latency"), &zero);
+    if (!value)
+      return false;
+    memcpy(&latency, value, sizeof(latency));
+  }
+  ncclbpf::RankProposal local;
+  local.rank = static_cast<uint32_t>(shared->rank);
+  local.n_ranks = static_cast<uint32_t>(shared->n_ranks);
+  local.policy_version = policy_state->policy_version;
+  local.round = call_number / kDistExchangeCalls;
+  local.activation_call = call_number + kDistExchangeCalls;
+  local.maps.push_back({"local_latency", sizeof(zero), sizeof(latency), 1});
+  ncclbpf::MapWrite write;
+  write.map = "local_latency";
+  write.key.resize(sizeof(zero));
+  write.value.resize(sizeof(latency));
+  memcpy(write.key.data(), &zero, sizeof(zero));
+  memcpy(write.value.data(), &latency, sizeof(latency));
+  local.writes.push_back(std::move(write));
+  shared->dist_activation_call = local.activation_call;
+  const uint64_t comm_id = shared->comm_id;
+  shared->dist_pending = std::async(std::launch::async,
+                                    [comm_id, local = std::move(local)]() {
+    DistExchangeOutcome outcome;
+    outcome.ok = ncclbpf::ExchangeSameHost(
+        comm_id, local, &outcome.snapshot, &outcome.error);
+    return outcome;
+  });
+  return true;
+}
+
 ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
                                    size_t n_bytes, int num_pipe_ops,
                                    float **coll_cost_table, int num_algo,
@@ -1695,6 +1987,9 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   TunerContext::SyntheticTelemetryState synthetic = {};
   int err = 0;
   std::shared_ptr<SharedCommState::LoadedPolicyState> policy_state;
+  std::unique_lock<std::mutex> dist_lock;
+  DistCallGuard dist_guard;
+  uint64_t dist_call_number = 0;
 
   if (!ctx || !ctx->shared || !n_channels)
     return ncclInternalError;
@@ -1702,6 +1997,26 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   policy_state = load_active_policy(ctx->shared.get());
   if (!policy_state || !policy_state->prog)
     return ncclInternalError;
+  if (policy_state->distributed) {
+    dist_lock = std::unique_lock<std::mutex>(ctx->shared->dist_mu);
+    if (ctx->shared->rank < 0 ||
+        static_cast<size_t>(ctx->shared->rank) >= ctx->shared->n_ranks ||
+        ctx->shared->dist_call_running ||
+        ctx->shared->rank_conflict)
+      return ncclInternalError;
+    ctx->shared->dist_call_running = true;
+    dist_guard.shared = ctx->shared.get();
+    dist_call_number = ++ctx->shared->dist_call_count;
+    if (!activate_distributed_snapshot(ctx->shared.get(),
+                                       policy_state.get(),
+                                       dist_call_number, &dist_lock)) {
+      if (dist_lock.owns_lock())
+        dist_lock.unlock();
+      return ncclInternalError;
+    }
+    if (dist_lock.owns_lock())
+      dist_lock.unlock();
+  }
   (void)policy_coll_type_from_nccl_func(coll_type, &policy_coll_type);
 
   {
@@ -1773,6 +2088,15 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
     call_count_snapshot = ctx->call_count;
   }
 
+  if (policy_state->distributed &&
+      dist_call_number % kDistExchangeCalls == 0) {
+    std::lock_guard<std::mutex> lock(ctx->shared->dist_mu);
+    if (!start_distributed_exchange(ctx->shared.get(),
+                                    policy_state.get(),
+                                    dist_call_number))
+      return ncclInternalError;
+  }
+
   if (call_count_snapshot <= 5 || call_count_snapshot % 100000 == 0) {
     fprintf(stderr,
             "[nccl-policy-plugin] call=%" PRIu64 " bytes=%zu action=%" PRIu64
@@ -1840,10 +2164,17 @@ int pluginReloadPolicyImpl(void *context, const char *policy_path,
     effective_path = getenv("NCCL_POLICY_BPF_PATH");
 
   std::lock_guard<std::mutex> lock(shared->reload_mu);
+  auto current_policy = load_active_policy(shared.get());
+  if (current_policy && current_policy->distributed) {
+    log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                       "distributed policy reload requires a cross-rank "
+                       "version commit and is disabled");
+    return -1;
+  }
   load_start_ns = monotonic_time_ns();
   auto next_policy = load_policy_state(shared.get(), effective_path);
   load_end_ns = monotonic_time_ns();
-  if (!next_policy)
+  if (!next_policy || next_policy->distributed)
     return -1;
 
   swap_start_ns = monotonic_time_ns();
@@ -1904,6 +2235,24 @@ ncclResult_t profilerInitImpl(void **context, uint64_t comm_id,
                                           log_function, false);
   ctx->comm_name = comm_name ? comm_name : "";
   ctx->rank = rank;
+  bool invalid_dist_rank = false;
+  {
+    std::lock_guard<std::mutex> dist_lock(ctx->shared->dist_mu);
+    auto active = load_active_policy(ctx->shared.get());
+    if (rank < 0 || static_cast<size_t>(rank) >= ctx->shared->n_ranks ||
+        (ctx->shared->rank >= 0 && ctx->shared->rank != rank))
+      ctx->shared->rank_conflict = true;
+    if (active && active->distributed && ctx->shared->rank_conflict)
+      invalid_dist_rank = true;
+    else if (!ctx->shared->rank_conflict)
+      ctx->shared->rank = rank;
+  }
+  if (invalid_dist_rank) {
+    release_shared_comm_state(ctx->shared, false);
+    delete ctx;
+    release_bpftime_runtime();
+    return ncclInternalError;
+  }
   ctx->use_ebpf = use_ebpf;
   ctx->activation_mask = ncclProfileColl | ncclProfileKernelCh |
                          ncclProfileCeColl;

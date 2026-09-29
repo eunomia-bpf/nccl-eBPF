@@ -142,6 +142,8 @@ add_policy_object(adaptive_channels_v2_policy adaptive_channels_v2
                   ADAPTIVE_CHANNELS_V2_BPF_O)
 add_policy_object(nvl72_size_aware_policy nvl72_size_aware
                   NVL72_SIZE_AWARE_BPF_O)
+add_policy_object(distributed_max_latency_policy distributed_max_latency
+                  DISTRIBUTED_MAX_LATENCY_BPF_O)
 
 set(POLICY_OBJECTS
     ${NOOP_BPF_O}
@@ -168,7 +170,8 @@ set(POLICY_OBJECTS
     ${NVLINK_RING_MID_V2_BPF_O}
     ${BAD_CHANNELS_BPF_O}
     ${ADAPTIVE_CHANNELS_V2_BPF_O}
-    ${NVL72_SIZE_AWARE_BPF_O})
+    ${NVL72_SIZE_AWARE_BPF_O}
+    ${DISTRIBUTED_MAX_LATENCY_BPF_O})
 
 add_custom_target(ebpf_policies ALL DEPENDS ${POLICY_OBJECTS})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in
@@ -184,7 +187,7 @@ set_target_properties(native_crash_policy PROPERTIES
     OUTPUT_NAME "native-crash-policy"
     PREFIX "lib")
 
-add_library(nccl-policy SHARED plugin.cpp)
+add_library(nccl-policy SHARED plugin.cpp distributed_map.cpp)
 add_dependencies(nccl-policy ebpf_policies)
 target_include_directories(nccl-policy PRIVATE
     ${NCCL_PUBLIC_INCLUDE_DIRS}
@@ -251,4 +254,28 @@ if(BUILD_TESTING)
            COMMAND test_rank_agreement_verifier)
   add_test(NAME nccl_policy_ebpf_plugin COMMAND test_ebpf_plugin)
   add_test(NAME nccl_policy_native_crash COMMAND test_native_crash)
+endif()
+
+add_executable(test_distributed_map test/test_distributed_map.cpp
+               distributed_map.cpp)
+target_link_libraries(test_distributed_map PRIVATE pthread)
+target_compile_definitions(test_distributed_map PRIVATE
+    NCCLBPF_EXCHANGE_WAIT_MS=300)
+if(BUILD_TESTING)
+  add_test(NAME nccl_policy_distributed_map COMMAND test_distributed_map)
+endif()
+
+add_executable(test_distributed_plugin test/test_distributed_plugin.cpp)
+add_dependencies(test_distributed_plugin nccl-policy ebpf_policies)
+target_include_directories(test_distributed_plugin PRIVATE
+    ${NCCL_PUBLIC_INCLUDE_DIRS})
+target_link_libraries(test_distributed_plugin PRIVATE dl)
+if(BUILD_TESTING)
+  foreach(rank_count IN ITEMS 2 8 9)
+    add_test(NAME nccl_policy_distributed_plugin_${rank_count}
+             COMMAND test_distributed_plugin
+               $<TARGET_FILE:nccl-policy>
+               ${DISTRIBUTED_MAX_LATENCY_BPF_O}
+               ${rank_count})
+  endforeach()
 endif()

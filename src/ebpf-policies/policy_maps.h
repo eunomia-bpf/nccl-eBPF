@@ -7,6 +7,12 @@
 #include <stdint.h>
 #endif
 
+/* Identical on all ranks after the host has exchanged rank-local slots. */
+struct nccl_dist_merge_ctx {
+  uint32_t n_ranks;
+  uint32_t reserved;
+};
+
 struct nccl_policy_telemetry_key {
   uint32_t coll_type;
   uint32_t n_nodes;
