@@ -57,6 +57,14 @@ bool MergeRankProposals(std::vector<RankProposal> proposals,
 bool ExchangeSameHost(uint64_t communicator_id, const RankProposal &local,
                       AgreedSnapshot *snapshot, std::string *error);
 
+// Experimental cross-host exchange. Every process uses the same explicit
+// coordinator IPv4 address (or IPv4-resolving DNS name) and TCP port. Rank 0
+// binds only that address; no listener is opened on other interfaces.
+// A complete prepare/acknowledge/commit round precedes local activation.
+bool ExchangeTCP(uint64_t communicator_id, const RankProposal &local,
+                 const std::string &coordinator,
+                 AgreedSnapshot *snapshot, std::string *error);
+
 }  // namespace ncclbpf
 
 #endif  // NCCLBPF_DISTRIBUTED_MAP_H_

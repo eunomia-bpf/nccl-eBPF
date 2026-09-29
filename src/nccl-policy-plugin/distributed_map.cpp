@@ -1,6 +1,9 @@
 #include "distributed_map.h"
 
 #include <sys/socket.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -464,6 +467,272 @@ bool ExchangeSameHost(uint64_t communicator_id, const RankProposal &local,
     close(peer);
   close(listener);
   unlink(path.c_str());
+  return ok;
+}
+
+
+namespace {
+
+bool ParseCoordinator(const std::string &endpoint, sockaddr_in *address,
+                      std::string *error) {
+  const size_t colon = endpoint.rfind(':');
+  if (colon == std::string::npos || colon == 0 ||
+      colon + 1 == endpoint.size() ||
+      endpoint.find(':') != colon) {
+    SetError(error, "coordinator must be IPv4-or-DNS:port");
+    return false;
+  }
+  const std::string host = endpoint.substr(0, colon);
+  const std::string port = endpoint.substr(colon + 1);
+  for (char c : port)
+    if (c < '0' || c > '9') {
+      SetError(error, "invalid coordinator TCP port");
+      return false;
+    }
+  const unsigned long port_number = std::strtoul(port.c_str(), nullptr, 10);
+  if (port_number == 0 || port_number > 65535) {
+    SetError(error, "invalid coordinator TCP port");
+    return false;
+  }
+  addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_NUMERICSERV;
+  addrinfo *resolved = nullptr;
+  const int rc = getaddrinfo(host.c_str(), port.c_str(), &hints, &resolved);
+  if (rc != 0 || !resolved) {
+    if (resolved)
+      freeaddrinfo(resolved);
+    SetError(error, "unable to resolve coordinator IPv4 address");
+    return false;
+  }
+  *address = *reinterpret_cast<sockaddr_in *>(resolved->ai_addr);
+  freeaddrinfo(resolved);
+  if (address->sin_addr.s_addr == htonl(INADDR_ANY) ||
+      address->sin_addr.s_addr == htonl(INADDR_BROADCAST)) {
+    SetError(error, "coordinator must identify one interface");
+    return false;
+  }
+  return true;
+}
+
+Bytes WireFrame(uint8_t type, uint64_t communicator_id, const Bytes &body = {}) {
+  Bytes frame{type};
+  Put64(&frame, communicator_id);
+  frame.insert(frame.end(), body.begin(), body.end());
+  return frame;
+}
+
+bool CheckWireFrame(const Bytes &frame, uint8_t type,
+                    uint64_t communicator_id, Bytes *body) {
+  size_t offset = 1;
+  uint64_t actual_id = 0;
+  if (frame.empty() || frame[0] != type ||
+      !Get64(frame, &offset, &actual_id) ||
+      actual_id != communicator_id)
+    return false;
+  if (body)
+    body->assign(frame.begin() + offset, frame.end());
+  return true;
+}
+
+int ConnectUntil(const sockaddr_in &address, Deadline deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+      return -1;
+    const int rc = connect(fd, reinterpret_cast<const sockaddr *>(&address),
+                           sizeof(address));
+    if (rc == 0)
+      return fd;
+    if (errno == EINPROGRESS && ReadyUntil(fd, POLLOUT, deadline)) {
+      int socket_error = 0;
+      socklen_t length = sizeof(socket_error);
+      if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == 0 &&
+          socket_error == 0)
+        return fd;
+    }
+    close(fd);
+    if (std::chrono::steady_clock::now() < deadline)
+      usleep(1000);
+  }
+  return -1;
+}
+
+bool ClientExchangeTCP(int fd, uint64_t communicator_id,
+                       const RankProposal &local, Deadline deadline,
+                       AgreedSnapshot *snapshot, std::string *error) {
+  Bytes proposal;
+  EncodeProposal(&proposal, local);
+  if (!SendFrame(fd, WireFrame('P', communicator_id, proposal), deadline)) {
+    SetError(error, "failed to send TCP rank proposal");
+    return false;
+  }
+  Bytes response;
+  Bytes body;
+  std::vector<RankProposal> proposals;
+  if (!ReceiveFrame(fd, &response, deadline) ||
+      !CheckWireFrame(response, 'R', communicator_id, &body) ||
+      !DecodeAll(body, &proposals)) {
+    SetError(error, "invalid TCP prepare response");
+    return false;
+  }
+  bool found_local = false;
+  for (const auto &received : proposals) {
+    if (received.rank != local.rank)
+      continue;
+    Bytes encoded;
+    EncodeProposal(&encoded, received);
+    found_local = encoded == proposal;
+    break;
+  }
+  if (!found_local ||
+      !MergeRankProposals(std::move(proposals), snapshot, error)) {
+    if (!error || error->empty())
+      SetError(error, "invalid TCP prepare response");
+    return false;
+  }
+  if (!SendFrame(fd, WireFrame('A', communicator_id), deadline) ||
+      !ReceiveFrame(fd, &response, deadline) ||
+      !CheckWireFrame(response, 'C', communicator_id, &body) ||
+      !body.empty()) {
+    SetError(error, "TCP exchange did not commit on every rank");
+    return false;
+  }
+  return true;
+}
+
+bool CoordinatorExchangeTCP(int listener, uint64_t communicator_id,
+                            const RankProposal &local, Deadline deadline,
+                            AgreedSnapshot *snapshot, std::string *error) {
+  std::map<uint32_t, int> peers;
+  std::vector<RankProposal> proposals{local};
+  bool ok = true;
+  while (proposals.size() < local.n_ranks) {
+    if (!ReadyUntil(listener, POLLIN, deadline)) {
+      SetError(error, "not all ranks joined the TCP exchange");
+      ok = false;
+      break;
+    }
+    int peer = accept(listener, nullptr, nullptr);
+    Bytes frame;
+    Bytes body;
+    RankProposal proposal;
+    size_t offset = 0;
+    if (peer < 0 ||
+        !ReceiveFrame(peer, &frame, deadline) ||
+        !CheckWireFrame(frame, 'P', communicator_id, &body) ||
+        !DecodeProposal(body, &offset, &proposal) ||
+        offset != body.size() ||
+        proposal.rank == 0 || proposal.rank >= local.n_ranks ||
+        proposal.n_ranks != local.n_ranks ||
+        proposal.round != local.round ||
+        peers.count(proposal.rank) != 0) {
+      if (peer >= 0)
+        close(peer);
+      SetError(error, "invalid, stale, or duplicate TCP rank proposal");
+      ok = false;
+      break;
+    }
+    peers.emplace(proposal.rank, peer);
+    proposals.push_back(std::move(proposal));
+  }
+  if (ok)
+    ok = MergeRankProposals(proposals, snapshot, error);
+  if (ok) {
+    Bytes all = EncodeAll(proposals);
+    Bytes prepare = WireFrame('R', communicator_id, all);
+    if (prepare.size() > kMaxFrameBytes) {
+      SetError(error, "TCP proposal set exceeds exchange frame");
+      ok = false;
+    } else {
+      for (const auto &[rank, peer] : peers) {
+        (void)rank;
+        if (!SendFrame(peer, prepare, deadline)) {
+          SetError(error, "failed to prepare every TCP rank");
+          ok = false;
+          break;
+        }
+      }
+    }
+  }
+  if (ok) {
+    for (const auto &[rank, peer] : peers) {
+      (void)rank;
+      Bytes ack;
+      Bytes body;
+      if (!ReceiveFrame(peer, &ack, deadline) ||
+          !CheckWireFrame(ack, 'A', communicator_id, &body) ||
+          !body.empty()) {
+        SetError(error, "not all TCP ranks acknowledged prepare");
+        ok = false;
+        break;
+      }
+    }
+  }
+  if (ok) {
+    const Bytes commit = WireFrame('C', communicator_id);
+    for (const auto &[rank, peer] : peers) {
+      (void)rank;
+      if (!SendFrame(peer, commit, deadline)) {
+        SetError(error, "failed to commit every TCP rank");
+        ok = false;
+        break;
+      }
+    }
+  }
+  for (const auto &[rank, peer] : peers) {
+    (void)rank;
+    close(peer);
+  }
+  return ok;
+}
+
+}  // namespace
+
+bool ExchangeTCP(uint64_t communicator_id, const RankProposal &local,
+                 const std::string &coordinator,
+                 AgreedSnapshot *snapshot, std::string *error) {
+  if (error)
+    error->clear();
+  if (local.n_ranks == 0 || local.rank >= local.n_ranks || !snapshot) {
+    SetError(error, "invalid local TCP rank metadata");
+    return false;
+  }
+  sockaddr_in address = {};
+  if (!ParseCoordinator(coordinator, &address, error))
+    return false;
+  if (local.n_ranks == 1)
+    return MergeRankProposals({local}, snapshot, error);
+  const Deadline deadline = std::chrono::steady_clock::now() + kExchangeWait;
+  if (local.rank != 0) {
+    const int fd = ConnectUntil(address, deadline);
+    if (fd < 0) {
+      SetError(error, "rank-zero TCP coordinator unavailable");
+      return false;
+    }
+    const bool ok = ClientExchangeTCP(fd, communicator_id, local, deadline,
+                                      snapshot, error);
+    close(fd);
+    return ok;
+  }
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (listener < 0) {
+    SetError(error, "failed to create TCP coordinator socket");
+    return false;
+  }
+  const int reuse = 1;
+  setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  if (bind(listener, reinterpret_cast<const sockaddr *>(&address),
+           sizeof(address)) != 0 ||
+      listen(listener, static_cast<int>(local.n_ranks)) != 0) {
+    close(listener);
+    SetError(error, "failed to bind the explicit TCP coordinator address");
+    return false;
+  }
+  const bool ok = CoordinatorExchangeTCP(listener, communicator_id, local,
+                                         deadline, snapshot, error);
+  close(listener);
   return ok;
 }
 
