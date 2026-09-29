@@ -69,5 +69,9 @@ int main() {
                  exit}, false, &why));
   assert(!check({insn(BPF_ALU64 | BPF_MOV | BPF_X, 0, 1),
                  exit}, false, &why));
+  assert(!check({insn(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 1),
+                 insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0),
+                 exit}, false, &why));
+  assert(why.find("pointer-dependent") != std::string::npos);
   std::puts("rank agreement verifier tests passed");
 }
