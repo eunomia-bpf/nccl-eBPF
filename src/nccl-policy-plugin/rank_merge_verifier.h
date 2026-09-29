@@ -64,7 +64,8 @@ inline Value load(const State &s, Value base, int off, int size) {
   return local();
 }
 inline bool store(State &s, Value base, int off, int size, Value value) {
-  if (base.kind == Kind::slots_value) return false;
+  if (base.kind == Kind::slots_value ||
+      base.kind == Kind::context) return false;
   if (base.kind != Kind::stack) return true;
   int pos = 512 + base.offset + off;
   if (pos < 0 || size <= 0 || pos + size > 512) return false;

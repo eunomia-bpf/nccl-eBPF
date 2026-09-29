@@ -25,6 +25,8 @@ struct Value {
 struct State {
   std::array<Value, 11> reg{};
   std::array<Value, 512> stack_bytes{};
+  std::array<bool, 11> zero{};
+  bool local_control = false;
   bool operator==(const State &) const = default;
 };
 inline Value scalar() { return {Kind::shared, 0}; }
@@ -45,6 +47,13 @@ inline bool merge(State &dst, const State &src) {
     changed |= !(v == dst.reg[i]);
     dst.reg[i] = v;
   }
+  for (size_t i = 0; i < dst.zero.size(); ++i) {
+    bool z = dst.zero[i] && src.zero[i];
+    changed |= z != dst.zero[i];
+    dst.zero[i] = z;
+  }
+  changed |= !dst.local_control && src.local_control;
+  dst.local_control |= src.local_control;
   for (size_t i = 0; i < dst.stack_bytes.size(); ++i) {
     Value v = join(dst.stack_bytes[i], src.stack_bytes[i]);
     changed |= !(v == dst.stack_bytes[i]);
@@ -62,10 +71,11 @@ inline int access_size(uint8_t code) {
   }
 }
 inline bool shared_context_access(int offset, int size) {
-  // Collective arguments and communicator-wide values. Timing, call count,
-  // registration, previous channels and rank-local topology remain local.
+  // Collective arguments and communicator-wide values, including the NCCL
+  // NVL-domain profile provided at communicator initialization. Timing, call
+  // count, registration and previous channels remain rank-local.
   constexpr int ranges[][2] = {
-      {0, 8}, {40, 48}, {52, 60}, {64, 68}};
+      {0, 8}, {40, 48}, {52, 60}, {64, 80}};
   for (auto &range : ranges)
     if (offset >= range[0] && offset + size <= range[1]) return true;
   return false;
@@ -84,7 +94,8 @@ inline Value load_memory(const State &s, Value base, int off, int size) {
   return local();
 }
 inline bool store_memory(State &s, Value base, int off, int size, Value value) {
-  if (base.kind == Kind::agreed_value) return false;
+  if (base.kind == Kind::agreed_value ||
+      base.kind == Kind::context) return false;
   if (base.kind != Kind::stack) return true;
   int pos = 512 + base.offset + off;
   if (pos < 0 || size <= 0 || pos + size > 512) return false;
@@ -140,32 +151,41 @@ bool check(const std::vector<Inst> &insns,
           ? Value{agreed_map_fds.count(in.imm) ? Kind::agreed_map :
                   Kind::local_map, 0}
           : in.src_reg == 0 ? scalar() : local();
+      s.zero[in.dst_reg] = in.src_reg == 0 && in.imm == 0 &&
+                           insns[next].imm == 0;
       ++next;
     } else if (cls == BPF_LDX && BPF_MODE(in.code) == BPF_MEM) {
       s.reg[in.dst_reg] =
           load_memory(s, s.reg[in.src_reg], in.off, access_size(in.code));
+      s.zero[in.dst_reg] = false;
     } else if ((cls == BPF_ST || cls == BPF_STX) &&
                BPF_MODE(in.code) == BPF_MEM) {
       Value value = cls == BPF_ST ? scalar() : s.reg[in.src_reg];
       if (!store_memory(s, s.reg[in.dst_reg], in.off,
                         access_size(in.code), value))
-        return fail(pc, "write to agreed snapshot or invalid stack");
+        return fail(pc, "write to policy context or agreed snapshot");
     } else if (cls == BPF_ALU || cls == BPF_ALU64) {
       uint8_t op = BPF_OP(in.code);
       bool x = BPF_SRC(in.code) == BPF_X;
       Value rhs = x ? s.reg[in.src_reg] : scalar();
-      if (op == BPF_MOV) s.reg[in.dst_reg] = rhs;
-      else if (op == BPF_NEG)
+      if (op == BPF_MOV) {
+        s.reg[in.dst_reg] = rhs;
+        s.zero[in.dst_reg] = x ? s.zero[in.src_reg] : in.imm == 0;
+      } else if (op == BPF_NEG) {
         s.reg[in.dst_reg] =
             s.reg[in.dst_reg].kind == Kind::shared ? scalar() : local();
-      else
+      } else {
         s.reg[in.dst_reg] = arithmetic(s.reg[in.dst_reg], rhs, op, x, in.imm,
-                                           cls == BPF_ALU64);
+                                       cls == BPF_ALU64);
+        s.zero[in.dst_reg] = false;
+      }
     } else if (cls == BPF_JMP || cls == BPF_JMP32) {
       uint8_t op = BPF_OP(in.code);
       if (op == BPF_EXIT) {
         if (s.reg[0].kind != Kind::shared)
           return fail(pc, "rank-local action");
+        if (s.local_control && !s.zero[0])
+          return fail(pc, "rank-local control flow");
         exiting = true;
       } else if (op == BPF_CALL) {
         if (in.src_reg != 0) return fail(pc, "subprogram call is unanalysed");
@@ -186,7 +206,11 @@ bool check(const std::vector<Inst> &insns,
               for (auto &byte : s.stack_bytes) byte = local();
           s.reg[0] = local();
         }
-        for (int arg = 1; arg <= 5; ++arg) s.reg[arg] = local();
+        s.zero[0] = false;
+        for (int arg = 1; arg <= 5; ++arg) {
+          s.reg[arg] = local();
+          s.zero[arg] = false;
+        }
       } else if (op == BPF_JA) {
         int64_t target = static_cast<int64_t>(pc) + 1 + in.off;
         if (target < 0 || target >= static_cast<int64_t>(insns.size()))
@@ -194,16 +218,17 @@ bool check(const std::vector<Inst> &insns,
         next = static_cast<size_t>(target);
       } else {
         Value rhs = BPF_SRC(in.code) == BPF_X ? s.reg[in.src_reg] : scalar();
-        if (rank_local(s.reg[in.dst_reg]) || rank_local(rhs))
-          return fail(pc, "rank-local control flow");
+        bool local_condition =
+            rank_local(s.reg[in.dst_reg]) || rank_local(rhs);
         if (s.reg[in.dst_reg].kind != Kind::shared ||
             rhs.kind != Kind::shared) {
           if (cls != BPF_JMP || BPF_SRC(in.code) != BPF_K ||
               in.imm != 0 || (op != BPF_JEQ && op != BPF_JNE) ||
               (s.reg[in.dst_reg].kind != Kind::context &&
                s.reg[in.dst_reg].kind != Kind::agreed_value))
-            return fail(pc, "pointer-dependent control flow");
+            local_condition = true;
         }
+        s.local_control |= local_condition;
         conditional = true;
       }
     } else {

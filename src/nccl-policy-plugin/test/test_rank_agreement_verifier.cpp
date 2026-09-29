@@ -26,16 +26,26 @@ int main() {
   auto load_shared = insn(BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 0);
   auto load_local = insn(BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 8);
   assert(check({load_shared, exit}, false, &why));
+  assert(check({insn(BPF_LDX | BPF_MEM | BPF_DW, 0, 1, 72), exit},
+               false, &why));
+  assert(!check({insn(BPF_LDX | BPF_MEM | BPF_W, 0, 1, 80), exit},
+                false, &why));
   assert(!check({load_local, exit}, false, &why));
   assert(why.find("rank-local action") != std::string::npos);
 
   auto branch_local = std::vector<bpf_insn>{
       insn(BPF_LDX | BPF_MEM | BPF_DW, 2, 1, 8),
-      insn(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1, 0),
-      insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0),
+      insn(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 2, 0),
+      insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1),
+      insn(BPF_JMP | BPF_JA, 0, 0, 1),
+      insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 2),
       exit};
   assert(!check(branch_local, false, &why));
   assert(why.find("control flow") != std::string::npos);
+  auto benign_local_branch = branch_local;
+  benign_local_branch[2].imm = 0;
+  benign_local_branch[4].imm = 0;
+  assert(check(benign_local_branch, false, &why));
 
   auto lookup = std::vector<bpf_insn>{
       insn(BPF_LD | BPF_DW | BPF_IMM, 1, BPF_PSEUDO_MAP_FD, 0, 7),
@@ -48,8 +58,15 @@ int main() {
   lookup[3] = insn(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1, 0);
   lookup.insert(lookup.end()-1, insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0));
   lookup.insert(lookup.end()-1, insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0));
-  assert(!check(lookup, false, &why));
+  assert(check(lookup, false, &why));
   assert(check(lookup, true, &why));
+  auto divergent_lookup = lookup;
+  divergent_lookup[3].off = 2;
+  divergent_lookup[4].imm = 1;
+  divergent_lookup.insert(divergent_lookup.begin() + 5,
+                          insn(BPF_JMP | BPF_JA, 0, 0, 1));
+  divergent_lookup[6].imm = 2;
+  assert(!check(divergent_lookup, false, &why));
 
   auto write_agreed = std::vector<bpf_insn>{
       insn(BPF_LD | BPF_DW | BPF_IMM, 1, BPF_PSEUDO_MAP_FD, 0, 7),
@@ -69,9 +86,16 @@ int main() {
                  exit}, false, &why));
   assert(!check({insn(BPF_ALU64 | BPF_MOV | BPF_X, 0, 1),
                  exit}, false, &why));
-  assert(!check({insn(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 1, 1),
+  assert(!check({insn(BPF_LDX | BPF_MEM | BPF_DW, 2, 1, 8),
+                 insn(BPF_STX | BPF_MEM | BPF_DW, 1, 2, 0),
                  insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0),
                  exit}, false, &why));
-  assert(why.find("pointer-dependent") != std::string::npos);
+  assert(why.find("write to policy context") != std::string::npos);
+  assert(!check({insn(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 2, 1),
+                 insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 1),
+                 insn(BPF_JMP | BPF_JA, 0, 0, 1),
+                 insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 2),
+                 exit}, false, &why));
+  assert(why.find("control flow") != std::string::npos);
   std::puts("rank agreement verifier tests passed");
 }

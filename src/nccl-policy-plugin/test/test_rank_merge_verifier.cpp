@@ -82,6 +82,10 @@ int main() {
       insn(BPF_LDX | BPF_MEM | BPF_W, 0, 1, 0),
       exit};
   assert(check(nranks, &why));
+  assert(!check({insn(BPF_ST | BPF_MEM | BPF_W, 1, 0, 0, 1),
+                 insn(BPF_ALU64 | BPF_MOV | BPF_K, 0, 0, 0, 0),
+                 exit}, &why));
+  assert(why.find("invalid write") != std::string::npos);
 
   auto update_status = merged;
   update_status.erase(update_status.end()-2);

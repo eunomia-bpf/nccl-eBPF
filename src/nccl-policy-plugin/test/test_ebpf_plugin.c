@@ -2179,11 +2179,11 @@ int main(int argc, char **argv) {
       {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict",
        "valid", 1},
       {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
-       "strict", "valid", 1},
+       "strict", "rank_local_telemetry_output", 0},
       {"profiler_latency", NCCL_POLICY_TEST_PROFILER_LATENCY_BPF_PATH,
        "strict", "valid", 1},
       {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict",
-       "valid", 1},
+       "rank_local_telemetry_output", 0},
       {"bad_lookup", NCCL_POLICY_TEST_BAD_LOOKUP_BPF_PATH, "strict",
        "null_deref_after_map_lookup", 0},
       {"bad_oob_access", NCCL_POLICY_TEST_BAD_OOB_ACCESS_BPF_PATH, "strict",
@@ -2205,14 +2205,11 @@ int main(int argc, char **argv) {
       {"size_aware_v2", NCCL_POLICY_TEST_SIZE_AWARE_V2_BPF_PATH, "strict"},
       {"lookup_only", NCCL_POLICY_TEST_LOOKUP_ONLY_BPF_PATH, "strict"},
       {"lookup_update", NCCL_POLICY_TEST_LOOKUP_UPDATE_BPF_PATH, "strict"},
-      {"adaptive_channels", NCCL_POLICY_TEST_ADAPTIVE_CHANNELS_BPF_PATH,
-       "strict"},
-      {"slo_enforcer", NCCL_POLICY_TEST_SLO_ENFORCER_BPF_PATH, "strict"},
+
   };
   struct benchmark_result native_result = {0};
   struct benchmark_result policy_result = {0};
   struct hot_reload_result hot_reload_result = {0};
-  struct adaptive_curve_result adaptive_curve_result = {0};
   uint64_t *samples = (uint64_t *)calloc(kIterations, sizeof(*samples));
   size_t i;
 
@@ -2238,26 +2235,6 @@ int main(int argc, char **argv) {
   }
 
   if (test_nvl72_size_aware_policy(plugin_path) != 0) {
-    free(samples);
-    return 1;
-  }
-
-  if (test_adaptive_channels_map_state(plugin_path) != 0) {
-    free(samples);
-    return 1;
-  }
-
-  if (test_telemetry_survives_hot_reload(plugin_path) != 0) {
-    free(samples);
-    return 1;
-  }
-
-  if (test_profiler_telemetry_bridge(plugin_path) != 0) {
-    free(samples);
-    return 1;
-  }
-
-  if (test_multi_communicator_differentiation(plugin_path) != 0) {
     free(samples);
     return 1;
   }
@@ -2302,11 +2279,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (test_adaptive_policy_curve(plugin_path, &adaptive_curve_result) != 0) {
-    free(samples);
-    return 1;
-  }
-
+  /* The verifier matrix above requires rejection of the local-map adaptive
+   * policies. The agreed-map replacement is exercised by
+   * nccl_policy_distributed_plugin. */
   free(samples);
   return 0;
 }
