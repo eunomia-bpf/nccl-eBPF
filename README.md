@@ -37,11 +37,14 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
   multi-node communicators unchanged
 - `bad_*.bpf.c` -- Intentionally unsafe programs for verifier testing (div-by-zero, OOB access, stack overflow, infinite loop, etc.)
 - `distributed_max_latency.bpf.c` -- Experimental agreed-map example: a verified BPF merge takes the maximum of rank-local latency slots, and the tuner selects channels from the shared result
-- `spark_tp4_ll_64k.bpf.c`, `spark_tp4_simple_64k.bpf.c`, and
-  `spark_tp4_ll_1m.bpf.c` -- Four-node, four-rank AllReduce protocol
-  comparison: Ring/LL or Ring/SIMPLE through 64 KiB, and Ring/LL through
-  1 MiB. They leave other collectives, topologies, and channel counts to
-  NCCL; no Spark inference speedup has been established by a hardware A/B test.
+- `spark_tp4_ll_64k.bpf.c`, `spark_tp4_simple_64k.bpf.c`,
+  `spark_tp4_ll_1m.bpf.c`, and `spark_tp4_simple_64k_1m.bpf.c` --
+  Four-node, four-rank AllReduce protocol comparisons: Ring/LL or
+  Ring/SIMPLE through 64 KiB, Ring/LL through 1 MiB, and Ring/SIMPLE
+  above 64 KiB through 1 MiB. The medium window matched 443 of the first
+  1000 AllReduce calls in a four-Spark DeepSeek pilot. Other collectives,
+  topologies, and channel counts remain NCCL-selected; no Spark inference
+  speedup has been established by a hardware A/B test.
 
 ### Cross-rank agreement prototype
 

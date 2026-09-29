@@ -28,12 +28,15 @@ multi-node communicator.
 
 ## Spark TP4 protocol candidates
 
-The `spark_tp4_ll_64k.bpf.o`, `spark_tp4_simple_64k.bpf.o`, and
-`spark_tp4_ll_1m.bpf.o` objects are separate A/B arms for a communicator
-with exactly four ranks on four nodes. They override only AllReduce: the
-first two request Ring/LL versus Ring/SIMPLE for 1 byte-64 KiB, and the third
-requests Ring/LL for 1 byte-1 MiB. Zero-byte calls, larger messages, other
-collectives, and other topologies return no action. None sets a channel
+The `spark_tp4_ll_64k.bpf.o`, `spark_tp4_simple_64k.bpf.o`,
+`spark_tp4_ll_1m.bpf.o`, and `spark_tp4_simple_64k_1m.bpf.o` objects are
+separate A/B arms for a communicator with exactly four ranks on four nodes.
+They override only AllReduce: the first two request Ring/LL versus
+Ring/SIMPLE for 1 byte-64 KiB, the third requests Ring/LL for 1 byte-1 MiB,
+and the fourth requests Ring/SIMPLE above 64 KiB through 1 MiB. The medium
+window matched 443 of the first 1000 AllReduce calls in a four-Spark
+DeepSeek pilot, giving it a real A/B target. Zero-byte calls, messages
+above each arm's range, other collectives, and other topologies return no action. None sets a channel
 count; NCCL retains its own channel limit. The plugin respects NCCL's
 ignored algorithm/protocol entries. These are candidate policies, not
 validated performance recommendations: compare each against both no plugin

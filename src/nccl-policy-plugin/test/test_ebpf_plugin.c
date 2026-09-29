@@ -1016,15 +1016,19 @@ static int test_spark_tp4_protocol_arms(const char *plugin_path) {
   const struct {
     struct policy_case policy;
     int proto;
+    size_t min_bytes;
     size_t max_bytes;
   } arms[] = {
       {{"spark_tp4_ll_64k", NCCL_POLICY_TEST_SPARK_TP4_LL_64K_BPF_PATH,
-        "strict"}, NCCL_PROTO_LL, 64u << 10},
+        "strict"}, NCCL_PROTO_LL, 1, 64u << 10},
       {{"spark_tp4_simple_64k",
         NCCL_POLICY_TEST_SPARK_TP4_SIMPLE_64K_BPF_PATH,
-        "strict"}, NCCL_PROTO_SIMPLE, 64u << 10},
+        "strict"}, NCCL_PROTO_SIMPLE, 1, 64u << 10},
       {{"spark_tp4_ll_1m", NCCL_POLICY_TEST_SPARK_TP4_LL_1M_BPF_PATH,
-        "strict"}, NCCL_PROTO_LL, 1u << 20},
+        "strict"}, NCCL_PROTO_LL, 1, 1u << 20},
+      {{"spark_tp4_simple_64k_1m",
+        NCCL_POLICY_TEST_SPARK_TP4_SIMPLE_64K_1M_BPF_PATH,
+        "strict"}, NCCL_PROTO_SIMPLE, (64u << 10) + 1, 1u << 20},
   };
 
   for (const auto &arm : arms) {
@@ -1035,7 +1039,8 @@ static int test_spark_tp4_protocol_arms(const char *plugin_path) {
     if (open_plugin_session(&session, plugin_path, &arm.policy, 4, 4) != 0)
       return -1;
     for (size_t n_bytes : sizes) {
-      const bool selected = n_bytes > 0 && n_bytes <= arm.max_bytes;
+      const bool selected = n_bytes >= arm.min_bytes &&
+                            n_bytes <= arm.max_bytes;
       if (run_policy_once(&session, ncclFuncAllReduce, n_bytes, 1, 0, 0,
                           &decision) != 0 ||
           expect_choice(arm.policy.name, "AllReduce size boundary", &decision,
@@ -1056,7 +1061,7 @@ static int test_spark_tp4_protocol_arms(const char *plugin_path) {
 
     if (open_plugin_session(&session, plugin_path, &arm.policy, 4, 2) != 0)
       return -1;
-    if (run_policy_once(&session, ncclFuncAllReduce, 4096, 1, 0, 0,
+    if (run_policy_once(&session, ncclFuncAllReduce, 128u << 10, 1, 0, 0,
                         &decision) != 0 ||
         expect_choice(arm.policy.name, "other topology", &decision,
                       -1, -1, 0) != 0) {
