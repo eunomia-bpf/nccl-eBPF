@@ -245,6 +245,10 @@ target_link_libraries(test_native_crash PRIVATE
 set_target_properties(test_native_crash PROPERTIES LINKER_LANGUAGE CXX)
 
 if(BUILD_TESTING)
+  add_executable(test_rank_agreement_verifier
+      test/test_rank_agreement_verifier.cpp)
+  add_test(NAME nccl_policy_rank_agreement_verifier
+           COMMAND test_rank_agreement_verifier)
   add_test(NAME nccl_policy_ebpf_plugin COMMAND test_ebpf_plugin)
   add_test(NAME nccl_policy_native_crash COMMAND test_native_crash)
 endif()

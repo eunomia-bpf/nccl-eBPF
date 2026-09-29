@@ -33,6 +33,7 @@
 #include "bpftime_shm.hpp"
 #include "nccl_tuner.h"
 #include "nccl_profiler.h"
+#include "rank_agreement_verifier.h"
 
 #include "../ebpf-policies/policy_action.h"
 #include "../ebpf-policies/policy_context.h"
@@ -1139,6 +1140,20 @@ bool load_program_from_object(SharedCommState *shared,
     return false;
   if (!verify_program(shared, policy_state, spec))
     return false;
+  if (spec.section_name.rfind("profiler", 0) != 0) {
+    std::unordered_set<int> agreed_fds;
+    auto agreed = policy_state->map_fds.find("agreed_map");
+    if (agreed != policy_state->map_fds.end())
+      agreed_fds.insert(agreed->second);
+    std::string agreement_error;
+    if (!rank_agreement::check(spec.insns, agreed_fds, &agreement_error)) {
+      log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
+                         NCCL_LOG_WARN,
+                         "cross-rank agreement rejected %s: %s",
+                         path, agreement_error.c_str());
+      return false;
+    }
+  }
 
   config.set_vm_name("llvm");
   policy_state->prog = std::make_unique<bpftime::bpftime_prog>(
