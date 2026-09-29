@@ -5,7 +5,9 @@ Design notes for two mechanisms that let eBPF policies use run-time measurements
 - a **cross-rank check**: a load-time information-flow check on policy bytecode, run after the ordinary eBPF verifier;
 - an **agreed (distributed) map**: a map whose value is the same on every rank of a communicator at each call, built from per-rank measurements by a verified, deterministic merge.
 
-The first is partly implemented (`src/nccl-policy-plugin/rank_agreement_verifier.h`, commit 4e74e1a). The second is a design. Sections 5 and 6 list what a review against the NCCL 2.29.7 source found, and the fixes the design needs before it is implemented.
+The load-time checker and an experimental same-host agreed-map example are implemented in `src/nccl-policy-plugin/`. The example supports 1-8 ranks, one rank per process, sharing `/tmp`, and uses a verified `dist_merge` BPF program over rank-local latency slots. It has passed CPU tests, not a multi-node or GPU benchmark. Sections 5 and 6 describe NCCL 2.29.7 paths that still need treatment before general cross-rank safety can be claimed.
+
+**Current safety boundary:** ranks do not compare policy versions before the first exchange at call 1024. Ordinary policies can also be reloaded independently per process. Host handling of channel bounds and algorithm/protocol availability can differ after identical BPF actions. Some NCCL paths do not advance `getCollInfo` counts uniformly, and an incomplete rank-zero snapshot broadcast can leave peers with different outcomes. Treat the distributed path as an opt-in prototype, not a production-wide agreement guarantee.
 
 NCCL line references are to NCCL 2.29.7 (`nccl` submodule, `src/`). Plugin references are to `src/nccl-policy-plugin/plugin.cpp` at the time of writing.
 
@@ -40,20 +42,19 @@ Inputs fall into two classes:
 - **Shared**: `getCollInfo` arguments that NCCL guarantees are identical (collective type, byte count, `numPipeOps`, rank and node counts), values aligned at communicator init, and reads from an agreed map.
 - **Rank-local**: measured latency, timers and other helpers, ordinary maps, `regBuff`, per-process environment variables.
 
-## 3. Cross-rank check (implemented)
+## 3. Cross-rank check (prototype)
 
 `rank_agreement_verifier.h` runs after the ordinary verifier for every non-profiler program (`plugin.cpp`, `load_program_from_object`). It is a forward abstract interpretation over the relocated bytecode:
 
 - every register and stack byte carries a label (`shared`, `local`, `context`, `agreed_map`, `agreed_value`, `local_map`, `local_value`, ...);
-- context loads are shared only for `n_bytes`, `coll_type`, `num_pipe_ops`, `n_ranks`, `n_nodes` (`shared_context_access`); `call_count`, `reg_buff`, `current_channels`, latency fields and the NVL-domain fields are local;
+- context loads are shared for `n_bytes`, `coll_type`, `num_pipe_ops`, `n_ranks`, `n_nodes`, and the tested NVL-domain fields, which pinned NCCL derives from communicator-wide values (`shared_context_access`); `call_count`, `reg_buff`, `current_channels`, and latency fields are local;
 - `map_lookup_elem` on the host-published `agreed_map` yields an agreed value; any other lookup, and every other helper, yields a local value;
-- a conditional branch on a local value is rejected ("rank-local control flow"), so both data flow and control flow are covered, including an early `return` that leaves NCCL's default in place;
+- a conditional branch on a local value is rejected unless every reachable action is provably zero; both data flow and control flow are covered;
 - the action is the return value; a local `r0` at `exit` is rejected ("rank-local action");
 - writes to the agreed map are rejected; subprogram calls are rejected as unanalysed.
 
-It is deliberately conservative: a local value may be computed but may not select a path or reach the action. Possible relaxations, each needing an argument:
+It is deliberately conservative: local data may be computed, but it cannot affect a nonzero action. Possible relaxations, each needing an argument:
 
-- NVL-domain fields come from `nvlDomainInfo`, which NCCL computes per communicator; they could be shared if NCCL's computation is shown to be identical on all ranks.
 - `current_channels` (the previous decision) is shared by induction if every earlier decision passed the check.
 - A per-communicator call count could be shared on the main path only; see Section 5.2.
 
@@ -63,7 +64,9 @@ Open items for the check:
 - **Channel bound.** NCCL does not clamp the tuner's channel count; CollNet and allgatherv use it directly (`enqueue.cc:621-626`, `scheduler/allgatherv_sched.cc:65-80`). The host should enforce `nChannels <= comm->nChannels`. The plugin cannot see that value, so it belongs in the profile.
 - **Scope of the check.** Only tuner programs are checked today. Net plugin programs need the per-connection scope from Section 2.
 
-## 4. Agreed (distributed) map (design)
+## 4. Agreed (distributed) map (design and same-host prototype)
+
+The current implementation fixes three u64 array maps (`local_latency`, `rank_slots`, `agreed_map`), a verified `SEC("dist_merge")` max operation, a same-host Unix-socket exchange every 1024 calls, and activation on the next 1024-call boundary. It requires `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`, supports 1-8 ranks with one rank per process and shared `/tmp`, and rejects distributed-policy hot reload. The more general semantics below remain design goals.
 
 ### 4.1 Layers
 
@@ -88,11 +91,11 @@ Open items for the check:
 
 ### 4.4 Rendezvous
 
-The tuner v5 init receives `commId`, rank and node counts, a logger, NVL-domain info and constants, but no rank id, bootstrap handle or communicator pointer (`tuner_v5.h:52-53`). Exchanging slots therefore needs a channel outside NCCL's plugin contract: a key-value store or a transport addressed by an environment variable plus the communicator hash. The rank id comes from the profiler plugin, whose init receives it. Key per-rank state by (commHash, rank): all local ranks of one communicator share a commHash, and repeated `ncclCommShrink` of the same parent can produce the same hash (`init.cc:2808-2815, 2849`).
+The tuner v5 init receives `commId`, rank and node counts, a logger, NVL-domain info and constants, but no rank id, bootstrap handle or communicator pointer (`tuner_v5.h:52-53`). Exchanging slots therefore needs a channel outside NCCL's plugin contract. The prototype uses a same-host Unix socket keyed by communicator hash and round; a multi-node transport remains unimplemented. The rank id comes from the profiler plugin, whose init receives it. The current state and socket key use the communicator hash, which can collide for overlapping communicators; a future implementation needs a per-communicator instance key. All local ranks of one communicator share a commHash, and repeated `ncclCommShrink` of the same parent can produce the same hash (`init.cc:2808-2815, 2849`).
 
 ### 4.5 Policy versions and hot reload
 
-Today reload is a per-process pointer swap (`pluginReloadPolicyImpl`). Paper T3 argues that briefly running different policies is fine because calls are independent; across ranks that is false. With an agreed map, the policy version becomes an agreed value: every rank loads, verifies and JITs the new program, reports success, and all ranks switch at an agreed call. This is a commit round, not a single map read. A rank whose verification fails aborts the switch for everyone.
+Ordinary-policy reload remains a per-process pointer swap (`pluginReloadPolicyImpl`); distributed-policy reload is rejected until cross-rank coordination exists. Paper T3 argues that briefly running different policies is fine because calls are independent; across ranks that is false. With an agreed map, the policy version becomes an agreed value: every rank loads, verifies and JITs the new program, reports success, and all ranks switch at an agreed call. This is a commit round, not a single map read. A rank whose verification fails aborts the switch for everyone.
 
 ### 4.6 Trust
 

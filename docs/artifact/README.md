@@ -60,11 +60,12 @@ The new cross-rank checker is exercised by the plugin tests. The experimental
 is opt-in with `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`; its CPU integration test
 uses two and eight local processes and verifies that different rank-local
 measurements produce the same BPF-merged action at activation; nine ranks are
-rejected. The current exchange works
-only for processes sharing one host and `/tmp` filesystem, with 1 to 8
-ranks and one rank per process. It has no
-validated multi-node or GPU result, and does not extend the frozen paper's
-B300 measurements. The [design notes](../cross-rank-agreement.md) describe
+rejected. The current exchange works only for processes sharing one host and
+`/tmp` filesystem, with 1 to 8 ranks and one rank per process. It has no
+validated multi-node or GPU result. Policy versions are not compared before
+the first exchange at call 1024, so this test does not establish general
+cross-rank safety. The work does not extend the frozen paper's B300
+measurements. The [design notes](../cross-rank-agreement.md) describe
 the broader intended model and remaining NCCL call-count limitations.
 
 The tuner/profiler plugin uses existing NCCL interfaces without modifying

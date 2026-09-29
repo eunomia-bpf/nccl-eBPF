@@ -1,6 +1,6 @@
 # NCCLbpf -- eBPF-based Policy Execution for NCCL
 
-NCCLbpf brings verified eBPF policy execution to [NCCL](https://github.com/NVIDIA/nccl) (NVIDIA Collective Communication Library). It uses [bpftime](https://github.com/eunomia-bpf/bpftime), a userspace eBPF runtime, to load and execute eBPF programs inside NCCL's plugin system. Tuner policies can govern algorithm, protocol, and channel selection; the current net plugin only traces transport events. Tuner actions are checked for cross-rank agreement at load time.
+NCCLbpf brings verified eBPF policy execution to [NCCL](https://github.com/NVIDIA/nccl) (NVIDIA Collective Communication Library). It uses [bpftime](https://github.com/eunomia-bpf/bpftime), a userspace eBPF runtime, to load and execute eBPF programs inside NCCL's plugin system. Tuner policies can govern algorithm, protocol, and channel selection; the current net plugin only traces transport events. Tuner policy bytecode receives a load-time check for rank-local dependencies in collective-wide actions.
 
 This is a research prototype targeting the eBPF Workshop at SOSP 2026.
 
@@ -55,10 +55,13 @@ calls, and the verified `SEC("dist_merge")` program independently computes the
 `agreed_map` value on each rank for activation at the next 1024-call boundary.
 The prototype supports 1 to 8 ranks with one rank per process sharing the
 same host and `/tmp` filesystem. Separate containers with private `/tmp`
-cannot rendezvous. It does not provide multi-node exchange, a general distributed-map API,
-per-connection net decisions, or coordinated policy reload. NCCL tuner call
-counts can differ on several paths, so this is an experimental CPU-tested
-path, not a production-safe guarantee for arbitrary NCCL workloads. The
+cannot rendezvous. It does not provide multi-node exchange, a general
+distributed-map API,
+per-connection net decisions, or coordinated policy reload. The first
+exchange occurs after 1024 calls, so policy versions are not compared before
+those calls. NCCL tuner call counts can differ on several paths, and host
+post-processing can depend on rank-local state. This CPU-tested path is not
+a production-safe guarantee for arbitrary NCCL workloads. The
 original paper's single-node B300 results predate this feature.
 
 The hardware-free distributed-map and plugin integration tests run under
