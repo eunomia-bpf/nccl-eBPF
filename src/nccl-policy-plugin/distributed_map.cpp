@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -468,6 +469,8 @@ bool ExchangeSameHost(uint64_t communicator_id, const RankProposal &local,
     close(peer);
   close(listener);
   unlink(path.c_str());
+  if (ok)
+    *snapshot = std::move(prepared);
   return ok;
 }
 

@@ -283,6 +283,7 @@ int main() {
       _exit(1);
     _exit(0);
   }
+  snapshot = {};
   assert(ExchangeSameHost(comm_id, Proposal(0), &snapshot, &error));
   AssertMerged(snapshot);
   int status = 0;
