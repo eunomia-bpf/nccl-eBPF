@@ -39,5 +39,5 @@ install:
 	$$apt_prefix apt-get update; \
 	$$apt_prefix apt-get install -y --no-install-recommends \
 		libelf1 libelf-dev zlib1g-dev libzstd-dev libboost-dev \
-		cmake make git clang-15 llvm-15 llvm-15-dev libclang-15-dev \
+		cmake make git clang llvm llvm-dev libclang-dev \
 		pkg-config build-essential
