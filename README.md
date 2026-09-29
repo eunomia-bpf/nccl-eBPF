@@ -1,6 +1,6 @@
 # NCCLbpf -- eBPF-based Policy Execution for NCCL
 
-NCCLbpf brings verified eBPF policy execution to [NCCL](https://github.com/NVIDIA/nccl) (NVIDIA Collective Communication Library). It uses [bpftime](https://github.com/eunomia-bpf/bpftime), a userspace eBPF runtime, to load and execute eBPF programs inside NCCL's plugin system. Policies run on every collective operation to govern algorithm/protocol selection, channel allocation, and transport-layer behavior -- all with static verification and process-level isolation.
+NCCLbpf brings verified eBPF policy execution to [NCCL](https://github.com/NVIDIA/nccl) (NVIDIA Collective Communication Library). It uses [bpftime](https://github.com/eunomia-bpf/bpftime), a userspace eBPF runtime, to load and execute eBPF programs inside NCCL's plugin system. Tuner policies can govern algorithm, protocol, and channel selection; the current net plugin only traces transport events. Tuner actions are checked for cross-rank agreement at load time.
 
 This is a research prototype targeting the eBPF Workshop at SOSP 2026.
 
@@ -16,7 +16,7 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 +------------------+     +---------------------------+
 |  NCCL Runtime    |     |  eBPF Policy Programs     |
 |                  |     |  (noop, size_aware,        |
-|  Tuner v5 hook --+---->|   slo_enforcer, ...)      |
+|  Tuner v5 hook --+---->|   distributed_max_latency)|
 |  Profiler v6 hook+---->|                           |
 |  Net v11 hook ---+---->+---------------------------+
 |                  |              |
@@ -30,13 +30,40 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 **eBPF Policies** (`src/ebpf-policies/`) -- Verified eBPF programs compiled with `clang -target bpf`. Includes:
 - `noop.bpf.c` -- Passthrough (no override), used for overhead measurement
 - `size_aware.bpf.c` / `size_aware_v2-v5` -- Size-based algorithm/protocol selection
-- `adaptive_channels.bpf.c` -- Dynamic channel count adjustment using telemetry maps
-- `slo_enforcer.bpf.c` -- SLO-driven policy using config maps and telemetry feedback
+- `adaptive_channels.bpf.c` / `slo_enforcer.bpf.c` -- Historical local-telemetry examples; the cross-rank checker now rejects their tuner actions because local measurements can diverge across ranks
 - `ring_simple_all.bpf.c` -- Forces RING/SIMPLE for all sizes
 - `nvl72_size_aware.bpf.c` -- Single-node, one-NVL-domain AllReduce overrides
   for exact 4-rank and 8-rank communicators; it deliberately leaves all
   multi-node communicators unchanged
 - `bad_*.bpf.c` -- Intentionally unsafe programs for verifier testing (div-by-zero, OOB access, stack overflow, infinite loop, etc.)
+- `distributed_max_latency.bpf.c` -- Experimental agreed-map example: a verified BPF merge takes the maximum of rank-local latency slots, and the tuner selects channels from the shared result
+
+### Cross-rank agreement prototype
+
+The tuner loader now checks both data and control dependencies of the returned
+action. It rejects a policy that lets ordinary local maps, timers, local
+telemetry, or rank-local context fields choose a collective-wide action. A
+second check verifies that a `dist_merge` BPF program reads only exchanged
+rank slots and writes the agreed result. The profiler may still record local
+measurements. See [the design and NCCL source analysis](docs/cross-rank-agreement.md).
+
+`distributed_max_latency` demonstrates the current distributed-map subset.
+Set `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1` and load its BPF object with
+`NCCL_POLICY_BPF_PATH` to opt in. Each rank writes its own `local_latency`
+slot; a same-host Unix-socket exchange distributes the slots every 1024 tuner
+calls, and the verified `SEC("dist_merge")` program independently computes the
+`agreed_map` value on each rank for activation at the next 1024-call boundary.
+The prototype supports 1 to 8 ranks with one rank per process on one host. It
+does not provide multi-node exchange, a general distributed-map API,
+per-connection net decisions, or coordinated policy reload. NCCL tuner call
+counts can differ on several paths, so this is an experimental CPU-tested
+path, not a production-safe guarantee for arbitrary NCCL workloads. The
+original paper's single-node B300 results predate this feature.
+
+The hardware-free distributed-map and plugin integration tests run under
+`make test`; they use two processes with different local latencies and check
+that both activate the same maximum-derived action. No new multi-node or GPU
+performance numbers are claimed.
 
 ### NCCL source compatibility
 
@@ -69,8 +96,8 @@ by this artifact.
 ## Build
 
 On Ubuntu, `make install` installs the host build dependencies used by the
-Makefile, including CMake and LLVM 15. CUDA, NCCL, bpftime, MPI, and nccl-tests
-remain separate prerequisites.
+Makefile, including CMake and the distribution LLVM packages. CUDA, NCCL,
+bpftime, MPI, and nccl-tests remain separate prerequisites.
 The example benchmark paths below assume a separately built `nccl-tests/`
 checkout next to `nccl/`; see the upstream build instructions for CUDA,
 `NCCL_HOME`, and optional `MPI=1` settings. A missing `nccl-tests/` directory
@@ -200,6 +227,7 @@ mpirun -np 2 nccl-tests/build/all_reduce_perf_mpi -b 128M -e 128M -g 1
 | `NCCL_POLICY_VERIFY_MODE` | Verifier behavior: `strict` (default, reject unsafe), `warning` (log but allow), `none` (skip verification) |
 | `NCCL_POLICY_PROFILER_MODE` | Telemetry writer: `native` (default) or `ebpf` |
 | `NCCL_POLICY_PROFILER_BPF_PATH` | Path to `profiler_latency.bpf.o`; required when profiler mode is `ebpf` |
+| `NCCL_POLICY_EXPERIMENTAL_DIST_MAP` | Set to `1` to load the same-host distributed-map example; see its rank and call-path limits above |
 
 ### Net Plugin
 
