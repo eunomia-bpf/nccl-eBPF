@@ -16,7 +16,7 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
 +------------------+     +---------------------------+
 |  NCCL Runtime    |     |  eBPF Policy Programs     |
 |                  |     |  (noop, size_aware,        |
-|  Tuner v5 hook --+---->|   distributed_max_latency)|
+|  Tuner v5 hook --+---->|   agreed-map example)      |
 |  Profiler v6 hook+---->|                           |
 |  Net v11 hook ---+---->+---------------------------+
 |                  |              |
