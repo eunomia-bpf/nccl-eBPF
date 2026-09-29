@@ -53,16 +53,18 @@ Set `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1` and load its BPF object with
 slot; a same-host Unix-socket exchange distributes the slots every 1024 tuner
 calls, and the verified `SEC("dist_merge")` program independently computes the
 `agreed_map` value on each rank for activation at the next 1024-call boundary.
-The prototype supports 1 to 8 ranks with one rank per process on one host. It
-does not provide multi-node exchange, a general distributed-map API,
+The prototype supports 1 to 8 ranks with one rank per process sharing the
+same host and `/tmp` filesystem. Separate containers with private `/tmp`
+cannot rendezvous. It does not provide multi-node exchange, a general distributed-map API,
 per-connection net decisions, or coordinated policy reload. NCCL tuner call
 counts can differ on several paths, so this is an experimental CPU-tested
 path, not a production-safe guarantee for arbitrary NCCL workloads. The
 original paper's single-node B300 results predate this feature.
 
 The hardware-free distributed-map and plugin integration tests run under
-`make test`; they use two processes with different local latencies and check
-that both activate the same maximum-derived action. No new multi-node or GPU
+`make test`; they use two and eight processes with different local latencies
+and check that every rank activates the same maximum-derived action. A
+nine-rank setup is rejected. No new multi-node or GPU
 performance numbers are claimed.
 
 ### NCCL source compatibility

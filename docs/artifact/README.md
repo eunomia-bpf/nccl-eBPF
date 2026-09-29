@@ -58,9 +58,11 @@ scripts/test_nccl_bench.sh
 The new cross-rank checker is exercised by the plugin tests. The experimental
 [distributed-map example](../../src/ebpf-policies/distributed_max_latency.bpf.c)
 is opt-in with `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`; its CPU integration test
-uses two local processes and verifies that different rank-local measurements
-produce the same BPF-merged action at activation. The current exchange works
-only on one host, for 1 to 8 ranks with one rank per process. It has no
+uses two and eight local processes and verifies that different rank-local
+measurements produce the same BPF-merged action at activation; nine ranks are
+rejected. The current exchange works
+only for processes sharing one host and `/tmp` filesystem, with 1 to 8
+ranks and one rank per process. It has no
 validated multi-node or GPU result, and does not extend the frozen paper's
 B300 measurements. The [design notes](../cross-rank-agreement.md) describe
 the broader intended model and remaining NCCL call-count limitations.
