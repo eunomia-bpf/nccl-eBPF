@@ -109,6 +109,8 @@ struct SharedCommState {
   uint64_t dist_call_count = 0;
   uint64_t dist_activation_call = 0;
   bool dist_call_running = false;
+  bool dist_initial_agreed = false;
+  bool dist_failed = false;
   std::future<DistExchangeOutcome> dist_pending;
   size_t tuner_refs = 0;
   size_t profiler_refs = 0;
@@ -123,6 +125,7 @@ struct SharedCommState {
     std::unique_ptr<bpftime::bpftime_prog> merge_prog;
     uint64_t policy_version = 0;
     bool distributed = false;
+    std::string dist_coordinator;
     bool loaded_from_file = false;
     std::string policy_source = "hardcoded-noop";
     std::string section_name = "uprobe";
@@ -1226,6 +1229,9 @@ bool load_program_from_object(SharedCommState *shared,
                          "distributed map requires explicit experimental opt-in");
       return false;
     }
+    const char *coordinator = getenv("NCCL_POLICY_DIST_COORDINATOR");
+    if (coordinator && coordinator[0] != '\0')
+      policy_state->dist_coordinator = coordinator;
     const auto local = policy_state->map_shapes.find("local_latency");
     const auto ranks = policy_state->map_shapes.find("rank_slots");
     const auto agreed = policy_state->map_shapes.find("agreed_map");
@@ -1235,12 +1241,13 @@ bool load_program_from_object(SharedCommState *shared,
         !valid_distributed_map_shape(local->second, 1) ||
         !valid_distributed_map_shape(ranks->second, 8) ||
         !valid_distributed_map_shape(agreed->second, 1) ||
-        !shared || shared->n_nodes != 1 ||
+        !shared || shared->n_nodes == 0 ||
+        (shared->n_nodes != 1 && policy_state->dist_coordinator.empty()) ||
         shared->n_ranks == 0 || shared->n_ranks > 8) {
       log_plugin_message(shared ? shared->log_function : nullptr, NCCL_TUNING,
                          NCCL_LOG_WARN,
-                         "distributed map requires one host and matching "
-                         "local_latency/rank_slots/agreed_map array schemas");
+                         "distributed map requires valid rank/map schemas "
+                         "and a TCP coordinator for multiple nodes");
       return false;
     }
     {
@@ -1852,6 +1859,44 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
 
 constexpr uint64_t kDistExchangeCalls = 1024;
 
+// The tuner ABI has no rank. The profiler init supplies it before the first
+// collective. Agreement is completed before any rank executes policy bytecode.
+bool ensure_initial_distributed_agreement(
+    SharedCommState *shared,
+    SharedCommState::LoadedPolicyState *policy_state,
+    std::unique_lock<std::mutex> *dist_lock) {
+  if (shared->dist_initial_agreed)
+    return true;
+  ncclbpf::RankProposal local;
+  local.rank = static_cast<uint32_t>(shared->rank);
+  local.n_ranks = static_cast<uint32_t>(shared->n_ranks);
+  local.policy_version = policy_state->policy_version;
+  local.round = 0;
+  local.activation_call = 0;
+  const uint64_t comm_id = shared->comm_id;
+  const std::string coordinator = policy_state->dist_coordinator;
+  dist_lock->unlock();
+  ncclbpf::AgreedSnapshot snapshot;
+  std::string error;
+  const bool exchanged = coordinator.empty()
+      ? ncclbpf::ExchangeSameHost(comm_id, local, &snapshot, &error)
+      : ncclbpf::ExchangeTCP(comm_id, local, coordinator, &snapshot, &error);
+  dist_lock->lock();
+  if (!exchanged ||
+      snapshot.policy_version != policy_state->policy_version ||
+      snapshot.round != 0 || snapshot.activation_call != 0 ||
+      !snapshot.rank_writes.empty()) {
+    if (exchanged)
+      error = "unexpected initial agreement snapshot";
+    log_plugin_message(shared->log_function, NCCL_TUNING, NCCL_LOG_WARN,
+                       "initial distributed policy agreement failed: %s",
+                       error.c_str());
+    return false;
+  }
+  shared->dist_initial_agreed = true;
+  return true;
+}
+
 bool activate_distributed_snapshot(
     SharedCommState *shared,
     SharedCommState::LoadedPolicyState *policy_state,
@@ -1961,13 +2006,18 @@ bool start_distributed_exchange(
   local.writes.push_back(std::move(write));
   shared->dist_activation_call = local.activation_call;
   const uint64_t comm_id = shared->comm_id;
-  shared->dist_pending = std::async(std::launch::async,
-                                    [comm_id, local = std::move(local)]() {
-    DistExchangeOutcome outcome;
-    outcome.ok = ncclbpf::ExchangeSameHost(
-        comm_id, local, &outcome.snapshot, &outcome.error);
-    return outcome;
-  });
+  const std::string coordinator = policy_state->dist_coordinator;
+  shared->dist_pending = std::async(
+      std::launch::async,
+      [comm_id, coordinator, local = std::move(local)]() {
+        DistExchangeOutcome outcome;
+        outcome.ok = coordinator.empty()
+            ? ncclbpf::ExchangeSameHost(comm_id, local, &outcome.snapshot,
+                                        &outcome.error)
+            : ncclbpf::ExchangeTCP(comm_id, local, coordinator,
+                                   &outcome.snapshot, &outcome.error);
+        return outcome;
+      });
   return true;
 }
 
@@ -2002,16 +2052,24 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
     if (ctx->shared->rank < 0 ||
         static_cast<size_t>(ctx->shared->rank) >= ctx->shared->n_ranks ||
         ctx->shared->dist_call_running ||
-        ctx->shared->rank_conflict)
+        ctx->shared->rank_conflict || ctx->shared->dist_failed)
       return ncclInternalError;
     ctx->shared->dist_call_running = true;
     dist_guard.shared = ctx->shared.get();
+    if (!ensure_initial_distributed_agreement(
+            ctx->shared.get(), policy_state.get(), &dist_lock)) {
+      ctx->shared->dist_failed = true;
+      dist_lock.unlock();
+      return ncclInternalError;
+    }
     dist_call_number = ++ctx->shared->dist_call_count;
     if (!activate_distributed_snapshot(ctx->shared.get(),
                                        policy_state.get(),
                                        dist_call_number, &dist_lock)) {
-      if (dist_lock.owns_lock())
-        dist_lock.unlock();
+      if (!dist_lock.owns_lock())
+        dist_lock.lock();
+      ctx->shared->dist_failed = true;
+      dist_lock.unlock();
       return ncclInternalError;
     }
     if (dist_lock.owns_lock())
@@ -2093,8 +2151,10 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
     std::lock_guard<std::mutex> lock(ctx->shared->dist_mu);
     if (!start_distributed_exchange(ctx->shared.get(),
                                     policy_state.get(),
-                                    dist_call_number))
+                                    dist_call_number)) {
+      ctx->shared->dist_failed = true;
       return ncclInternalError;
+    }
   }
 
   if (call_count_snapshot <= 5 || call_count_snapshot % 100000 == 0) {

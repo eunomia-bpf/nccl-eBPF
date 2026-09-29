@@ -271,11 +271,21 @@ target_include_directories(test_distributed_plugin PRIVATE
     ${NCCL_PUBLIC_INCLUDE_DIRS})
 target_link_libraries(test_distributed_plugin PRIVATE dl)
 if(BUILD_TESTING)
-  foreach(rank_count IN ITEMS 2 8 9)
+  foreach(rank_count IN ITEMS 2 4 8 9)
     add_test(NAME nccl_policy_distributed_plugin_${rank_count}
              COMMAND test_distributed_plugin
                $<TARGET_FILE:nccl-policy>
                ${DISTRIBUTED_MAX_LATENCY_BPF_O}
                ${rank_count})
   endforeach()
+  add_test(NAME nccl_policy_distributed_plugin_missing_coordinator
+           COMMAND test_distributed_plugin
+             $<TARGET_FILE:nccl-policy>
+             ${DISTRIBUTED_MAX_LATENCY_BPF_O}
+             3)
+  add_test(NAME nccl_policy_distributed_plugin_version_mismatch
+           COMMAND test_distributed_plugin
+             $<TARGET_FILE:nccl-policy>
+             ${DISTRIBUTED_MAX_LATENCY_BPF_O}
+             5)
 endif()
