@@ -144,6 +144,12 @@ add_policy_object(nvl72_size_aware_policy nvl72_size_aware
                   NVL72_SIZE_AWARE_BPF_O)
 add_policy_object(distributed_max_latency_policy distributed_max_latency
                   DISTRIBUTED_MAX_LATENCY_BPF_O)
+add_policy_object(spark_tp4_ll_64k_policy spark_tp4_ll_64k
+                  SPARK_TP4_LL_64K_BPF_O)
+add_policy_object(spark_tp4_simple_64k_policy spark_tp4_simple_64k
+                  SPARK_TP4_SIMPLE_64K_BPF_O)
+add_policy_object(spark_tp4_ll_1m_policy spark_tp4_ll_1m
+                  SPARK_TP4_LL_1M_BPF_O)
 
 set(POLICY_OBJECTS
     ${NOOP_BPF_O}
@@ -171,7 +177,10 @@ set(POLICY_OBJECTS
     ${BAD_CHANNELS_BPF_O}
     ${ADAPTIVE_CHANNELS_V2_BPF_O}
     ${NVL72_SIZE_AWARE_BPF_O}
-    ${DISTRIBUTED_MAX_LATENCY_BPF_O})
+    ${DISTRIBUTED_MAX_LATENCY_BPF_O}
+    ${SPARK_TP4_LL_64K_BPF_O}
+    ${SPARK_TP4_SIMPLE_64K_BPF_O}
+    ${SPARK_TP4_LL_1M_BPF_O})
 
 add_custom_target(ebpf_policies ALL DEPENDS ${POLICY_OBJECTS})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/test/policy_test_paths.h.in
