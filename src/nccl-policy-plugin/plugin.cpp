@@ -155,6 +155,50 @@ struct DistCallGuard {
   }
 };
 
+struct BenchmarkSummary {
+  // Buckets: <=16 KiB, <=64 KiB, <=1 MiB, <=16 MiB, >16 MiB.
+  // Rows: AllReduce, AllGather, ReduceScatter.
+  uint64_t size_bins[3][5] = {};
+  uint64_t action_hits[3] = {};
+};
+
+int benchmark_coll_index(uint32_t coll_type) {
+  switch (coll_type) {
+  case NCCL_POLICY_COLL_ALLREDUCE: return 0;
+  case NCCL_POLICY_COLL_ALLGATHER: return 1;
+  case NCCL_POLICY_COLL_REDUCESCATTER: return 2;
+  default: return -1;
+  }
+}
+
+size_t benchmark_size_bin(size_t n_bytes) {
+  if (n_bytes <= (16u << 10)) return 0;
+  if (n_bytes <= (64u << 10)) return 1;
+  if (n_bytes <= (1u << 20)) return 2;
+  if (n_bytes <= (16u << 20)) return 3;
+  return 4;
+}
+
+void print_benchmark_summary(uint64_t comm_id, uint64_t calls,
+                             const BenchmarkSummary &summary) {
+  std::string line =
+      "[nccl-policy-plugin] BENCH calls=" + std::to_string(calls) +
+      " comm=" + std::to_string(comm_id) +
+      " bins=le16k,le64k,le1m,le16m,gt16m";
+  const char *names[] = {"AR", "AG", "RS"};
+  for (size_t coll = 0; coll < 3; ++coll) {
+    line += " ";
+    line += names[coll];
+    line += "=";
+    for (size_t bin = 0; bin < 5; ++bin) {
+      if (bin) line += ",";
+      line += std::to_string(summary.size_bins[coll][bin]);
+    }
+    line += "/hits=" + std::to_string(summary.action_hits[coll]);
+  }
+  fprintf(stderr, "%s\n", line.c_str());
+}
+
 struct TunerContext {
   std::shared_ptr<SharedCommState> shared;
   std::mutex stats_mu;
@@ -163,6 +207,8 @@ struct TunerContext {
   uint64_t last_latency_ns = 0;
   uint64_t rolling_p99_ns = 0;
   int last_channels = 0;
+  bool benchmark_ready = false;
+  BenchmarkSummary benchmark;
   uint32_t n_nvl_domains = 0;
   uint32_t min_ranks_per_nvl_domain = 0;
   uint32_t max_ranks_per_nvl_domain = 0;
@@ -1843,7 +1889,8 @@ ncclResult_t pluginInitImpl(void **context, uint64_t comm_id, size_t n_ranks,
       "initialized for %zu ranks across %zu nodes using policy %s", n_ranks,
       n_nodes, load_active_policy(ctx->shared.get())->policy_source.c_str());
   const char *ready_marker = getenv("NCCL_POLICY_BENCHMARK_READY");
-  if (ready_marker && strcmp(ready_marker, "1") == 0) {
+  ctx->benchmark_ready = ready_marker && strcmp(ready_marker, "1") == 0;
+  if (ctx->benchmark_ready) {
     const char *mpi_rank = getenv("OMPI_COMM_WORLD_RANK");
     if (!mpi_rank || mpi_rank[0] == '\0')
       mpi_rank = getenv("PMIX_RANK");
@@ -2135,6 +2182,8 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
   }
 
   apply_policy_action(action, coll_cost_table, num_algo, num_proto, n_channels);
+  bool emit_benchmark = false;
+  BenchmarkSummary benchmark_snapshot;
   {
     std::lock_guard<std::mutex> lock(ctx->stats_mu);
     ctx->last_channels = *n_channels;
@@ -2144,7 +2193,24 @@ ncclResult_t pluginGetCollInfoImpl(void *context, ncclFunc_t coll_type,
     ctx->total_latency_ns += ctx->last_latency_ns;
     ctx->call_count++;
     call_count_snapshot = ctx->call_count;
+    if (ctx->benchmark_ready) {
+      const int coll_index = benchmark_coll_index(policy_coll_type);
+      if (coll_index >= 0) {
+        ++ctx->benchmark.size_bins[coll_index][benchmark_size_bin(n_bytes)];
+        if (nccl_policy_action_flags_get(action) != 0)
+          ++ctx->benchmark.action_hits[coll_index];
+      }
+      emit_benchmark = call_count_snapshot == 5 ||
+                       call_count_snapshot == 100 ||
+                       call_count_snapshot == 1000 ||
+                       call_count_snapshot % 10000 == 0;
+      if (emit_benchmark)
+        benchmark_snapshot = ctx->benchmark;
+    }
   }
+  if (emit_benchmark)
+    print_benchmark_summary(ctx->shared->comm_id, call_count_snapshot,
+                            benchmark_snapshot);
 
   if (policy_state->distributed &&
       dist_call_number % kDistExchangeCalls == 0) {
@@ -2176,6 +2242,7 @@ ncclResult_t pluginFinalizeImpl(void *context) {
   uint64_t p99_latency = 0;
   auto shared = ctx ? ctx->shared : nullptr;
   std::string policy_source = "none";
+  BenchmarkSummary benchmark_snapshot;
 
   if (!ctx)
     return ncclSuccess;
@@ -2183,6 +2250,8 @@ ncclResult_t pluginFinalizeImpl(void *context) {
   {
     std::lock_guard<std::mutex> lock(ctx->stats_mu);
     call_count = ctx->call_count;
+    if (ctx->benchmark_ready)
+      benchmark_snapshot = ctx->benchmark;
     avg_latency = call_count == 0 ? 0 : ctx->total_latency_ns / call_count;
     last_latency = ctx->last_latency_ns;
     p99_latency = ctx->rolling_p99_ns;
@@ -2198,6 +2267,9 @@ ncclResult_t pluginFinalizeImpl(void *context) {
           " p99_estimate_ns=%" PRIu64 " source=%s\n",
           call_count, avg_latency, last_latency, p99_latency,
           policy_source.c_str());
+  if (ctx->benchmark_ready)
+    print_benchmark_summary(shared->comm_id, call_count,
+                            benchmark_snapshot);
 
   release_shared_comm_state(shared, true);
   policy_state.reset();

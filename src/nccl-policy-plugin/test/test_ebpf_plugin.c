@@ -580,7 +580,8 @@ static void close_plugin_session(struct plugin_session *session) {
 
 static int test_benchmark_ready_marker_opt_in(const char *plugin_path) {
   const struct policy_case policy = {
-      "noop", NCCL_POLICY_TEST_NOOP_BPF_PATH, "strict"};
+      "spark_tp4_ll_64k", NCCL_POLICY_TEST_SPARK_TP4_LL_64K_BPF_PATH,
+      "strict"};
   const char *marker_name = "NCCL_POLICY_BENCHMARK_READY";
   const char *rank_name = "OMPI_COMM_WORLD_RANK";
   const char *original_marker = getenv(marker_name);
@@ -596,6 +597,24 @@ static int test_benchmark_ready_marker_opt_in(const char *plugin_path) {
   struct plugin_session session;
   std::string captured;
   int init_rc = -1;
+  bool calls_ok = false;
+  auto run_sample_calls = [&](struct plugin_session *active) {
+    const size_t sizes[] = {1024, 32u << 10, 128u << 10,
+                            1u << 20, 32u << 20};
+    const ncclFunc_t types[] = {ncclFuncAllReduce, ncclFuncAllReduce,
+                                ncclFuncAllReduce, ncclFuncAllGather,
+                                ncclFuncReduceScatter};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+      float cost_table[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS] = {};
+      int channels = 0;
+      if (active->plugin->getCollInfo(
+              active->plugin_context, types[i], sizes[i], 1,
+              (float **)cost_table, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS,
+              0, &channels) != ncclSuccess)
+        return false;
+    }
+    return true;
+  };
 
   auto restore_environment = [&]() {
     if (had_original_marker)
@@ -617,33 +636,44 @@ static int test_benchmark_ready_marker_opt_in(const char *plugin_path) {
   if (capture_stderr(
           [&]() {
             init_rc = open_plugin_session_for_comm(&session, plugin_path,
-                                                   &policy, 700, 8, 1);
-            if (init_rc == 0)
+                                                   &policy, 700, 4, 4);
+            if (init_rc == 0) {
+              calls_ok = run_sample_calls(&session);
               close_plugin_session(&session);
+            }
           },
           &captured) != 0)
     return fail_test("failed to capture default plugin stderr");
-  if (init_rc != 0)
-    return fail_test("plugin initialization failed with READY marker disabled");
-  if (captured.find(marker_prefix) != std::string::npos)
-    return fail_test("plugin emitted READY marker without benchmark opt-in");
+  if (init_rc != 0 || !calls_ok)
+    return fail_test("plugin calls failed with READY marker disabled");
+  if (captured.find(marker_prefix) != std::string::npos ||
+      captured.find("[nccl-policy-plugin] BENCH") != std::string::npos)
+    return fail_test("plugin emitted benchmark logs without opt-in");
 
   if (setenv(marker_name, "1", 1) != 0)
     return fail_test("failed to enable READY marker test environment");
   init_rc = -1;
+  calls_ok = false;
   if (capture_stderr(
           [&]() {
             init_rc = open_plugin_session_for_comm(&session, plugin_path,
-                                                   &policy, 701, 8, 1);
-            if (init_rc == 0)
+                                                   &policy, 701, 4, 4);
+            if (init_rc == 0) {
+              calls_ok = run_sample_calls(&session);
               close_plugin_session(&session);
+            }
           },
           &captured) != 0)
     return fail_test("failed to capture opted-in plugin stderr");
-  if (init_rc != 0)
-    return fail_test("plugin initialization failed with READY marker enabled");
+  if (init_rc != 0 || !calls_ok)
+    return fail_test("plugin calls failed with READY marker enabled");
   if (captured.find(expected_marker) == std::string::npos)
     return fail_test("opted-in plugin did not emit the per-rank READY marker");
+  if (captured.find("BENCH calls=5") == std::string::npos ||
+      captured.find("AR=1,1,1,0,0/hits=2") == std::string::npos ||
+      captured.find("AG=0,0,1,0,0/hits=0") == std::string::npos ||
+      captured.find("RS=0,0,0,0,1/hits=0") == std::string::npos)
+    return fail_test("benchmark histogram or action-hit count mismatch");
 
   restore_environment();
   printf("benchmark READY marker opt-in: PASS\n");

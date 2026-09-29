@@ -26,6 +26,21 @@ does not provide a distinct MNNVL fabric signal, and its domain count follows
 the node count, so this policy deliberately returns no override for every
 multi-node communicator.
 
+## Spark TP4 protocol candidates
+
+The `spark_tp4_ll_64k.bpf.o`, `spark_tp4_simple_64k.bpf.o`, and
+`spark_tp4_ll_1m.bpf.o` objects are separate A/B arms for a communicator
+with exactly four ranks on four nodes. They override only AllReduce: the
+first two request Ring/LL versus Ring/SIMPLE for 1 byte-64 KiB, and the third
+requests Ring/LL for 1 byte-1 MiB. Zero-byte calls, larger messages, other
+collectives, and other topologies return no action. None sets a channel
+count; NCCL retains its own channel limit. The plugin respects NCCL's
+ignored algorithm/protocol entries. These are candidate policies, not
+validated performance recommendations: compare each against both no plugin
+and `noop.bpf.o` under the same live TP4 inference workload, and inspect
+all ranks for plugin load, errors, request correctness, latency and
+throughput before selecting an arm.
+
 ## Experimental agreed map across ranks
 
 The `distributed_max_latency.bpf.o` example uses a verified `dist_merge`
@@ -75,6 +90,17 @@ Produces:
 | `NCCL_POLICY_PROFILER_BPF_PATH` | Path to `profiler_latency.bpf.o`; required in `ebpf` mode |
 | `NCCL_POLICY_EXPERIMENTAL_DIST_MAP` | Set to `1` to load the agreed-map example |
 | `NCCL_POLICY_DIST_COORDINATOR` | Shared `rank-0-host-or-IPv4:port` endpoint for multi-node TCP exchange; unset uses same-host Unix sockets |
+| `NCCL_POLICY_BENCHMARK_READY` | Existing `1` opt-in prints the per-rank READY marker and compact cumulative tuner-call histograms; unset adds no counter updates |
+
+With `NCCL_POLICY_BENCHMARK_READY=1`, the plugin summarizes AllReduce
+(`AR`), AllGather (`AG`), and ReduceScatter (`RS`) calls in five
+message-size buckets: <=16 KiB, <=64 KiB, <=1 MiB, <=16 MiB, and >16 MiB.
+It prints cumulative counts at tuner calls 5, 100, 1000, each 10000
+thereafter, and finalization. `hits` counts nonzero BPF action requests,
+not confirmed NCCL algorithm/protocol selections; NCCL may ignore an
+unavailable pair. CUDA Graph replay does not call the tuner again, so
+these counts describe policy decisions during capture/uncaptured calls,
+not the number of inference steps or requests.
 
 ## Exported Symbols
 

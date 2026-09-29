@@ -37,6 +37,11 @@ NCCLbpf consists of two NCCL plugins and a library of eBPF policy programs:
   multi-node communicators unchanged
 - `bad_*.bpf.c` -- Intentionally unsafe programs for verifier testing (div-by-zero, OOB access, stack overflow, infinite loop, etc.)
 - `distributed_max_latency.bpf.c` -- Experimental agreed-map example: a verified BPF merge takes the maximum of rank-local latency slots, and the tuner selects channels from the shared result
+- `spark_tp4_ll_64k.bpf.c`, `spark_tp4_simple_64k.bpf.c`, and
+  `spark_tp4_ll_1m.bpf.c` -- Four-node, four-rank AllReduce protocol
+  comparison: Ring/LL or Ring/SIMPLE through 64 KiB, and Ring/LL through
+  1 MiB. They leave other collectives, topologies, and channel counts to
+  NCCL; no Spark inference speedup has been established by a hardware A/B test.
 
 ### Cross-rank agreement prototype
 
@@ -208,7 +213,11 @@ given a policy-labelled filename only after the log contains a successful
 tuner-policy initialization marker for every Open MPI rank. The runner enables
 nccl-tests data checking (`CHECK=1`) by default; set `CHECK=0` explicitly to
 disable it. Run `scripts/test_nccl_bench.sh` for the hardware-free arm and
-load-marker regression tests.
+load-marker regression tests. For a short live policy trial,
+`NCCL_POLICY_BENCHMARK_READY=1` also prints compact per-communicator
+AllReduce/AllGather/ReduceScatter size and action-request summaries; see
+[the plugin README](src/nccl-policy-plugin/README.md). CUDA Graph replay
+does not add tuner calls to these summaries.
 
 ## Usage
 
