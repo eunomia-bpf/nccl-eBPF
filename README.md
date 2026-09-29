@@ -47,28 +47,38 @@ second check verifies that a `dist_merge` BPF program reads only exchanged
 rank slots and writes the agreed result. The profiler may still record local
 measurements. See [the design and NCCL source analysis](docs/cross-rank-agreement.md).
 
-`distributed_max_latency` demonstrates the current distributed-map subset.
-Set `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1` and load its BPF object with
-`NCCL_POLICY_BPF_PATH` to opt in. Each rank writes its own `local_latency`
-slot; a same-host Unix-socket exchange distributes the slots every 1024 tuner
-calls, and the verified `SEC("dist_merge")` program independently computes the
-`agreed_map` value on each rank for activation at the next 1024-call boundary.
-The prototype supports 1 to 8 ranks with one rank per process sharing the
-same host and `/tmp` filesystem. Separate containers with private `/tmp`
-cannot rendezvous. It does not provide multi-node exchange, a general
-distributed-map API,
-per-connection net decisions, or coordinated policy reload. The first
-exchange occurs after 1024 calls, so policy versions are not compared before
-those calls. NCCL tuner call counts can differ on several paths, and host
-post-processing can depend on rank-local state. This CPU-tested path is not
-a production-safe guarantee for arbitrary NCCL workloads. The
-original paper's single-node B300 results predate this feature.
+`distributed_max_latency` demonstrates the experimental agreed-map subset.
+Set `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`, load its object with
+`NCCL_POLICY_BPF_PATH`, and load the same library as both tuner and profiler
+(`NCCL_TUNER_PLUGIN` and `NCCL_PROFILER_PLUGIN`). The profiler supplies the
+rank ID, which tuner v5 does not expose; a missing or conflicting rank is
+rejected. The example supports 1-8 ranks, one rank per process. With
+`NCCL_POLICY_DIST_COORDINATOR` unset, ranks on one host exchange over a Unix
+socket and must share `/tmp`. For separate hosts, every rank must set it to
+the same `rank-0-host-or-IPv4:port`; rank 0 binds only that named local
+interface and peers connect to it. An unspecified endpoint on a multi-node
+communicator is rejected.
 
-The hardware-free distributed-map and plugin integration tests run under
-`make test`; they use two and eight processes with different local latencies
-and check that every rank activates the same maximum-derived action. A
-nine-rank setup is rejected. No new multi-node or GPU
-performance numbers are claimed.
+Before its first policy action, each participating distributed-policy rank
+exchanges the hash of the BPF object and plugin runtime in round 0. A mismatch
+or transport failure returns an error. Thereafter each rank writes its own
+`local_latency` value; an asynchronous TCP or Unix-socket exchange starts
+every 1024 tuner calls. At the following 1024-call boundary, each rank runs
+the verified `SEC("dist_merge")` program on the same rank-indexed slots and
+checks the maximum before publishing `agreed_map`. The initial handshake and
+activation can wait up to the exchange deadline (30 seconds by default).
+Distributed-policy hot reload is disabled.
+
+This remains an experimental path. NCCL tuner call counts can differ on
+special paths, host processing can depend on rank-local state, and a transport
+failure partway through COMMIT can leave some ranks with a committed snapshot
+while others fail. The current CPU tests do not establish safety for arbitrary
+NCCL jobs. The original paper's single-node B300 results predate this feature.
+
+The hardware-free tests run under `make test`: local two- and eight-process
+Unix-socket exchanges, a four-process TCP loopback plugin run, version
+mismatch and missing-coordinator rejection, and focused TCP transport cases.
+There is no measured multi-host Spark, GPU, or LLM result for this path yet.
 
 ### NCCL source compatibility
 
@@ -228,11 +238,13 @@ mpirun -np 2 nccl-tests/build/all_reduce_perf_mpi -b 128M -e 128M -g 1
 | Variable | Description |
 |---|---|
 | `NCCL_TUNER_PLUGIN` | Path to `libnccl-policy.so` |
+| `NCCL_PROFILER_PLUGIN` | Set to the same library for the agreed-map example so profiler v6 supplies the rank ID |
 | `NCCL_POLICY_BPF_PATH` | Path to the eBPF policy `.bpf.o` file to load |
 | `NCCL_POLICY_VERIFY_MODE` | Verifier behavior: `strict` (default, reject unsafe), `warning` (log but allow), `none` (skip verification) |
 | `NCCL_POLICY_PROFILER_MODE` | Telemetry writer: `native` (default) or `ebpf` |
 | `NCCL_POLICY_PROFILER_BPF_PATH` | Path to `profiler_latency.bpf.o`; required when profiler mode is `ebpf` |
-| `NCCL_POLICY_EXPERIMENTAL_DIST_MAP` | Set to `1` to load the same-host distributed-map example; see its rank and call-path limits above |
+| `NCCL_POLICY_EXPERIMENTAL_DIST_MAP` | Set to `1` to load the experimental agreed-map example |
+| `NCCL_POLICY_DIST_COORDINATOR` | For multi-node agreed-map jobs, set the same rank-0 host or IPv4 address and TCP port on every rank (for example `rank0.example:47000`); rank 0 must own that interface. Unset selects same-host Unix sockets |
 
 ### Net Plugin
 

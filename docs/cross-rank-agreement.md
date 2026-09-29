@@ -5,9 +5,9 @@ Design notes for two mechanisms that let eBPF policies use run-time measurements
 - a **cross-rank check**: a load-time information-flow check on policy bytecode, run after the ordinary eBPF verifier;
 - an **agreed (distributed) map**: a map whose value is the same on every rank of a communicator at each call, built from per-rank measurements by a verified, deterministic merge.
 
-The load-time checker and an experimental same-host agreed-map example are implemented in `src/nccl-policy-plugin/`. The example supports 1-8 ranks, one rank per process, sharing `/tmp`, and uses a verified `dist_merge` BPF program over rank-local latency slots. It has passed CPU tests, not a multi-node or GPU benchmark. Sections 5 and 6 describe NCCL 2.29.7 paths that still need treatment before general cross-rank safety can be claimed.
+The load-time checker and an experimental agreed-map example are implemented in `src/nccl-policy-plugin/`. The example supports 1-8 ranks, one rank per process, and uses a verified `dist_merge` BPF program over rank-local latency slots. Ranks on one host use Unix sockets; an explicit rank-zero TCP endpoint enables a multi-host path. The Unix and TCP paths have passed local CPU tests, not a multi-host Spark, GPU, or LLM benchmark. Sections 5 and 6 describe NCCL 2.29.7 paths that still need treatment before general cross-rank safety can be claimed.
 
-**Current safety boundary:** ranks do not compare policy versions before the first exchange at call 1024. Ordinary policies can also be reloaded independently per process. Host handling of channel bounds and algorithm/protocol availability can differ after identical BPF actions. Some NCCL paths do not advance `getCollInfo` counts uniformly, and an incomplete rank-zero snapshot broadcast can leave peers with different outcomes. Treat the distributed path as an opt-in prototype, not a production-wide agreement guarantee.
+**Current safety boundary:** participating distributed-policy ranks compare the BPF object and plugin-runtime hash before their first BPF action. Ordinary policies can still be reloaded independently per process. Host handling of channel bounds and algorithm/protocol availability can differ after identical BPF actions. Some NCCL paths do not advance `getCollInfo` counts uniformly. TCP prepare/ACK/COMMIT cannot make COMMIT delivery atomic: a failure partway through it can leave some ranks with a committed snapshot while others fail. Treat the distributed path as an opt-in prototype, not a production-wide agreement guarantee.
 
 NCCL line references are to NCCL 2.29.7 (`nccl` submodule, `src/`). Plugin references are to `src/nccl-policy-plugin/plugin.cpp` at the time of writing.
 
@@ -64,9 +64,9 @@ Open items for the check:
 - **Channel bound.** NCCL does not clamp the tuner's channel count; CollNet and allgatherv use it directly (`enqueue.cc:621-626`, `scheduler/allgatherv_sched.cc:65-80`). The host should enforce `nChannels <= comm->nChannels`. The plugin cannot see that value, so it belongs in the profile.
 - **Scope of the check.** Only tuner programs are checked today. Net plugin programs need the per-connection scope from Section 2.
 
-## 4. Agreed (distributed) map (design and same-host prototype)
+## 4. Agreed (distributed) map (design and experimental transport)
 
-The current implementation fixes three u64 array maps (`local_latency`, `rank_slots`, `agreed_map`), a verified `SEC("dist_merge")` max operation, a same-host Unix-socket exchange every 1024 calls, and activation on the next 1024-call boundary. It requires `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`, supports 1-8 ranks with one rank per process and shared `/tmp`, and rejects distributed-policy hot reload. The more general semantics below remain design goals.
+The current implementation fixes three u64 array maps (`local_latency`, `rank_slots`, `agreed_map`), a verified `SEC("dist_merge")` max operation, an exchange every 1024 tuner calls, and activation on the next 1024-call boundary. It requires `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`, supports 1-8 ranks with one rank per process, and rejects distributed-policy hot reload. Without `NCCL_POLICY_DIST_COORDINATOR`, same-host ranks use a Unix socket and shared `/tmp`. For multiple hosts, every rank must use the same explicit rank-zero `host-or-IPv4:port` endpoint; rank zero binds only that local interface, and peers connect over TCP. The more general semantics below remain design goals.
 
 ### 4.1 Layers
 
@@ -85,17 +85,18 @@ The current implementation fixes three u64 array maps (`local_latency`, `rank_sl
 ### 4.3 Activation
 
 - An epoch covers K calls. Seal epoch e at call (e+1)·K and activate it at call (e+2)·K, so the exchange has one epoch of slack and stays off the critical path.
-- **Never block indefinitely inside `getCollInfo`.** It runs on the user thread (blocking communicators) or on a group thread (non-blocking communicators), and `ncclCommAbort` joins that thread (`group.cc:644-648, 797-822, 873-878`; `init.cc:2713`). One thread may drive several GPUs and prepare each communicator in turn, so waiting for a peer that the same thread serves self-deadlocks. The plugin also holds `telemetry_mu` while running a program (`plugin.cpp` near the `bpftime_prog_exec` call), which the profiler write-back needs.
-- If the snapshot for the activation call has not arrived: wait with a bound and without holding locks, then return an error from `getCollInfo` (fail closed). Never fall back to a local value, because a local fallback is itself a disagreement.
-- Before the first merged epoch the snapshot is the init-time default, identical on every rank; pick one convention (empty or a version-0 default) and use it everywhere.
+- **Bound every wait inside `getCollInfo`.** The round-0 version handshake happens before the first BPF action and may wait up to the exchange deadline (30 seconds by default). Later exchanges start asynchronously at calls 1024, 2048, and so on; an activation call waits for its pending result without holding the distributed-state lock. The first-call wait is still a liveness risk if one NCCL thread drives several ranks sequentially; the tested setup uses one rank per process. `getCollInfo` can run on the user or a group thread, and `ncclCommAbort` joins that thread (`group.cc:644-648, 797-822, 873-878`; `init.cc:2713`).
+- If the snapshot for the activation call has not arrived: wait with a bound and return an error from `getCollInfo` (fail closed). Never fall back to a local value, because a local fallback is itself a disagreement.
+- Before the first merged epoch, the zero-initialized `agreed_map` is read only after round-0 version agreement. This is the tested example's initial value, not a generic map API contract.
+- The TCP path exchanges prepare proposals, receives ACKs, then sends COMMIT. A lost connection during COMMIT can reach only a subset of peers. Some ranks may commit while others fail; an atomic cross-rank outcome still needs a stronger protocol or NCCL-level integration.
 
 ### 4.4 Rendezvous
 
-The tuner v5 init receives `commId`, rank and node counts, a logger, NVL-domain info and constants, but no rank id, bootstrap handle or communicator pointer (`tuner_v5.h:52-53`). Exchanging slots therefore needs a channel outside NCCL's plugin contract. The prototype uses a same-host Unix socket keyed by communicator hash and round; a multi-node transport remains unimplemented. The rank id comes from the profiler plugin, whose init receives it. The current state and socket key use the communicator hash, which can collide for overlapping communicators; a future implementation needs a per-communicator instance key. All local ranks of one communicator share a commHash, and repeated `ncclCommShrink` of the same parent can produce the same hash (`init.cc:2808-2815, 2849`).
+The tuner v5 init receives `commId`, rank and node counts, a logger, NVL-domain info and constants, but no rank id, bootstrap handle or communicator pointer (`tuner_v5.h:52-53`). Exchanging slots therefore needs a channel outside NCCL's plugin contract. The rank id comes from the profiler v6 plugin, whose init receives it; missing or conflicting rank metadata is rejected before the first tuner action. The same-host path uses a Unix socket keyed by communicator hash and round. The TCP path uses `NCCL_POLICY_DIST_COORDINATOR=host-or-IPv4:port` on every rank; rank zero binds the specified local interface, so the address must be reachable by every peer. This is an explicit endpoint, not a discovered NCCL bootstrap address or a standalone service. The current state and rendezvous still use the communicator hash, which can collide for overlapping communicators; a future implementation needs a per-communicator instance key. All local ranks of one communicator share a commHash, and repeated `ncclCommShrink` of the same parent can produce the same hash (`init.cc:2808-2815, 2849`).
 
 ### 4.5 Policy versions and hot reload
 
-Ordinary-policy reload remains a per-process pointer swap (`pluginReloadPolicyImpl`); distributed-policy reload is rejected until cross-rank coordination exists. Paper T3 argues that briefly running different policies is fine because calls are independent; across ranks that is false. With an agreed map, the policy version becomes an agreed value: every rank loads, verifies and JITs the new program, reports success, and all ranks switch at an agreed call. This is a commit round, not a single map read. A rank whose verification fails aborts the switch for everyone.
+Ordinary-policy reload remains a per-process pointer swap (`pluginReloadPolicyImpl`); distributed-policy reload is rejected until cross-rank coordination exists. For the initial distributed policy, round 0 exchanges a version derived from the BPF object bytes and the loaded plugin runtime bytes before any BPF action. A mismatch rejects the action. This checks participating ranks that loaded a distributed policy; it does not force an ordinary policy or a rank with no plugin into the same handshake. Paper T3 argues that briefly running different policies is fine because calls are independent; across ranks that is false. A future distributed hot reload would require every rank to load, verify and JIT the new program, report success, and switch at an agreed call. A rank whose verification fails must abort the switch for everyone.
 
 ### 4.6 Trust
 
@@ -121,7 +122,7 @@ Fixes: count epochs only on main-path, uncaptured calls; pin captured graphs to 
 ### 5.3 Inputs to reclassify
 
 - `regBuff`: local (registration and graph capture).
-- `NCCL_ALGO`, `NCCL_PROTO`, `NCCL_POLICY_BPF_PATH`: read per process; put them in the init-time profile and require them to match.
+- `NCCL_ALGO`, `NCCL_PROTO`: read per process; put relevant availability in the init-time profile and require it to match. The distributed-policy round-0 exchange compares policy/runtime bytes, not the `NCCL_POLICY_BPF_PATH` string; ordinary policies have no cross-rank version exchange.
 - `comm->nChannels`: needed for the channel bound; put it in the profile.
 
 ## 6. Scenarios
@@ -143,7 +144,7 @@ A policy can pick algorithm, protocol and channels from a measured table per com
 
 1. Rerun the composability experiment with `NCCL_DEBUG=INFO` (prints channel counts, `init.cc:1450`) and nccl-tests `-c 1`, logging each rank's channel count per call. Establish whether the 10 vs 9 mismatch hung, corrupted data, or was clamped.
 2. Run the paper's §5.3 adaptive-channels policy through the checker: it should be rejected with an ordinary map and accepted with an agreed map.
-3. Measure the agreed-map exchange at 2, 8 and multi-node scale: epoch latency, activation slack needed, and cost on the hot path (one lookup plus one compare).
+3. Extend the local CPU checks (2 and 8 Unix-socket ranks, 4 TCP loopback ranks) to real multi-host Spark/NCCL runs. Measure epoch latency, activation slack, and hot-path cost; compare policy decisions and data-check results on every rank.
 
 ## 8. Prior art
 
@@ -155,12 +156,12 @@ A policy can pick algorithm, protocol and channels from a measured table per com
 - **MUST**: run-time comparison of collective arguments.
 - **GoLiSA** (ECOOP'23): information flow from nondeterministic sources to consensus-relevant sinks only.
 
-What is new here: agreement semantics exposed as an eBPF map that any verified policy can read, with the merged value computed by the same verified deterministic program on every rank rather than by a leader, on unmodified NCCL; and a load-time check on eBPF bytecode, scoped by output, with map-level labels (agreed vs. local).
+The prototype demonstrates agreement semantics as an eBPF map read by the verified tuner example, with the merged value computed by the same verified deterministic program on every rank rather than by a leader, on unmodified NCCL; and a load-time check on eBPF bytecode, scoped by output, with map-level labels (agreed vs. local). General map APIs and full NCCL call-path coverage remain future work.
 
 ## 9. Questions to expect
 
-- **Isn't this MCCS or AutoCCL?** They agree by a leader or manager deciding. Here every rank runs the same verified merge, any policy reads the result as a map, and the check guarantees the policy reads only agreed values.
-- **Does a straggler or dead rank block everyone?** Only at epoch boundaries, with one epoch of slack. A dead rank already hangs a collective; the plugin returns an error after a bounded wait instead of blocking.
-- **Scale and staleness?** Associative merges reduce as a tree. Staleness is one to two epochs, which suits slow drift; fast local reactions use local-scope outputs.
-- **Is the taint analysis sound?** It follows data and control flow on the bytecode, rejects any branch on a local value and any local action, and treats every helper result as local. Maps written by several programs need all of them analysed together, re-run on reload.
-- **What about CUDA graphs?** Captured calls keep the policy in force at capture time; epochs advance only on uncaptured calls.
+- **Isn't this MCCS or AutoCCL?** They agree by a leader or manager deciding. Here rank 0 transports measurements, but each rank runs the same verified merge over the exchanged slots; the experimental tuner example reads the resulting agreed map.
+- **Does a straggler or dead rank block everyone?** The initial version handshake and later activation boundaries can wait for peers, each with a bounded exchange deadline. An epoch starts asynchronously one 1024-call interval before activation. The current one-rank-per-process CPU tests do not prove that this scheduling is safe for every NCCL thread path.
+- **Scale and staleness?** The current TCP prototype sends all slots through rank 0 and activates one 1024-call interval after sealing. A hierarchical tree reduction and local-scope fast reactions are design options, not measured or implemented in this example.
+- **Is the taint analysis sound?** It follows data and control flow on the bytecode, rejects local values that can affect a nonzero collective action, and treats ordinary map and nondeterministic helper results as local. Maps written by several programs need all of them analysed together, re-run on reload.
+- **What about CUDA graphs?** The current call-count epoch scheme does not account for captured replays that skip `getCollInfo`; pinning a captured graph to its original policy is still a design requirement.

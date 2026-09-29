@@ -55,18 +55,21 @@ can also run on a host without CUDA:
 scripts/test_nccl_bench.sh
 ```
 
-The new cross-rank checker is exercised by the plugin tests. The experimental
+The cross-rank checker is exercised by the plugin tests. The experimental
 [distributed-map example](../../src/ebpf-policies/distributed_max_latency.bpf.c)
-is opt-in with `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`; its CPU integration test
-uses two and eight local processes and verifies that different rank-local
-measurements produce the same BPF-merged action at activation; nine ranks are
-rejected. The current exchange works only for processes sharing one host and
-`/tmp` filesystem, with 1 to 8 ranks and one rank per process. It has no
-validated multi-node or GPU result. Policy versions are not compared before
-the first exchange at call 1024, so this test does not establish general
-cross-rank safety. The work does not extend the frozen paper's B300
-measurements. The [design notes](../cross-rank-agreement.md) describe
-the broader intended model and remaining NCCL call-count limitations.
+is opt-in with `NCCL_POLICY_EXPERIMENTAL_DIST_MAP=1`. It supports 1-8 ranks,
+one rank per process: same-host Unix sockets with shared `/tmp`, or TCP when
+every rank sets `NCCL_POLICY_DIST_COORDINATOR` to rank 0's explicit
+`host-or-IPv4:port`. The profiler plugin must be loaded to supply rank ID.
+A round-0 exchange checks the BPF object and plugin-runtime version before
+the first action. CPU integration tests exercise two and eight local Unix
+socket processes, four local TCP loopback processes, version mismatch and
+missing-coordinator rejection, and the BPF-merged action at activation.
+They do not establish a multi-host Spark, GPU, or LLM result. NCCL call-count,
+host post-processing, and mid-COMMIT transport limits remain, so this is not
+a general cross-rank safety guarantee. The work does not extend the frozen
+paper's B300 measurements. The [design notes](../cross-rank-agreement.md)
+describe the broader model and limitations.
 
 The tuner/profiler plugin uses existing NCCL interfaces without modifying
 NCCL source. The net plugin prototype is different: it wraps NCCL's internal
