@@ -229,9 +229,11 @@ static void TestPartialPrepare(uint64_t comm_id) {
   local.maps.clear();
   local.writes.clear();
   AgreedSnapshot result;
+  result.policy_version = 99;
   std::string reason;
   assert(!ExchangeTCP(comm_id, local, endpoint, &result, &reason));
   assert(reason.find("acknowledged") != std::string::npos);
+  assert(result.policy_version == 99 && result.rank_writes.empty());
   int status = 0;
   assert(waitpid(rank1, &status, 0) == rank1);
   assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);

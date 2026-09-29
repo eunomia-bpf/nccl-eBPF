@@ -448,8 +448,9 @@ bool ExchangeSameHost(uint64_t communicator_id, const RankProposal &local,
     peers.push_back(peer);
     proposals.push_back(std::move(proposal));
   }
+  AgreedSnapshot prepared;
   if (ok)
-    ok = MergeRankProposals(proposals, snapshot, error);
+    ok = MergeRankProposals(proposals, &prepared, error);
   if (ok) {
     Bytes all_frame = EncodeAll(proposals);
     if (all_frame.size() > kMaxFrameBytes) {
@@ -586,8 +587,9 @@ bool ClientExchangeTCP(int fd, uint64_t communicator_id,
     found_local = encoded == proposal;
     break;
   }
+  AgreedSnapshot prepared;
   if (!found_local ||
-      !MergeRankProposals(std::move(proposals), snapshot, error)) {
+      !MergeRankProposals(std::move(proposals), &prepared, error)) {
     if (!error || error->empty())
       SetError(error, "invalid TCP prepare response");
     return false;
@@ -599,6 +601,7 @@ bool ClientExchangeTCP(int fd, uint64_t communicator_id,
     SetError(error, "TCP exchange did not commit on every rank");
     return false;
   }
+  *snapshot = std::move(prepared);
   return true;
 }
 
@@ -637,8 +640,9 @@ bool CoordinatorExchangeTCP(int listener, uint64_t communicator_id,
     peers.emplace(proposal.rank, peer);
     proposals.push_back(std::move(proposal));
   }
+  AgreedSnapshot prepared;
   if (ok)
-    ok = MergeRankProposals(proposals, snapshot, error);
+    ok = MergeRankProposals(proposals, &prepared, error);
   if (ok) {
     Bytes all = EncodeAll(proposals);
     Bytes prepare = WireFrame('R', communicator_id, all);
@@ -685,6 +689,8 @@ bool CoordinatorExchangeTCP(int listener, uint64_t communicator_id,
     (void)rank;
     close(peer);
   }
+  if (ok)
+    *snapshot = std::move(prepared);
   return ok;
 }
 
